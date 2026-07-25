@@ -198,6 +198,30 @@ history. It never displays API keys or authorization headers.
 
 Storage directories are private (`0700`) and run files are private (`0600`).
 
+## Versioned local wiki
+
+The canonical wiki is a separate Git repository at `/srv/swarm-wiki`, not
+application runtime data and not part of this source repository. Override the
+root for tests or another approved deployment with `OWUI_SWARM_WIKI_ROOT`; the
+live user configuration is not changed automatically.
+
+```bash
+owui-swarm wiki init --with-samples
+owui-swarm wiki validate
+owui-swarm wiki status
+owui-swarm wiki list
+owui-swarm wiki get acme-orbit-overview
+owui-swarm wiki backup
+owui-swarm wiki restore-verify ~/backups/swarm-wiki/<timestamp>
+```
+
+Wiki commands do not load the Open WebUI API key, model catalog, or run history.
+Pages and immutable source manifests are validated before atomic, locked writes.
+Backups contain a Git bundle and tracked working files; restore verification
+always uses a temporary directory and never replaces the canonical wiki.
+Governance and recovery details are in
+[`docs/wiki-storage-foundation.md`](docs/wiki-storage-foundation.md).
+
 ## Validation
 
 ```bash
