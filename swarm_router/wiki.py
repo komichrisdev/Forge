@@ -602,7 +602,7 @@ class WikiRepository:
             os.close(root_fd)
         try:
             fd = os.open(
-                "repository.lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=lock_dir_fd
+                "repository.lock", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=lock_dir_fd
             )
         except FileNotFoundError:
             return {"locked": False, "file_exists": False}

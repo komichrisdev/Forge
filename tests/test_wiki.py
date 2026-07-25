@@ -282,6 +282,14 @@ class WikiStorageTest(unittest.TestCase):
         self.repository.write_page(replace(page, title="After stale lock"), section="projects")
         self.assertEqual(self.repository.get_page(page.id).title, "After stale lock")
 
+    def test_status_reads_a_read_only_lock_file(self) -> None:
+        lock_dir = self.root / ".locks"
+        lock_dir.mkdir(mode=0o700)
+        lock_file = lock_dir / "repository.lock"
+        lock_file.write_text("{}\n", encoding="utf-8")
+        lock_file.chmod(0o400)
+        self.assertFalse(self.repository.status(self.base / "backups")["lock"]["locked"])
+
     def test_unexpected_existing_directory_during_init(self) -> None:
         root = self.base / "unknown"
         root.mkdir(mode=0o750)
