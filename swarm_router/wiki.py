@@ -751,7 +751,15 @@ class WikiRepository:
                 if len(parts) != 2 or (parts[1] != "README.md" and path.suffix != ".md"):
                     issues.append(WikiIssue("unknown_file", rel, message="unexpected proposal file"))
             elif top == "index":
-                if parts != ("index", "README.md"):
+                if parts == ("index", "README.md"):
+                    continue
+                if len(parts) == 2 and (
+                    parts[1] in {"wiki.db", "wiki.db-wal", "wiki.db-shm"} or
+                    re.fullmatch(r"\.wiki\.db\.[0-9a-fA-F]+\.tmp", parts[1]) or
+                    re.fullmatch(r"\.wiki\.db\.[0-9]+\.tmp", parts[1])
+                ):
+                    continue
+                else:
                     issues.append(WikiIssue("unknown_file", rel, message="generated indexes are excluded"))
             elif top == "tests":
                 if parts != ("tests", "fixtures", ".gitkeep"):
@@ -1029,6 +1037,21 @@ class WikiRepository:
         recent = max(
             (path.name for path in backups.iterdir() if path.is_dir()), default=None
         ) if backups.is_dir() else None
+        try:
+            from .wiki_search import WikiIndex
+            index_status = WikiIndex(self).status()
+        except Exception:
+            index_status = {
+                "present": False,
+                "path": str(self.root / "index" / "wiki.db"),
+                "schema_version": None,
+                "canonical_page_count": 0,
+                "indexed_page_count": 0,
+                "last_build": None,
+                "freshness": "invalid",
+                "drift": {"added": 0, "changed": 0, "removed": 0},
+                "validation": "invalid",
+            }
         return {
             "root": str(self.root),
             "git": git,
@@ -1043,6 +1066,7 @@ class WikiRepository:
             "issue_count": len(issues),
             "lock": self.lock_state() if self.root.is_dir() else {"locked": False, "file_exists": False},
             "latest_backup": recent,
+            "index": index_status,
         }
 
     def backup(self, backup_root: str | Path | None = None) -> Path:

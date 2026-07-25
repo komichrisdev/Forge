@@ -208,7 +208,11 @@ live user configuration is not changed automatically.
 ```bash
 owui-swarm wiki init --with-samples
 owui-swarm wiki validate
+owui-swarm wiki index --full
 owui-swarm wiki status
+owui-swarm wiki search "ORBIT-7"
+owui-swarm wiki related acme-orbit-overview
+owui-swarm wiki stale --days 30
 owui-swarm wiki list
 owui-swarm wiki get acme-orbit-overview
 owui-swarm wiki backup
@@ -217,6 +221,8 @@ owui-swarm wiki restore-verify ~/backups/swarm-wiki/<timestamp>
 
 Wiki commands do not load the Open WebUI API key, model catalog, or run history.
 Pages and immutable source manifests are validated before atomic, locked writes.
+`index/wiki.db` is derived SQLite FTS5 data and is rebuilt from canonical pages
+and manifests; it is not canonical content and is excluded from Git history.
 Backups contain a Git bundle and tracked working files; restore verification
 always uses a temporary directory and never replaces the canonical wiki.
 Governance and recovery details are in

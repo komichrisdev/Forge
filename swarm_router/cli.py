@@ -120,9 +120,26 @@ def _parser() -> argparse.ArgumentParser:
     wiki_sub.add_parser("validate", help="Validate schemas, paths, references, and repository state.")
     wiki_status = wiki_sub.add_parser("status", help="Show compact wiki and Git status.")
     wiki_status.add_argument("--backup-root")
+    wiki_index = wiki_sub.add_parser("index", help="Build or update the derived SQLite FTS5 wiki index.")
+    wiki_index.add_argument("--full", action="store_true", help="Force a clean rebuild instead of an incremental update.")
+    wiki_index.add_argument("--json", action="store_true", help="Emit JSON output (default).")
     wiki_get = wiki_sub.add_parser("get", help="Retrieve one exact canonical page.")
     wiki_get.add_argument("page_id")
     wiki_sub.add_parser("list", help="List canonical page metadata in deterministic order.")
+    wiki_search = wiki_sub.add_parser("search", help="Query the current derived wiki search index.")
+    wiki_search.add_argument("query")
+    wiki_search.add_argument("--limit", type=int, default=20)
+    wiki_search.add_argument("--verification")
+    wiki_search.add_argument("--min-confidence", type=int)
+    wiki_search.add_argument("--jira-key")
+    wiki_search.add_argument("--json", action="store_true", help="Emit JSON output (default).")
+    wiki_related = wiki_sub.add_parser("related", help="List related canonical pages for one page ID.")
+    wiki_related.add_argument("page_id")
+    wiki_related.add_argument("--limit", type=int, default=10)
+    wiki_related.add_argument("--json", action="store_true", help="Emit JSON output (default).")
+    wiki_stale = wiki_sub.add_parser("stale", help="List pages whose source timestamps are older than N days.")
+    wiki_stale.add_argument("--days", type=int, required=True)
+    wiki_stale.add_argument("--json", action="store_true", help="Emit JSON output (default).")
     wiki_backup = wiki_sub.add_parser("backup", help="Create a restricted Git and working-tree backup.")
     wiki_backup.add_argument("--backup-root")
     wiki_restore = wiki_sub.add_parser(
@@ -134,8 +151,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def _run_wiki(args: argparse.Namespace) -> int:
     from .wiki import WikiRepository
+    from .wiki_search import WikiIndex
 
     repository = WikiRepository(args.root)
+    index = WikiIndex(repository)
     if args.wiki_command == "init":
         print(json.dumps(
             repository.initialize(with_samples=args.with_samples),
@@ -154,6 +173,9 @@ def _run_wiki(args: argparse.Namespace) -> int:
             repository.status(args.backup_root), indent=2, ensure_ascii=False
         ))
         return 0
+    if args.wiki_command == "index":
+        print(json.dumps(index.build(full=args.full), indent=2, ensure_ascii=False))
+        return 0
     if args.wiki_command == "get":
         page = repository.get_page(args.page_id)
         print(json.dumps(
@@ -163,6 +185,21 @@ def _run_wiki(args: argparse.Namespace) -> int:
         return 0
     if args.wiki_command == "list":
         print(json.dumps(repository.list_pages(), indent=2, ensure_ascii=False))
+        return 0
+    if args.wiki_command == "search":
+        print(json.dumps(index.search(
+            args.query,
+            limit=args.limit,
+            verification=args.verification,
+            min_confidence=args.min_confidence,
+            jira_key=args.jira_key,
+        ), indent=2, ensure_ascii=False))
+        return 0
+    if args.wiki_command == "related":
+        print(json.dumps(index.related(args.page_id, limit=args.limit), indent=2, ensure_ascii=False))
+        return 0
+    if args.wiki_command == "stale":
+        print(json.dumps(index.stale(days=args.days), indent=2, ensure_ascii=False))
         return 0
     if args.wiki_command == "backup":
         print(json.dumps(
