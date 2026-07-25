@@ -1,0 +1,7 @@
+FICTIONAL TEST SOURCE — ACME ORBIT CACHE DECISION V1
+
+Decision: the demo service may use a five-minute in-memory cache for synthetic
+catalog responses. The cache is process-local and may be discarded at any
+time. This fixture authorizes no production change.
+
+Review outcome: approved for the fictional training project.

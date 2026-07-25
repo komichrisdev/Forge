@@ -1,0 +1,7 @@
+FICTIONAL TEST SOURCE — ACME ORBIT RECOVERY RUNBOOK V1
+
+If the synthetic demo cache is suspected of being stale, stop the fictional
+test process, clear only its temporary cache directory, start the fictional
+process, and verify the synthetic catalog response.
+
+This fixture contains no real command, endpoint, path, or service identity.

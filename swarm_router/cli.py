@@ -111,12 +111,77 @@ def _parser() -> argparse.ArgumentParser:
         help="Assign the top N locally catalogued models across worker roles for this mode.",
     )
     run.add_argument("--json", action="store_true")
+
+    wiki = sub.add_parser("wiki", help="Manage the separate versioned local wiki repository.")
+    wiki.add_argument("--root", help="Wiki root; defaults to OWUI_SWARM_WIKI_ROOT or /srv/swarm-wiki.")
+    wiki_sub = wiki.add_subparsers(dest="wiki_command", required=True)
+    wiki_init = wiki_sub.add_parser("init", help="Initialize an empty wiki root without Git.")
+    wiki_init.add_argument("--with-samples", action="store_true")
+    wiki_sub.add_parser("validate", help="Validate schemas, paths, references, and repository state.")
+    wiki_status = wiki_sub.add_parser("status", help="Show compact wiki and Git status.")
+    wiki_status.add_argument("--backup-root")
+    wiki_get = wiki_sub.add_parser("get", help="Retrieve one exact canonical page.")
+    wiki_get.add_argument("page_id")
+    wiki_sub.add_parser("list", help="List canonical page metadata in deterministic order.")
+    wiki_backup = wiki_sub.add_parser("backup", help="Create a restricted Git and working-tree backup.")
+    wiki_backup.add_argument("--backup-root")
+    wiki_restore = wiki_sub.add_parser(
+        "restore-verify", help="Verify a backup in a new temporary directory."
+    )
+    wiki_restore.add_argument("backup")
     return parser
+
+
+def _run_wiki(args: argparse.Namespace) -> int:
+    from .wiki import WikiRepository
+
+    repository = WikiRepository(args.root)
+    if args.wiki_command == "init":
+        print(json.dumps(
+            repository.initialize(with_samples=args.with_samples),
+            indent=2, ensure_ascii=False,
+        ))
+        return 0
+    if args.wiki_command == "validate":
+        issues = repository.validate()
+        for issue in issues:
+            print("\t".join((
+                issue.code, issue.file, issue.item_id, issue.field, issue.message
+            )))
+        return 1 if issues else 0
+    if args.wiki_command == "status":
+        print(json.dumps(
+            repository.status(args.backup_root), indent=2, ensure_ascii=False
+        ))
+        return 0
+    if args.wiki_command == "get":
+        page = repository.get_page(args.page_id)
+        print(json.dumps(
+            {"metadata": page.metadata(), "content": page.body},
+            indent=2, ensure_ascii=False,
+        ))
+        return 0
+    if args.wiki_command == "list":
+        print(json.dumps(repository.list_pages(), indent=2, ensure_ascii=False))
+        return 0
+    if args.wiki_command == "backup":
+        print(json.dumps(
+            {"backup": str(repository.backup(args.backup_root))}, indent=2
+        ))
+        return 0
+    if args.wiki_command == "restore-verify":
+        print(json.dumps(
+            WikiRepository.restore_verify(args.backup), indent=2, ensure_ascii=False
+        ))
+        return 0
+    return 2
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "wiki":
+            return _run_wiki(args)
         config = load_config(args.config)
         client = OpenWebUIClient(
             config.openwebui.base_url,

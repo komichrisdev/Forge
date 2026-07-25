@@ -1,0 +1,16 @@
+.locks/
+.tmp/
+index/*
+!index/README.md
+*.sqlite
+*.sqlite3
+*.db
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.bak
+*.tar
+*.tar.gz
+*.bundle
+.DS_Store

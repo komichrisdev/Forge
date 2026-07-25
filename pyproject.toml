@@ -7,7 +7,7 @@ name = "openwebui-codex-swarm"
 version = "0.2.0"
 description = "A token-conscious Open WebUI model swarm orchestrator and dashboard for Codex."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["PyYAML==6.0.3"]
 
 [project.scripts]
 owui-swarm = "swarm_router.cli:main"
@@ -16,4 +16,10 @@ owui-swarm = "swarm_router.cli:main"
 include = ["swarm_router*"]
 
 [tool.setuptools.package-data]
-swarm_router = ["benchmarks/*.json"]
+swarm_router = [
+    "benchmarks/*.json",
+    "wiki_template/**/*",
+    "wiki_template/.gitignore",
+    "wiki_template/*/.gitkeep",
+    "wiki_template/*/*/.gitkeep",
+]

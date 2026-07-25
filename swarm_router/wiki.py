@@ -1,0 +1,1213 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from hashlib import sha256
+from pathlib import Path, PurePosixPath
+from secrets import token_hex
+from stat import S_IMODE
+from time import monotonic, sleep
+from typing import Any, Iterator
+from urllib.parse import parse_qsl, urlsplit
+import fcntl
+import json
+import os
+import re
+import subprocess
+import tarfile
+import tempfile
+
+import yaml
+from yaml.constructor import ConstructorError
+from yaml.events import AliasEvent
+from yaml.nodes import MappingNode
+
+from . import __version__
+
+
+DEFAULT_WIKI_ROOT = "/srv/swarm-wiki"
+DEFAULT_BACKUP_ROOT = "~/backups/swarm-wiki"
+WIKI_ROOT_ENV = "OWUI_SWARM_WIKI_ROOT"
+SCHEMA_VERSION = "1.0"
+MAX_DOCUMENT_BYTES = 1_000_000
+PAGE_SECTIONS = ("projects", "features", "decisions", "systems", "research", "glossary")
+VERIFICATION_STATUSES = ("unverified", "verified", "conflicted", "superseded")
+SOURCE_TYPES = ("jira", "drive", "document", "web", "repository", "decision", "runbook", "other")
+SOURCE_AUTHORITIES = ("authoritative", "approved-decision", "supporting", "generated")
+PAGE_FIELDS = (
+    "id", "title", "project", "aliases", "jira_keys", "source_refs",
+    "source_updated_at", "ingested_at", "verification_status", "confidence",
+    "tags", "supersedes",
+)
+SOURCE_FIELDS = (
+    "source_id", "version", "source_type", "title", "locator",
+    "source_updated_at", "ingested_at", "checksum", "checksum_algorithm",
+    "media_type", "authority", "supersedes", "notes",
+)
+ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+JIRA_RE = re.compile(r"^[A-Z][A-Z0-9]{1,19}-[1-9][0-9]*$")
+MEDIA_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$")
+REFERENCE_RE = re.compile(r"\[\[(page|source):([^\]]+)\]\]")
+SENSITIVE_QUERY_KEYS = {"api_key", "apikey", "auth", "key", "password", "secret", "signature", "token"}
+REQUIRED_PATHS = (
+    "README.md", ".gitignore", "sources", "sources/README.md", "sources/manifests",
+    "sources/originals", "wiki", "proposals", "proposals/README.md", "schema",
+    "schema/VERSION", "schema/PAGE.md", "schema/SOURCE.md", "schema/INGEST.md",
+    "schema/VERIFY.md", "schema/RETRIEVE.md", "schema/STYLE.md", "schema/BACKUP.md",
+    "index", "index/README.md", "tests", "tests/fixtures",
+) + tuple(f"wiki/{section}" for section in PAGE_SECTIONS)
+SAMPLE_PATHS = {
+    "sources/manifests/src-orbit-charter-v1.yaml",
+    "sources/manifests/src-orbit-cache-decision-v1.yaml",
+    "sources/manifests/src-orbit-runbook-v1.yaml",
+    "sources/originals/orbit-charter-v1.txt",
+    "sources/originals/orbit-cache-decision-v1.txt",
+    "sources/originals/orbit-runbook-v1.txt",
+    "wiki/projects/acme-orbit-overview.md",
+    "wiki/features/acme-orbit-cache-decision.md",
+    "wiki/systems/acme-orbit-recovery-runbook.md",
+}
+
+
+class StrictLoader(yaml.SafeLoader):
+    def compose_node(self, parent: Any, index: Any) -> Any:
+        if self.check_event(AliasEvent):
+            event = self.peek_event()
+            raise ConstructorError(
+                "document", event.start_mark, "YAML aliases are forbidden", event.start_mark
+            )
+        return super().compose_node(parent, index)
+
+
+StrictLoader.yaml_implicit_resolvers = {
+    key: list(value) for key, value in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+for key, resolvers in StrictLoader.yaml_implicit_resolvers.items():
+    StrictLoader.yaml_implicit_resolvers[key] = [
+        item for item in resolvers if item[0] != "tag:yaml.org,2002:timestamp"
+    ]
+
+
+def _strict_mapping(loader: StrictLoader, node: MappingNode, deep: bool = False) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ConstructorError("mapping", node.start_mark, "unhashable key", key_node.start_mark) from exc
+        if duplicate:
+            raise ConstructorError(
+                "mapping", node.start_mark, f"duplicate key: {key}", key_node.start_mark
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+StrictLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_mapping
+)
+
+
+@dataclass(frozen=True)
+class WikiIssue:
+    code: str
+    file: str
+    item_id: str = ""
+    field: str = ""
+    message: str = ""
+
+    def as_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+class WikiValidationError(ValueError):
+    def __init__(self, issues: list[WikiIssue]):
+        self.issues = sorted(
+            issues, key=lambda item: (item.file, item.code, item.item_id, item.field, item.message)
+        )
+        super().__init__("; ".join(
+            f"{item.code}:{item.file}:{item.field}:{item.message}" for item in self.issues
+        ))
+
+
+class WikiLockError(TimeoutError):
+    pass
+
+
+@dataclass(frozen=True)
+class WikiPage:
+    id: str
+    title: str
+    project: str
+    aliases: tuple[str, ...]
+    jira_keys: tuple[str, ...]
+    source_refs: tuple[str, ...]
+    source_updated_at: str
+    ingested_at: str
+    verification_status: str
+    confidence: int
+    tags: tuple[str, ...]
+    supersedes: tuple[str, ...]
+    body: str
+
+    def metadata(self) -> dict[str, Any]:
+        value = asdict(self)
+        value.pop("body")
+        for key in ("aliases", "jira_keys", "source_refs", "tags", "supersedes"):
+            value[key] = list(value[key])
+        return value
+
+
+@dataclass(frozen=True)
+class SourceManifest:
+    source_id: str
+    version: int
+    source_type: str
+    title: str
+    locator: str
+    source_updated_at: str
+    ingested_at: str
+    checksum: str
+    checksum_algorithm: str
+    media_type: str
+    authority: str
+    supersedes: tuple[str, ...]
+    notes: str
+
+    def as_mapping(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["supersedes"] = list(value["supersedes"])
+        return value
+
+
+def wiki_root(value: str | Path | None = None) -> Path:
+    configured = value if value is not None else os.environ.get(WIKI_ROOT_ENV, DEFAULT_WIKI_ROOT)
+    return Path(os.path.abspath(os.path.expanduser(str(configured))))
+
+
+def normalize_jira_key(value: str) -> str:
+    normalized = value.strip().upper()
+    if not JIRA_RE.fullmatch(normalized):
+        raise ValueError(f"Invalid Jira key: {value!r}")
+    return normalized
+
+
+def page_filename(page_id: str) -> str:
+    if not ID_RE.fullmatch(page_id):
+        raise ValueError(f"Invalid page ID: {page_id!r}")
+    return f"{page_id}.md"
+
+
+def source_filename(source_id: str) -> str:
+    if not ID_RE.fullmatch(source_id):
+        raise ValueError(f"Invalid source ID: {source_id!r}")
+    return f"{source_id}.yaml"
+
+
+def _canonical_timestamp(value: Any, file: str, field: str, issues: list[WikiIssue]) -> str:
+    if not isinstance(value, str):
+        issues.append(WikiIssue("invalid_type", file, field=field, message="must be a string"))
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        issues.append(WikiIssue("invalid_timestamp", file, field=field, message="must be ISO 8601"))
+        return value
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        issues.append(WikiIssue("invalid_timestamp", file, field=field, message="timezone is required"))
+        return value
+    canonical = parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if canonical != value:
+        issues.append(WikiIssue(
+            "timestamp_not_normalized", file, field=field,
+            message="must use UTC seconds with a trailing Z",
+        ))
+    return canonical
+
+
+def _string(raw: dict[str, Any], field: str, file: str, issues: list[WikiIssue],
+            *, allow_empty: bool = False) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        issues.append(WikiIssue("invalid_type", file, field=field, message="must be a string"))
+        return ""
+    if "\x00" in value or (not allow_empty and not value.strip()):
+        issues.append(WikiIssue("invalid_value", file, field=field, message="must be non-empty text"))
+    return value
+
+
+def _strings(raw: dict[str, Any], field: str, file: str, issues: list[WikiIssue],
+             *, allow_empty: bool) -> tuple[str, ...]:
+    value = raw.get(field)
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        issues.append(WikiIssue("invalid_type", file, field=field, message="must be a list of strings"))
+        return ()
+    if not allow_empty and not value:
+        issues.append(WikiIssue("empty_list", file, field=field, message="must not be empty"))
+    if any(not item.strip() or "\x00" in item for item in value):
+        issues.append(WikiIssue("invalid_value", file, field=field, message="items must be non-empty"))
+    folded = [item.casefold() for item in value]
+    if len(folded) != len(set(folded)):
+        issues.append(WikiIssue("duplicate_value", file, field=field, message="items must be unique"))
+    return tuple(value)
+
+
+def _mapping(text: str, file: str) -> dict[str, Any]:
+    if len(text.encode("utf-8")) > MAX_DOCUMENT_BYTES:
+        raise WikiValidationError([
+            WikiIssue("document_too_large", file, message=f"maximum is {MAX_DOCUMENT_BYTES} bytes")
+        ])
+    try:
+        value = yaml.load(text, Loader=StrictLoader)
+    except yaml.YAMLError as exc:
+        raise WikiValidationError([
+            WikiIssue("malformed_yaml", file, message=str(exc).splitlines()[0])
+        ]) from exc
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise WikiValidationError([
+            WikiIssue("invalid_front_matter", file, message="must be a string-keyed mapping")
+        ])
+    return value
+
+
+def _fields(raw: dict[str, Any], expected: tuple[str, ...], file: str) -> list[WikiIssue]:
+    issues = [
+        WikiIssue("missing_field", file, field=field, message="required field is missing")
+        for field in expected if field not in raw
+    ]
+    issues.extend(
+        WikiIssue("unknown_field", file, field=field, message="field is not allowed")
+        for field in sorted(set(raw) - set(expected))
+    )
+    return issues
+
+
+def parse_page(text: str, file: str = "<memory>") -> WikiPage:
+    if not text.startswith("---\n"):
+        raise WikiValidationError([
+            WikiIssue("malformed_front_matter", file, message="opening delimiter is required")
+        ])
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        raise WikiValidationError([
+            WikiIssue("malformed_front_matter", file, message="closing delimiter is required")
+        ])
+    raw = _mapping(text[4:end], file)
+    body = text[end + 5:].strip()
+    issues = _fields(raw, PAGE_FIELDS, file)
+    page_id = _string(raw, "id", file, issues)
+    title = _string(raw, "title", file, issues)
+    project = _string(raw, "project", file, issues)
+    aliases = _strings(raw, "aliases", file, issues, allow_empty=True)
+    jira_keys = _strings(raw, "jira_keys", file, issues, allow_empty=True)
+    source_refs = _strings(raw, "source_refs", file, issues, allow_empty=False)
+    source_updated_at = _canonical_timestamp(raw.get("source_updated_at"), file, "source_updated_at", issues)
+    ingested_at = _canonical_timestamp(raw.get("ingested_at"), file, "ingested_at", issues)
+    verification_status = _string(raw, "verification_status", file, issues)
+    confidence = raw.get("confidence")
+    tags = _strings(raw, "tags", file, issues, allow_empty=False)
+    supersedes = _strings(raw, "supersedes", file, issues, allow_empty=True)
+
+    if page_id and not ID_RE.fullmatch(page_id):
+        issues.append(WikiIssue("invalid_page_id", file, page_id, "id", "must be a lowercase slug"))
+    if project and not ID_RE.fullmatch(project):
+        issues.append(WikiIssue("invalid_project", file, page_id, "project", "must be a lowercase slug"))
+    for key in jira_keys:
+        try:
+            if normalize_jira_key(key) != key:
+                raise ValueError
+        except ValueError:
+            issues.append(WikiIssue("invalid_jira_key", file, page_id, "jira_keys", f"not canonical: {key}"))
+    for ref in (*source_refs, *supersedes):
+        if not ID_RE.fullmatch(ref):
+            issues.append(WikiIssue("invalid_reference", file, page_id, "source_refs", f"invalid ID: {ref}"))
+    for tag in tags:
+        if not ID_RE.fullmatch(tag):
+            issues.append(WikiIssue("invalid_tag", file, page_id, "tags", f"invalid tag: {tag}"))
+    if verification_status not in VERIFICATION_STATUSES:
+        issues.append(WikiIssue(
+            "invalid_verification_status", file, page_id, "verification_status",
+            f"must be one of {', '.join(VERIFICATION_STATUSES)}",
+        ))
+    if isinstance(confidence, bool) or not isinstance(confidence, int) or not 0 <= confidence <= 100:
+        issues.append(WikiIssue(
+            "invalid_confidence", file, page_id, "confidence", "must be an integer from 0 to 100"
+        ))
+        confidence = 0
+    if page_id and page_id in supersedes:
+        issues.append(WikiIssue("self_supersession", file, page_id, "supersedes", "cannot supersede itself"))
+    if not body:
+        issues.append(WikiIssue("empty_body", file, page_id, message="page body must not be empty"))
+    if re.search(r"(?:file://|/(?:home|srv|etc)/)", body):
+        issues.append(WikiIssue(
+            "absolute_path", file, page_id, message="absolute filesystem references are forbidden"
+        ))
+    references = REFERENCE_RE.findall(body)
+    body_sources = [target for kind, target in references if kind == "source"]
+    for kind, target in references:
+        if not ID_RE.fullmatch(target):
+            issues.append(WikiIssue("invalid_reference", file, page_id, message=f"invalid {kind} ID: {target}"))
+    for source_id in source_refs:
+        if source_id not in body_sources:
+            issues.append(WikiIssue(
+                "unattached_source_ref", file, page_id, "source_refs",
+                f"body must cite [[source:{source_id}]]",
+            ))
+    for source_id in body_sources:
+        if source_id not in source_refs:
+            issues.append(WikiIssue(
+                "undeclared_source_ref", file, page_id, "source_refs",
+                f"body cites undeclared source {source_id}",
+            ))
+    if verification_status == "conflicted" and not re.search(r"^## Conflicts\s*$", body, re.MULTILINE):
+        issues.append(WikiIssue(
+            "missing_conflict_section", file, page_id, "verification_status",
+            "conflicted pages require a ## Conflicts section",
+        ))
+    if issues:
+        raise WikiValidationError(issues)
+    return WikiPage(
+        page_id, title, project, aliases, jira_keys, source_refs,
+        source_updated_at, ingested_at, verification_status, confidence,
+        tags, supersedes, body,
+    )
+
+
+def parse_source(text: str, file: str = "<memory>") -> SourceManifest:
+    raw = _mapping(text, file)
+    issues = _fields(raw, SOURCE_FIELDS, file)
+    source_id = _string(raw, "source_id", file, issues)
+    version = raw.get("version")
+    source_type = _string(raw, "source_type", file, issues)
+    title = _string(raw, "title", file, issues)
+    locator = _string(raw, "locator", file, issues)
+    source_updated_at = _canonical_timestamp(raw.get("source_updated_at"), file, "source_updated_at", issues)
+    ingested_at = _canonical_timestamp(raw.get("ingested_at"), file, "ingested_at", issues)
+    checksum = _string(raw, "checksum", file, issues)
+    checksum_algorithm = _string(raw, "checksum_algorithm", file, issues)
+    media_type = _string(raw, "media_type", file, issues)
+    authority = _string(raw, "authority", file, issues)
+    supersedes = _strings(raw, "supersedes", file, issues, allow_empty=True)
+    notes = _string(raw, "notes", file, issues, allow_empty=True)
+
+    if source_id and not ID_RE.fullmatch(source_id):
+        issues.append(WikiIssue("invalid_source_id", file, source_id, "source_id", "must be a lowercase slug"))
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        issues.append(WikiIssue("invalid_version", file, source_id, "version", "must be a positive integer"))
+        version = 1
+    if source_type not in SOURCE_TYPES:
+        issues.append(WikiIssue("invalid_source_type", file, source_id, "source_type", "unknown source type"))
+    if authority not in SOURCE_AUTHORITIES:
+        issues.append(WikiIssue("invalid_authority", file, source_id, "authority", "unknown authority"))
+    if checksum_algorithm != "sha256":
+        issues.append(WikiIssue(
+            "invalid_checksum_algorithm", file, source_id, "checksum_algorithm", "only sha256 is allowed"
+        ))
+    if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        issues.append(WikiIssue("invalid_checksum", file, source_id, "checksum", "must be 64 lowercase hex characters"))
+    if not MEDIA_TYPE_RE.fullmatch(media_type):
+        issues.append(WikiIssue("invalid_media_type", file, source_id, "media_type", "must be type/subtype"))
+    for ref in supersedes:
+        if not ID_RE.fullmatch(ref):
+            issues.append(WikiIssue("invalid_reference", file, source_id, "supersedes", f"invalid ID: {ref}"))
+    if source_id and source_id in supersedes:
+        issues.append(WikiIssue("self_supersession", file, source_id, "supersedes", "cannot supersede itself"))
+    if locator:
+        _validate_locator(locator, file, source_id, issues)
+    if issues:
+        raise WikiValidationError(issues)
+    return SourceManifest(
+        source_id, version, source_type, title, locator, source_updated_at,
+        ingested_at, checksum, checksum_algorithm, media_type, authority,
+        supersedes, notes,
+    )
+
+
+def _validate_locator(locator: str, file: str, source_id: str,
+                      issues: list[WikiIssue]) -> None:
+    parsed = urlsplit(locator)
+    if parsed.scheme in {"http", "https"}:
+        if not parsed.netloc or parsed.username or parsed.password:
+            issues.append(WikiIssue("unsafe_locator", file, source_id, "locator", "URL credentials are forbidden"))
+        query_keys = {key.casefold() for key, _value in parse_qsl(parsed.query, keep_blank_values=True)}
+        if query_keys & SENSITIVE_QUERY_KEYS:
+            issues.append(WikiIssue("unsafe_locator", file, source_id, "locator", "sensitive query keys are forbidden"))
+        return
+    if locator.startswith("external:") and ID_RE.fullmatch(locator.removeprefix("external:")):
+        return
+    path = PurePosixPath(locator)
+    if (
+        path.is_absolute() or "\\" in locator or ".." in path.parts or
+        len(path.parts) < 3 or path.parts[:2] != ("sources", "originals")
+    ):
+        issues.append(WikiIssue(
+            "unsafe_locator", file, source_id, "locator",
+            "must be an http(s) URL, external:<slug>, or sources/originals relative path",
+        ))
+
+
+def serialize_page(page: WikiPage) -> str:
+    front = page.metadata()
+    ordered = {field: front[field] for field in PAGE_FIELDS}
+    yaml_text = yaml.safe_dump(
+        ordered, allow_unicode=True, default_flow_style=False, sort_keys=False, width=1000
+    )
+    return f"---\n{yaml_text}---\n\n{page.body.strip()}\n"
+
+
+def serialize_source(source: SourceManifest) -> str:
+    raw = source.as_mapping()
+    ordered = {field: raw[field] for field in SOURCE_FIELDS}
+    return yaml.safe_dump(
+        ordered, allow_unicode=True, default_flow_style=False, sort_keys=False, width=1000
+    )
+
+
+class WikiRepository:
+    def __init__(self, root: str | Path | None = None):
+        self.root = wiki_root(root)
+
+    def _assert_root(self, *, exists: bool = True) -> None:
+        if self.root.is_symlink():
+            raise ValueError("Wiki root must not be a symlink")
+        if exists and not self.root.is_dir():
+            raise ValueError(f"Wiki root is unavailable: {self.root}")
+        if self.root.exists() and self.root.resolve() != self.root:
+            raise ValueError("Wiki root path contains a symlink")
+
+    def _open_dir(self, relative: PurePosixPath | str = ".") -> int:
+        descriptor = os.open(
+            self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        try:
+            for part in PurePosixPath(relative).parts:
+                if part in {".", ""}:
+                    continue
+                if part == "..":
+                    raise ValueError("Directory traversal is forbidden")
+                next_descriptor = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _safe_path(self, path: Path) -> Path:
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError("Path escapes wiki root") from exc
+        current = self.root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError(f"Symlink paths are forbidden: {relative}")
+        return path
+
+    def initialize(self, *, with_samples: bool = False) -> dict[str, Any]:
+        if self.root.exists() and self.root.is_symlink():
+            raise ValueError("Wiki root must not be a symlink")
+        if not self.root.exists():
+            if not self.root.parent.is_dir():
+                raise ValueError(f"Wiki parent does not exist: {self.root.parent}")
+            self.root.mkdir(mode=0o750)
+        existing = list(self.root.iterdir())
+        if existing:
+            version = self.root / "schema/VERSION"
+            readme = self.root / "README.md"
+            if (
+                version.is_file() and version.read_text(encoding="utf-8").strip() == SCHEMA_VERSION and
+                readme.is_file() and "Swarm Wiki" in readme.read_text(encoding="utf-8")
+            ):
+                issues = self.validate()
+                if issues:
+                    raise WikiValidationError(issues)
+                return {"root": str(self.root), "created": False, "recognized": True}
+            raise ValueError("Wiki root contains unrecognized existing content")
+        os.chmod(self.root, 0o750)
+        template = Path(__file__).with_name("wiki_template")
+        if not template.is_dir():
+            raise RuntimeError("Packaged wiki template is unavailable")
+        for source in sorted(template.rglob("*")):
+            relative = source.relative_to(template).as_posix()
+            target = self.root / relative
+            if source.is_dir():
+                target.mkdir(mode=0o750)
+                continue
+            if not with_samples and relative in SAMPLE_PATHS:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
+            target.write_bytes(source.read_bytes())
+            os.chmod(target, 0o640)
+        return {"root": str(self.root), "created": True, "samples": with_samples}
+
+    @contextmanager
+    def locked(self, timeout_seconds: float = 10.0) -> Iterator[None]:
+        self._assert_root()
+        root_fd = self._open_dir()
+        try:
+            try:
+                os.mkdir(".locks", mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            lock_dir_fd = os.open(
+                ".locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+            )
+        finally:
+            os.close(root_fd)
+        fd = os.open(
+            "repository.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+            dir_fd=lock_dir_fd,
+        )
+        os.close(lock_dir_fd)
+        deadline = monotonic() + timeout_seconds
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if monotonic() >= deadline:
+                        raise WikiLockError("Timed out waiting for wiki repository lock")
+                    sleep(0.02)
+            payload = json.dumps({
+                "pid": os.getpid(),
+                "acquired_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }).encode()
+            os.ftruncate(fd, 0)
+            os.write(fd, payload)
+            os.fsync(fd)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def lock_state(self) -> dict[str, Any]:
+        if not (self.root / ".locks").exists():
+            return {"locked": False, "file_exists": False}
+        root_fd = self._open_dir()
+        try:
+            lock_dir_fd = os.open(
+                ".locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+            )
+        finally:
+            os.close(root_fd)
+        try:
+            fd = os.open(
+                "repository.lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=lock_dir_fd
+            )
+        except FileNotFoundError:
+            return {"locked": False, "file_exists": False}
+        finally:
+            os.close(lock_dir_fd)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {"locked": True, "file_exists": True}
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return {"locked": False, "file_exists": True}
+        finally:
+            os.close(fd)
+
+    def _walk_files(self) -> tuple[list[Path], list[WikiIssue]]:
+        files: list[Path] = []
+        issues: list[WikiIssue] = []
+        for base, directories, names in os.walk(self.root, followlinks=False):
+            base_path = Path(base)
+            relative_base = base_path.relative_to(self.root)
+            kept: list[str] = []
+            for name in sorted(directories):
+                path = base_path / name
+                relative = path.relative_to(self.root).as_posix()
+                if path.is_symlink():
+                    issues.append(WikiIssue("symlink_forbidden", relative, message="symlinks are forbidden"))
+                    continue
+                if relative_base == Path(".") and name in {".git", ".locks", ".tmp"}:
+                    continue
+                kept.append(name)
+            directories[:] = kept
+            for name in sorted(names):
+                path = base_path / name
+                relative = path.relative_to(self.root).as_posix()
+                if path.is_symlink():
+                    issues.append(WikiIssue("symlink_forbidden", relative, message="symlinks are forbidden"))
+                elif path.is_file():
+                    if path.stat().st_nlink != 1:
+                        issues.append(WikiIssue(
+                            "hardlink_forbidden", relative,
+                            message="protected files must have exactly one hard link",
+                        ))
+                    files.append(path)
+        return files, issues
+
+    def validate(
+        self,
+        *,
+        page_override: tuple[Path, WikiPage] | None = None,
+        source_override: tuple[Path, SourceManifest] | None = None,
+    ) -> list[WikiIssue]:
+        try:
+            self._assert_root()
+        except ValueError as exc:
+            return [WikiIssue("invalid_root", ".", message=str(exc))]
+        issues: list[WikiIssue] = []
+        root_stat = self.root.stat()
+        if root_stat.st_uid != os.geteuid():
+            issues.append(WikiIssue("unsafe_owner", ".", message="wiki root must be owned by the current user"))
+        if root_stat.st_gid != os.getgid():
+            issues.append(WikiIssue("unsafe_group", ".", message="wiki root must use the current user's primary group"))
+        if S_IMODE(root_stat.st_mode) != 0o750:
+            issues.append(WikiIssue("unsafe_mode", ".", message="wiki root mode must be 0750"))
+        for required in REQUIRED_PATHS:
+            if not (self.root / required).exists():
+                issues.append(WikiIssue("missing_path", required, message="required path is missing"))
+        version = self.root / "schema/VERSION"
+        if version.is_file() and version.read_text(encoding="utf-8").strip() != SCHEMA_VERSION:
+            issues.append(WikiIssue("schema_version", "schema/VERSION", message=f"expected {SCHEMA_VERSION}"))
+        files, walk_issues = self._walk_files()
+        issues.extend(walk_issues)
+        pages: list[tuple[Path, WikiPage]] = []
+        sources: list[tuple[Path, SourceManifest]] = []
+        page_override_path = page_override[0] if page_override else None
+        source_override_path = source_override[0] if source_override else None
+
+        for path in files:
+            relative = path.relative_to(self.root)
+            parts = relative.parts
+            rel = relative.as_posix()
+            if not parts:
+                continue
+            if len(parts) == 1:
+                if parts[0] not in {"README.md", ".gitignore"}:
+                    issues.append(WikiIssue("unknown_file", rel, message="unexpected root file"))
+                continue
+            top = parts[0]
+            if top == "wiki":
+                if len(parts) != 3 or parts[1] not in PAGE_SECTIONS:
+                    issues.append(WikiIssue("unknown_file", rel, message="unexpected wiki path"))
+                elif parts[2] == ".gitkeep":
+                    continue
+                elif path.suffix != ".md":
+                    issues.append(WikiIssue("unknown_file", rel, message="canonical pages must be Markdown"))
+                else:
+                    try:
+                        page = page_override[1] if path == page_override_path else parse_page(
+                            path.read_text(encoding="utf-8"), rel
+                        )
+                        if path.name != page_filename(page.id):
+                            issues.append(WikiIssue(
+                                "unsafe_filename", rel, page.id, "id",
+                                f"filename must be {page_filename(page.id)}",
+                            ))
+                        pages.append((path, page))
+                    except (UnicodeDecodeError, WikiValidationError) as exc:
+                        if isinstance(exc, WikiValidationError):
+                            issues.extend(exc.issues)
+                        else:
+                            issues.append(WikiIssue("invalid_utf8", rel, message="must be UTF-8"))
+            elif top == "sources":
+                if parts == ("sources", "README.md"):
+                    continue
+                if len(parts) >= 3 and parts[1] == "originals":
+                    continue
+                if parts == ("sources", "manifests", ".gitkeep"):
+                    continue
+                if len(parts) == 3 and parts[1] == "manifests" and path.suffix == ".yaml":
+                    try:
+                        source = source_override[1] if path == source_override_path else parse_source(
+                            path.read_text(encoding="utf-8"), rel
+                        )
+                        if path.name != source_filename(source.source_id):
+                            issues.append(WikiIssue(
+                                "unsafe_filename", rel, source.source_id, "source_id",
+                                f"filename must be {source_filename(source.source_id)}",
+                            ))
+                        sources.append((path, source))
+                    except (UnicodeDecodeError, WikiValidationError) as exc:
+                        if isinstance(exc, WikiValidationError):
+                            issues.extend(exc.issues)
+                        else:
+                            issues.append(WikiIssue("invalid_utf8", rel, message="must be UTF-8"))
+                else:
+                    issues.append(WikiIssue("unknown_file", rel, message="unexpected source path"))
+            elif top == "schema":
+                allowed = {
+                    "VERSION", "PAGE.md", "SOURCE.md", "INGEST.md", "VERIFY.md",
+                    "RETRIEVE.md", "STYLE.md", "BACKUP.md",
+                }
+                if len(parts) != 2 or parts[1] not in allowed:
+                    issues.append(WikiIssue("unknown_file", rel, message="unexpected schema file"))
+            elif top == "proposals":
+                if len(parts) != 2 or (parts[1] != "README.md" and path.suffix != ".md"):
+                    issues.append(WikiIssue("unknown_file", rel, message="unexpected proposal file"))
+            elif top == "index":
+                if parts != ("index", "README.md"):
+                    issues.append(WikiIssue("unknown_file", rel, message="generated indexes are excluded"))
+            elif top == "tests":
+                if parts != ("tests", "fixtures", ".gitkeep"):
+                    issues.append(WikiIssue("unknown_file", rel, message="unexpected fixture file"))
+            else:
+                issues.append(WikiIssue("unknown_file", rel, message="unexpected repository path"))
+
+        if page_override and all(path != page_override[0] for path, _page in pages):
+            pages.append(page_override)
+        if source_override and all(path != source_override[0] for path, _source in sources):
+            sources.append(source_override)
+
+        page_ids: dict[str, list[Path]] = {}
+        source_ids: dict[str, list[Path]] = {}
+        for path, page in pages:
+            page_ids.setdefault(page.id, []).append(path)
+        for path, source in sources:
+            source_ids.setdefault(source.source_id, []).append(path)
+        for item_id, paths in page_ids.items():
+            if len(paths) > 1:
+                for path in paths:
+                    issues.append(WikiIssue(
+                        "duplicate_page_id", path.relative_to(self.root).as_posix(), item_id,
+                        "id", "page ID must be globally unique",
+                    ))
+        for item_id, paths in source_ids.items():
+            if len(paths) > 1:
+                for path in paths:
+                    issues.append(WikiIssue(
+                        "duplicate_source_id", path.relative_to(self.root).as_posix(), item_id,
+                        "source_id", "source ID must be globally unique",
+                    ))
+
+        page_map = {page.id: (path, page) for path, page in pages}
+        source_map = {source.source_id: (path, source) for path, source in sources}
+        superseded_by: dict[str, list[str]] = {}
+        for path, page in pages:
+            rel = path.relative_to(self.root).as_posix()
+            for source_id in page.source_refs:
+                if source_id not in source_map:
+                    issues.append(WikiIssue(
+                        "broken_source_ref", rel, page.id, "source_refs",
+                        f"source does not exist: {source_id}",
+                    ))
+            for kind, target in REFERENCE_RE.findall(page.body):
+                if kind == "page" and target not in page_map:
+                    issues.append(WikiIssue("broken_page_link", rel, page.id, message=f"page does not exist: {target}"))
+            for target in page.supersedes:
+                if target not in page_map:
+                    issues.append(WikiIssue(
+                        "missing_superseded_page", rel, page.id, "supersedes",
+                        f"page does not exist: {target}",
+                    ))
+                else:
+                    superseded_by.setdefault(target, []).append(page.id)
+                    if page_map[target][1].verification_status != "superseded":
+                        issues.append(WikiIssue(
+                            "superseded_status", rel, page.id, "supersedes",
+                            f"{target} must have verification_status superseded",
+                        ))
+        for page_id, (path, page) in page_map.items():
+            if page.verification_status == "superseded" and page_id not in superseded_by:
+                issues.append(WikiIssue(
+                    "orphan_superseded_page", path.relative_to(self.root).as_posix(), page_id,
+                    "verification_status", "superseded page must be referenced by a replacement",
+                ))
+        issues.extend(self._supersession_cycles(page_map))
+
+        for path, source in sources:
+            rel = path.relative_to(self.root).as_posix()
+            for target in source.supersedes:
+                if target not in source_map:
+                    issues.append(WikiIssue(
+                        "missing_source_version", rel, source.source_id, "supersedes",
+                        f"source does not exist: {target}",
+                    ))
+                elif source.version <= source_map[target][1].version:
+                    issues.append(WikiIssue(
+                        "invalid_source_version", rel, source.source_id, "version",
+                        "new source version must be greater than superseded version",
+                    ))
+            if source.locator.startswith("sources/originals/"):
+                original = self.root / PurePosixPath(source.locator)
+                try:
+                    self._safe_path(original)
+                except ValueError as exc:
+                    issues.append(WikiIssue("unsafe_locator", rel, source.source_id, "locator", str(exc)))
+                    continue
+                if not original.is_file():
+                    issues.append(WikiIssue(
+                        "missing_source_content", rel, source.source_id, "locator",
+                        f"source file does not exist: {source.locator}",
+                    ))
+                elif sha256(original.read_bytes()).hexdigest() != source.checksum:
+                    issues.append(WikiIssue(
+                        "checksum_mismatch", rel, source.source_id, "checksum",
+                        "source content does not match manifest checksum",
+                    ))
+        return sorted(
+            issues, key=lambda item: (item.file, item.code, item.item_id, item.field, item.message)
+        )
+
+    def _supersession_cycles(
+        self, page_map: dict[str, tuple[Path, WikiPage]]
+    ) -> list[WikiIssue]:
+        issues: list[WikiIssue] = []
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(page_id: str, chain: list[str]) -> None:
+            if page_id in visiting:
+                cycle = chain[chain.index(page_id):] + [page_id]
+                path = page_map[page_id][0].relative_to(self.root).as_posix()
+                issues.append(WikiIssue(
+                    "supersession_cycle", path, page_id, "supersedes",
+                    " -> ".join(cycle),
+                ))
+                return
+            if page_id in visited:
+                return
+            visiting.add(page_id)
+            for target in page_map[page_id][1].supersedes:
+                if target in page_map:
+                    visit(target, chain + [page_id])
+            visiting.remove(page_id)
+            visited.add(page_id)
+
+        for page_id in sorted(page_map):
+            visit(page_id, [])
+        return issues
+
+    def require_valid(self) -> None:
+        issues = self.validate()
+        if issues:
+            raise WikiValidationError(issues)
+
+    def pages(self) -> list[WikiPage]:
+        self.require_valid()
+        result = [
+            parse_page(path.read_text(encoding="utf-8"), path.relative_to(self.root).as_posix())
+            for section in PAGE_SECTIONS
+            for path in sorted((self.root / "wiki" / section).glob("*.md"))
+        ]
+        return sorted(result, key=lambda page: page.id)
+
+    def get_page(self, page_id: str) -> WikiPage:
+        page_filename(page_id)
+        matches = [page for page in self.pages() if page.id == page_id]
+        if not matches:
+            raise KeyError(f"Page not found: {page_id}")
+        return matches[0]
+
+    def list_pages(self) -> list[dict[str, Any]]:
+        return [page.metadata() for page in self.pages()]
+
+    def _atomic_write(self, target: Path, content: str, parsed: Any,
+                      *, immutable: bool = False) -> None:
+        target = self._safe_path(target)
+        relative_parent = PurePosixPath(target.parent.relative_to(self.root).as_posix())
+        parent_fd = self._open_dir(relative_parent)
+        temporary_name = f".{target.name}.{token_hex(8)}.tmp"
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o640,
+            dir_fd=parent_fd,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.fchmod(handle.fileno(), 0o640)
+            read_fd = os.open(
+                temporary_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+            with os.fdopen(read_fd, "r", encoding="utf-8") as handle:
+                written = handle.read()
+            if isinstance(parsed, WikiPage):
+                reparsed = parse_page(written, target.name)
+            else:
+                reparsed = parse_source(written, target.name)
+            if reparsed != parsed:
+                raise RuntimeError("Serialized wiki object did not round-trip")
+            if immutable:
+                os.link(
+                    temporary_name, target.name,
+                    src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            else:
+                os.replace(
+                    temporary_name, target.name,
+                    src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                )
+            os.fsync(parent_fd)
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+
+    def write_page(self, page: WikiPage, *, section: str, dry_run: bool = False) -> Path:
+        if section not in PAGE_SECTIONS:
+            raise ValueError(f"Unknown page section: {section}")
+        content = serialize_page(page)
+        parsed = parse_page(content)
+        target = self.root / "wiki" / section / page_filename(page.id)
+        with self.locked():
+            issues = self.validate(page_override=(target, parsed))
+            if issues:
+                raise WikiValidationError(issues)
+            if not dry_run:
+                self._atomic_write(target, content, parsed)
+        return target
+
+    def write_source(self, source: SourceManifest, *, dry_run: bool = False) -> Path:
+        content = serialize_source(source)
+        parsed = parse_source(content)
+        target = self.root / "sources/manifests" / source_filename(source.source_id)
+        with self.locked():
+            if target.exists():
+                raise FileExistsError(f"Source manifest is immutable: {source.source_id}")
+            issues = self.validate(source_override=(target, parsed))
+            if issues:
+                raise WikiValidationError(issues)
+            if not dry_run:
+                try:
+                    self._atomic_write(target, content, parsed, immutable=True)
+                except FileExistsError as exc:
+                    raise FileExistsError(
+                        f"Source manifest is immutable: {source.source_id}"
+                    ) from exc
+        return target
+
+    def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(self.root), *args],
+            text=True, capture_output=True, check=check,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+
+    def git_info(self) -> dict[str, Any]:
+        if not (self.root / ".git").is_dir():
+            return {"repository": False, "branch": None, "commit": None, "dirty": False, "changes": []}
+        branch = self._git("branch", "--show-current").stdout.strip() or None
+        commit_result = self._git("rev-parse", "HEAD", check=False)
+        commit = commit_result.stdout.strip() if commit_result.returncode == 0 else None
+        changes = self._git("status", "--porcelain=v1").stdout.splitlines()
+        return {
+            "repository": True, "branch": branch, "commit": commit,
+            "dirty": bool(changes), "changes": changes,
+        }
+
+    def git_commit(self, message: str) -> str:
+        if not message.strip():
+            raise ValueError("Commit message is required")
+        with self.locked():
+            self.require_valid()
+            self._git("add", "--all")
+            self._git("commit", "-m", message)
+            return self._git("rev-parse", "HEAD").stdout.strip()
+
+    def status(self, backup_root: str | Path | None = None) -> dict[str, Any]:
+        issues = self.validate()
+        git = self.git_info()
+        proposals = [
+            path for path in (self.root / "proposals").glob("*.md") if path.name != "README.md"
+        ] if (self.root / "proposals").is_dir() else []
+        backups = Path(
+            os.path.abspath(os.path.expanduser(str(backup_root or DEFAULT_BACKUP_ROOT)))
+        )
+        recent = max(
+            (path.name for path in backups.iterdir() if path.is_dir()), default=None
+        ) if backups.is_dir() else None
+        return {
+            "root": str(self.root),
+            "git": git,
+            "page_count": len({
+                path.stem for section in PAGE_SECTIONS
+                for path in (self.root / "wiki" / section).glob("*.md")
+            }) if (self.root / "wiki").is_dir() else 0,
+            "source_manifest_count": len(list((self.root / "sources/manifests").glob("*.yaml")))
+            if (self.root / "sources/manifests").is_dir() else 0,
+            "proposal_count": len(proposals),
+            "validation": "valid" if not issues else "invalid",
+            "issue_count": len(issues),
+            "lock": self.lock_state() if self.root.is_dir() else {"locked": False, "file_exists": False},
+            "latest_backup": recent,
+        }
+
+    def backup(self, backup_root: str | Path | None = None) -> Path:
+        backup_parent = Path(os.path.abspath(os.path.expanduser(str(
+            backup_root or DEFAULT_BACKUP_ROOT
+        ))))
+        try:
+            backup_parent.relative_to(self.root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Backup root must be outside the wiki repository")
+        backup_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(backup_parent, 0o700)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        destination = backup_parent / timestamp
+        destination.mkdir(mode=0o700)
+
+        with self.locked():
+            self.require_valid()
+            git = self.git_info()
+            if not git["repository"] or not git["commit"]:
+                raise RuntimeError("Wiki backup requires a Git repository with at least one commit")
+            state_before = self._git("status", "--porcelain=v2", "-z").stdout
+            status_text = self._git("status", "--porcelain=v1").stdout
+            tracked = [
+                item for item in self._git("ls-files", "-z").stdout.split("\0") if item
+            ]
+            working_files = [
+                item for item in tracked
+                if (self.root / PurePosixPath(item)).is_file()
+            ]
+            bundle = destination / "wiki.bundle"
+            self._git("bundle", "create", str(bundle), "--all")
+            self._git("bundle", "verify", str(bundle))
+            archive = destination / "working-tree.tar.gz"
+            with tarfile.open(archive, "w:gz") as handle:
+                for name in working_files:
+                    path = self._safe_path(self.root / PurePosixPath(name))
+                    handle.add(path, arcname=name, recursive=False)
+            metadata = {
+                "schema_version": SCHEMA_VERSION,
+                "tool_version": __version__,
+                "backup_timestamp": timestamp,
+                "source_commit": git["commit"],
+                "source_branch": git["branch"],
+                "dirty": bool(status_text),
+                "working_files": working_files,
+                "page_count": len(self.list_pages()),
+                "source_manifest_count": len(list((self.root / "sources/manifests").glob("*.yaml"))),
+            }
+            (destination / "metadata.json").write_text(
+                json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            (destination / "git-status.txt").write_text(status_text, encoding="utf-8")
+            warning = (
+                "WARNING: tracked working files include uncommitted changes."
+                if status_text else "Repository was clean."
+            )
+            (destination / "BACKUP-MANIFEST.md").write_text(
+                "# Swarm Wiki backup\n\n"
+                f"- Timestamp: `{timestamp}`\n"
+                f"- Source commit: `{git['commit']}`\n"
+                f"- Schema version: `{SCHEMA_VERSION}`\n"
+                f"- State: {warning}\n"
+                "- Includes: all Git refs, current tracked working files, status and metadata.\n"
+                "- Excludes: untracked files, locks, temp files, generated indexes, caches and secrets.\n"
+                "- Restore verification always uses a new temporary directory.\n",
+                encoding="utf-8",
+            )
+            for path in destination.iterdir():
+                if path.is_file():
+                    os.chmod(path, 0o600)
+            checksum_paths = sorted(
+                path for path in destination.iterdir()
+                if path.is_file() and path.name != "SHA256SUMS"
+            )
+            sums = "".join(
+                f"{sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+                for path in checksum_paths
+            )
+            (destination / "SHA256SUMS").write_text(sums, encoding="utf-8")
+            os.chmod(destination / "SHA256SUMS", 0o600)
+            state_after = self._git("status", "--porcelain=v2", "-z").stdout
+            if state_after != state_before:
+                raise RuntimeError("Wiki changed while backup was being created")
+        return destination
+
+    @staticmethod
+    def restore_verify(backup: str | Path) -> dict[str, Any]:
+        backup_path = Path(os.path.abspath(os.path.expanduser(str(backup))))
+        sums_path = backup_path / "SHA256SUMS"
+        if not backup_path.is_dir() or not sums_path.is_file():
+            raise ValueError("Backup or SHA256SUMS is missing")
+        for line in sums_path.read_text(encoding="utf-8").splitlines():
+            digest, separator, name = line.partition("  ")
+            candidate = PurePosixPath(name)
+            if not separator or candidate.is_absolute() or ".." in candidate.parts:
+                raise ValueError("Unsafe checksum entry")
+            path = backup_path / candidate
+            if not path.is_file() or sha256(path.read_bytes()).hexdigest() != digest:
+                raise ValueError(f"Backup checksum failed: {name}")
+        metadata = json.loads((backup_path / "metadata.json").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory(
+            prefix=f"restore-test-{backup_path.name}-", dir=backup_path.parent
+        ) as temporary:
+            stage = Path(temporary)
+            verifier = stage / "verify.git"
+            subprocess.run(
+                ["git", "init", "--bare", "--quiet", str(verifier)],
+                text=True, capture_output=True, check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(verifier), "bundle", "verify",
+                 str(backup_path / "wiki.bundle")],
+                text=True, capture_output=True, check=True,
+            )
+            restored = stage / "wiki"
+            subprocess.run(
+                ["git", "clone", "--quiet", str(backup_path / "wiki.bundle"), str(restored)],
+                text=True, capture_output=True, check=True,
+            )
+            os.chmod(restored, 0o750)
+            raw_working_files = metadata.get("working_files")
+            if not isinstance(raw_working_files, list) or any(
+                not isinstance(name, str) for name in raw_working_files
+            ):
+                raise ValueError("Invalid working-file metadata")
+            working_files: set[str] = set()
+            for name in raw_working_files:
+                candidate = PurePosixPath(name)
+                if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
+                    raise ValueError("Unsafe working-file metadata")
+                working_files.add(candidate.as_posix())
+            current = subprocess.run(
+                ["git", "-C", str(restored), "ls-files", "-z"],
+                text=True, capture_output=True, check=True,
+            ).stdout.split("\0")
+            for name in filter(None, current):
+                if name not in working_files:
+                    (restored / PurePosixPath(name)).unlink(missing_ok=True)
+            with tarfile.open(backup_path / "working-tree.tar.gz", "r:gz") as handle:
+                for member in handle.getmembers():
+                    path = PurePosixPath(member.name)
+                    if (
+                        path.is_absolute() or ".." in path.parts or
+                        not member.isreg()
+                    ):
+                        raise ValueError("Unsafe archive entry")
+                handle.extractall(restored, filter="data")
+            repository = WikiRepository(restored)
+            issues = repository.validate()
+            if issues:
+                raise WikiValidationError(issues)
+            commit = repository._git("rev-parse", "HEAD").stdout.strip()
+            pages = len(repository.list_pages())
+            sources = len(list((restored / "sources/manifests").glob("*.yaml")))
+            if commit != metadata["source_commit"]:
+                raise ValueError("Restored commit does not match backup metadata")
+            if pages != metadata["page_count"] or sources != metadata["source_manifest_count"]:
+                raise ValueError("Restored page/source counts do not match backup metadata")
+            return {
+                "verified": True,
+                "source_commit": commit,
+                "page_count": pages,
+                "source_manifest_count": sources,
+                "dirty_backup": bool(metadata["dirty"]),
+            }

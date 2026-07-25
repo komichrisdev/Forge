@@ -1,0 +1,13 @@
+source_id: src-orbit-runbook-v1
+version: 1
+source_type: runbook
+title: Acme Orbit fictional recovery runbook
+locator: sources/originals/orbit-runbook-v1.txt
+source_updated_at: '2026-01-06T12:00:00Z'
+ingested_at: '2026-01-07T12:00:00Z'
+checksum: 270d82aba36caca2e6f0be6d78dea6f739e1242b7a70c1380fdcd678a6858dcd
+checksum_algorithm: sha256
+media_type: text/plain
+authority: supporting
+supersedes: []
+notes: Synthetic runbook fixture; commands and systems are fictional.

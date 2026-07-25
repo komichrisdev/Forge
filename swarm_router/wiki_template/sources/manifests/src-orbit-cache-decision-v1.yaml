@@ -1,0 +1,13 @@
+source_id: src-orbit-cache-decision-v1
+version: 1
+source_type: decision
+title: Acme Orbit fictional cache decision
+locator: sources/originals/orbit-cache-decision-v1.txt
+source_updated_at: '2026-01-04T12:00:00Z'
+ingested_at: '2026-01-05T12:00:00Z'
+checksum: 644519e5cb9a0f25aecbc709903540453fe1e05be551fd9f6ce4d43dacf8e774
+checksum_algorithm: sha256
+media_type: text/plain
+authority: approved-decision
+supersedes: []
+notes: Synthetic approved decision for validation only.

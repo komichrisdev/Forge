@@ -1,0 +1,13 @@
+source_id: src-orbit-charter-v1
+version: 1
+source_type: document
+title: Acme Orbit fictional charter
+locator: sources/originals/orbit-charter-v1.txt
+source_updated_at: '2026-01-02T12:00:00Z'
+ingested_at: '2026-01-03T12:00:00Z'
+checksum: 07e4de83a6db9049320709380935bd87c9ef7741e60418090003a63439782703
+checksum_algorithm: sha256
+media_type: text/plain
+authority: authoritative
+supersedes: []
+notes: Synthetic Phase 1.0 source fixture; no production content.

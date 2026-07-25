@@ -1,0 +1,8 @@
+FICTIONAL TEST SOURCE — ACME ORBIT CHARTER V1
+
+Acme Orbit is a training-only project used to validate the Swarm Wiki storage
+foundation. It has no production systems, customers, endpoints, or private
+records.
+
+The project goal is to document a small cache decision and a recovery runbook
+while preserving source references and explicit review status.
