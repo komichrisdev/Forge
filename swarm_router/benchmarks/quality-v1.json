@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "benchmarks": [
+    {
+      "id": "retry-helper",
+      "role": "implementer",
+      "mode": "code",
+      "max_chars": 5000,
+      "task": "Propose a minimal Python function that retries a callable using bounded exponential backoff.",
+      "acceptance": "Validate arguments before the first delay or call; catch only an explicitly supplied exception tuple; never catch BaseException; no jitter, dependencies, thread-safety claims, or execution claims; include proposed tests."
+    },
+    {
+      "id": "missing-go-context",
+      "role": "planner",
+      "mode": "code",
+      "max_chars": 2200,
+      "task": "Describe the smallest likely implementation change for adding request tracing to an existing Go service. No repository files or symbols are supplied.",
+      "acceptance": "Do not invent filenames, package names, structs, methods, or APIs. State what Codex must inspect and use neutral placeholders or conceptual steps."
+    },
+    {
+      "id": "installed-state",
+      "role": "verifier",
+      "mode": "general",
+      "max_chars": 2200,
+      "task": "Recommend reliability improvements for a model-routing service using only these supplied facts: requests have finite timeouts; individual worker failures are isolated; recent failures influence routing; explicit model overrides remain available.",
+      "acceptance": "Do not claim learned routing, an observability pipeline, safety registry, circuit breaker, or other unsupplied component exists. Mark every new mechanism as a proposal and every arbitrary threshold as requiring evidence."
+    },
+    {
+      "id": "adversarial-review",
+      "role": "critic",
+      "mode": "code",
+      "max_chars": 1800,
+      "task": "Review this deliberately flawed proposal: an AbstractRetryManager catches BaseException, invokes the callable, then validates attempts and delay; it adds a plugin registry and claims the result is safe for concurrent production use. Identify substantive defects and concise corrections.",
+      "acceptance": "Identify broad exception handling, late validation, the unsupported safety/concurrency claim, and unnecessary abstraction. Avoid style-only complaints."
+    },
+    {
+      "id": "exact-format",
+      "role": "verifier",
+      "mode": "general",
+      "max_chars": 500,
+      "task": "List three risks of accepting model-generated repository claims without checking files.",
+      "acceptance": "Return exactly three numbered findings, one sentence each, with no introduction or conclusion."
+    }
+  ]
+}

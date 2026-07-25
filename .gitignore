@@ -1,0 +1,76 @@
+# Python environments and generated metadata
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Node dependencies and caches
+node_modules/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+
+# Local runtime state and private artifacts
+.swarm-runs/
+runs/
+artifacts/
+uploads/
+runtime/
+data/
+models/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.db-wal
+*.db-shm
+*.db-journal
+*.gguf
+*.safetensors
+*.onnx
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+/config.toml
+/configuration/
+/secrets/
+credentials*.json
+secrets*.json
+*.pem
+*.key
+*.p12
+
+# Logs, temporary files, and editor/OS metadata
+*.log
+logs/
+tmp/
+.tmp/
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local backups and archives
+/backups/
+*.bak
+*.backup
+*.tar
+*.tar.gz
+*.tgz
+*.zip

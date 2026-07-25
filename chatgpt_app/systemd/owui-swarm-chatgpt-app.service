@@ -1,0 +1,28 @@
+[Unit]
+Description=Open WebUI Codex Swarm read-only ChatGPT MCP App
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/openwebui-codex-swarm/chatgpt_app
+ExecStart=/usr/bin/node %h/openwebui-codex-swarm/chatgpt_app/build/main.js
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+LockPersonality=true
+Environment=NODE_ENV=production
+Environment=SWARM_DB_PATH=%h/.local/share/owui-swarm/catalog.sqlite3
+Environment=SWARM_RUN_DIR=%h/.local/share/owui-swarm/runs
+
+[Install]
+WantedBy=default.target

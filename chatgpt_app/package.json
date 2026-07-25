@@ -1,0 +1,30 @@
+{
+  "name": "owui-swarm-chatgpt-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20.19" },
+  "scripts": {
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "check": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "test": "node --test --import tsx test/*.test.ts",
+    "serve": "node build/main.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "1.7.4",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "better-sqlite3": "12.11.1",
+    "express": "5.1.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "1.0.0",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/express": "5.0.3",
+    "@types/node": "20.19.9",
+    "tsx": "4.20.6",
+    "typescript": "5.8.3",
+    "vite": "7.3.6",
+    "vite-plugin-singlefile": "2.3.0"
+  }
+}
