@@ -11,12 +11,20 @@ import { startHttpServer } from "../src/main.js";
 import { createServer, WIDGET_URI } from "../src/server.js";
 
 type Json = Record<string, any>;
+const contractFixture = JSON.parse(readFileSync(new URL("./fixtures/mcp-live-contract.json", import.meta.url), "utf8")) as Json;
 const temp = mkdtempSync(join(tmpdir(), "swarm-control-test-"));
 const dbPath = join(temp, "catalog.sqlite3");
 const runRoot = join(temp, "runs");
 let data: SwarmData;
 
 function json(path: string, value: unknown): void { writeFileSync(path, JSON.stringify(value, null, 2)); }
+function normalized(value: any): any {
+  if (Array.isArray(value)) return value.map(normalized);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalized(value[key])]));
+  }
+  return value;
+}
 
 function createFixture(): void {
   mkdirSync(runRoot, { recursive: true });
@@ -132,6 +140,30 @@ describe("MCP protocol and widget", () => {
       assert.equal(tool.annotations?.readOnlyHint, true); assert.equal(tool.annotations?.destructiveHint, false); assert.equal(tool.annotations?.openWorldHint, false);
       assert.equal(tool.inputSchema.type, "object"); assert.equal(tool.outputSchema?.type, "object");
       assert.ok(!/(start|cancel|probe|update|delete|restart|execute|write)/i.test(tool.name));
+    }
+  });
+
+  test("public MCP contract matches the live baseline fixture", async () => {
+    const tools = (await client.listTools()).tools.sort((left, right) => left.name.localeCompare(right.name));
+    const resources = (await client.listResources()).resources.sort((left, right) => left.uri.localeCompare(right.uri));
+    const resourceTemplates = (await client.listResourceTemplates()).resourceTemplates;
+    const { capturedTransport, errorShapes, ...expected } = contractFixture;
+    assert.equal(capturedTransport, "streamable-http");
+    assert.deepEqual(normalized({
+      serverInfo: client.getServerVersion(),
+      capabilities: client.getServerCapabilities(),
+      tools,
+      resources,
+      resourceTemplates,
+    }), normalized(expected));
+
+    for (const [name, args, expectedError] of [
+      ["__phase_0_3_unknown_tool__", {}, errorShapes.unknownTool],
+      ["get_swarm_run_summary", {}, errorShapes.missingRequiredField],
+    ] as const) {
+      const response = await client.callTool({ name, arguments: args }) as Json;
+      assert.equal(response.isError, expectedError.isError);
+      assert.match(String((response.content[0] as Json).text), new RegExp(String(expectedError.code)));
     }
   });
 
