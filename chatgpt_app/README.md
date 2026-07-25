@@ -14,9 +14,9 @@ Protocol references: [MCP Apps build guide](https://modelcontextprotocol.io/exte
 
 ```bash
 cd /home/komichris/openwebui-codex-swarm/chatgpt_app
-npm install
+npm ci
 npm run check
-npm run build
+npm run check:mcp-build
 install -m 644 systemd/owui-swarm-chatgpt-app.service \
   /home/komichris/.config/systemd/user/owui-swarm-chatgpt-app.service
 systemctl --user daemon-reload
@@ -29,14 +29,23 @@ The runtime is isolated under this directory (`node_modules`, `build`, and `dist
 
 ```bash
 npm run check                 # TypeScript checks
-npm run build                 # Server compile plus single-file widget
+npm run build:mcp             # Explicitly regenerate committed build/ and dist/
+npm run check:mcp-build       # Isolated build; fail on generated-file drift
 npm test                      # Unit, schema, bridge, and in-memory MCP tests
+npm run test:mcp-contract     # Public schema/metadata baseline
+npm run test:mcp-parity       # Committed build versus isolated candidate
 RUN_HTTP_INTEGRATION=1 npm test  # Includes real loopback HTTP initialization
 systemctl --user status owui-swarm-chatgpt-app.service
 systemctl --user restart owui-swarm-chatgpt-app.service
 ```
 
 Endpoint: `http://127.0.0.1:8790/mcp`. No other app endpoint or public bind exists.
+
+`src/`, `widget.html`, and `vite.config.ts` are authoritative. Generated `build/`
+and `dist/` files are committed because the service runs `build/main.js`; do not
+edit them by hand. Regenerate explicitly with `npm run build:mcp`, then run the
+contract, parity, and no-drift checks. Public contract changes require review of
+`test/fixtures/mcp-live-contract.json`.
 
 ## Read-only tools
 
@@ -93,7 +102,7 @@ Do not register the app until Debian validation passes. The Windows session must
 journalctl --user -u owui-swarm-chatgpt-app.service -n 100 --no-pager
 ss -ltnp | grep 8790
 systemctl --user is-active owui-swarm-chatgpt-app.service
-npm run check && npm test && npm run build
+npm run check && npm test && npm run test:mcp-parity && npm run check:mcp-build
 ```
 
 `Swarm catalog is unavailable` means the configured SQLite file is absent or unreadable. `Swarm run directory is unavailable` means the run root cannot be read. The app returns bounded public errors and does not log artifact contents.

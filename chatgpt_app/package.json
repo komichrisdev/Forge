@@ -5,9 +5,13 @@
   "type": "module",
   "engines": { "node": ">=20.19" },
   "scripts": {
-    "build": "tsc -p tsconfig.server.json && vite build",
+    "build": "npm run build:mcp",
+    "build:mcp": "tsc -p tsconfig.server.json && vite build",
+    "check:mcp-build": "node scripts/mcp-build.mjs check",
     "check": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "test": "node --test --import tsx test/*.test.ts",
+    "test:mcp-contract": "node --test --import tsx test/swarm-control.test.ts",
+    "test:mcp-parity": "node scripts/mcp-build.mjs parity",
     "serve": "node build/main.js"
   },
   "dependencies": {
