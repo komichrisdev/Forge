@@ -23,7 +23,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now owui-swarm-chatgpt-app.service
 ```
 
-The runtime is isolated under this directory (`node_modules`, `build`, and `dist`). It does not load `/home/komichris/.config/owui-swarm/environment` and needs no Open WebUI API key.
+The runtime is isolated under this directory (`node_modules`, `build`, and `dist`). It does not load `/home/komichris/.config/owui-swarm/environment` and needs no Open WebUI API key. Wiki reads delegate to the existing `.venv/bin/owui-swarm` console entrypoint so Node does not duplicate markdown parsing, validation, ranking, or index logic.
 
 ## Commands and endpoint
 
@@ -55,6 +55,10 @@ contract, parity, and no-drift checks. Public contract changes require review of
 - `get_swarm_run_details`
 - `list_swarm_models`
 - `get_swarm_model`
+- `wiki.search`
+- `wiki.page`
+- `wiki.related`
+- `wiki.status`
 - `render_swarm_control`
 
 Every tool advertises `readOnlyHint: true`, `destructiveHint: false`, and `openWorldHint: false`. There are no dispatch, probe, mutation, filesystem, shell, configuration, or service-control tools.
@@ -71,11 +75,15 @@ The widget is self-contained. Its CSP has no connect, resource, frame, image, or
 
 - Catalog: `/home/komichris/.local/share/owui-swarm/catalog.sqlite3`
 - Runs: `/home/komichris/.local/share/owui-swarm/runs/<validated-run-id>/`
+- Canonical wiki: `/srv/swarm-wiki` via `OWUI_SWARM_WIKI_ROOT`
+- Derived wiki index: `/srv/swarm-wiki/index/wiki.db`
 - Configuration only through `SWARM_DB_PATH` and `SWARM_RUN_DIR` in the service unit
 
 SQL is fixed and parameterized. Pagination is bounded to 100. Run IDs and artifact filenames are allowlisted, resolved paths must remain under the run root, individual files are capped at 256 KiB, displayed prompts/responses at 48,000 characters, and detailed metadata at 700,000 bytes. Truncation is reported. Browser rendering uses `textContent`, not untrusted HTML.
 
 Returned copies redact authorization and cookie headers, bearer/basic tokens, known credential assignments and object keys, JWT-like strings, private keys, common token prefixes, and long credential-like values. Stored SQLite rows and artifacts are never changed. Protected environment contents, arbitrary paths, unrelated environment variables, SSH/tunnel credentials, and Open WebUI credentials are outside the app boundary.
+
+Wiki MCP tools expose only read-only search, page, relationship, and status views. They reject path arguments, do not rebuild the index, do not run backups or restores, and never write canonical markdown, manifests, or SQLite files.
 
 ## MCP Inspector
 

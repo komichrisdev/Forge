@@ -5,6 +5,11 @@ WebUI. Workers and the judge produce untrusted proposals; Codex keeps repository
 access, testing, final verification, changes, and user-facing authority.
 
 The read-only native ChatGPT MCP App is documented in [chatgpt_app/README.md](chatgpt_app/README.md).
+Phase 2.0 adds four read-only wiki MCP tools backed by the same canonical
+Python wiki/search modules: `wiki.search`, `wiki.page`, `wiki.related`, and
+`wiki.status`. The committed build is updated in this repository; the live MCP
+service will not expose them until a separately approved restart loads the new
+code.
 
 ## Authority
 
