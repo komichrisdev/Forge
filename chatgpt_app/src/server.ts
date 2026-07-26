@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { PublicError, SwarmData } from "./data.js";
+import { PublicError, SwarmData, WikiData } from "./data.js";
 
 export const WIDGET_URI = "ui://swarm-control/v1/widget.html";
 const annotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false } as const;
@@ -12,6 +12,14 @@ const outputSchema = { data: z.record(z.string(), z.unknown()) };
 const page = {
   limit: z.number().int().min(1).max(100).optional(),
   offset: z.number().int().min(0).max(100_000).optional(),
+};
+const wikiId = z.string().regex(/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/).max(200);
+const wikiSearch = {
+  query: z.string().min(1).max(300),
+  limit: z.number().int().min(1).max(100).optional(),
+  verification: z.enum(["unverified", "verified", "conflicted", "superseded"]).optional(),
+  minConfidence: z.number().int().min(0).max(100).optional(),
+  jiraKey: z.string().max(32).optional(),
 };
 
 function result(data: Record<string, unknown>, detail?: unknown) {
@@ -30,7 +38,15 @@ function safe<T>(callback: () => T) {
   }
 }
 
-export function createServer(data = new SwarmData()): McpServer {
+async function safeAsync<T>(callback: () => Promise<T>, message = "Swarm data could not be read.") {
+  try { return await callback(); }
+  catch (error) {
+    const detail = error instanceof PublicError ? error.message : message;
+    return { content: [{ type: "text" as const, text: detail }], isError: true };
+  }
+}
+
+export function createServer(data = new SwarmData(), wiki = new WikiData()): McpServer {
   const server = new McpServer({ name: "Swarm Control", version: "1.0.0" });
 
   registerAppTool(server, "get_swarm_status", {
@@ -77,6 +93,32 @@ export function createServer(data = new SwarmData()): McpServer {
     title: "Get swarm model", description: "Read reliability, quality, role, and benchmark evidence for one exact model ID.",
     inputSchema: { modelId: z.string().min(1).max(300) }, outputSchema, annotations, _meta: toolMeta,
   }, async ({ modelId }) => safe(() => result(data.model(modelId))));
+
+  registerAppTool(server, "wiki.search", {
+    title: "Search wiki", description: "Read the validated wiki search index with bounded filters and deterministic ranking.",
+    inputSchema: wikiSearch, outputSchema, annotations, _meta: toolMeta,
+  }, async (input) => safeAsync(async () => result(await wiki.search(input)), "Wiki data could not be read."));
+
+  registerAppTool(server, "wiki.page", {
+    title: "Get wiki page", description: "Read one exact canonical wiki page by page ID or slug, including sources and relationships.",
+    inputSchema: {
+      pageId: wikiId.optional(),
+      slug: wikiId.optional(),
+    }, outputSchema, annotations, _meta: toolMeta,
+  }, async ({ pageId, slug }) => safeAsync(async () => {
+    if (Boolean(pageId) === Boolean(slug)) throw new PublicError("Provide exactly one of pageId or slug.");
+    return result(await wiki.page({ pageId, slug }));
+  }, "Wiki data could not be read."));
+
+  registerAppTool(server, "wiki.related", {
+    title: "Get related wiki pages", description: "Read related canonical wiki pages ranked by the existing derived relationship logic.",
+    inputSchema: { pageId: wikiId, limit: z.number().int().min(1).max(100).optional() }, outputSchema, annotations, _meta: toolMeta,
+  }, async ({ pageId, limit }) => safeAsync(async () => result(await wiki.related({ pageId, limit })), "Wiki data could not be read."));
+
+  registerAppTool(server, "wiki.status", {
+    title: "Get wiki status", description: "Read canonical wiki, index, backup, and Git status without rebuilding or mutating anything.",
+    inputSchema: {}, outputSchema, annotations, _meta: toolMeta,
+  }, async () => safeAsync(async () => result(await wiki.status()), "Wiki data could not be read."));
 
   registerAppTool(server, "render_swarm_control", {
     title: "Render Swarm Control", description: "Render the read-only native Swarm Control widget.",

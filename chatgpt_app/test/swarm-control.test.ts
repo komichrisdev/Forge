@@ -1,21 +1,26 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { after, before, describe, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import Database from "better-sqlite3";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { redact, SwarmData } from "../src/data.js";
+import { join, resolve } from "node:path";
+import { redact, SwarmData, WikiData } from "../src/data.js";
 import { startHttpServer } from "../src/main.js";
 import { createServer, WIDGET_URI } from "../src/server.js";
 
 type Json = Record<string, any>;
 const contractFixture = JSON.parse(readFileSync(new URL("./fixtures/mcp-live-contract.json", import.meta.url), "utf8")) as Json;
+const project = resolve(import.meta.dirname, "../..");
 const temp = mkdtempSync(join(tmpdir(), "swarm-control-test-"));
 const dbPath = join(temp, "catalog.sqlite3");
 const runRoot = join(temp, "runs");
+const wikiRoot = join(temp, "wiki");
+const wikiCli = resolve(project, ".venv/bin/owui-swarm");
 let data: SwarmData;
+let wiki: WikiData;
 
 function json(path: string, value: unknown): void { writeFileSync(path, JSON.stringify(value, null, 2)); }
 function normalized(value: any): any {
@@ -24,6 +29,116 @@ function normalized(value: any): any {
     return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalized(value[key])]));
   }
   return value;
+}
+
+function command(bin: string, args: string[], cwd = project): string {
+  const result = spawnSync(bin, args, { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.stdout || `${bin} failed`);
+  return result.stdout;
+}
+
+function wikiCommand(...args: string[]): string {
+  return command(wikiCli, ["wiki", "--root", wikiRoot, ...args]);
+}
+
+function pageText(input: {
+  id: string;
+  title: string;
+  section: string;
+  aliases?: string[];
+  jiraKeys?: string[];
+  sourceRefs?: string[];
+  sourceUpdatedAt?: string;
+  ingestedAt?: string;
+  verification?: "unverified" | "verified" | "conflicted" | "superseded";
+  confidence?: number;
+  tags?: string[];
+  supersedes?: string[];
+  body: string;
+}): string {
+  return `---
+id: ${JSON.stringify(input.id)}
+title: ${JSON.stringify(input.title)}
+project: "acme-orbit"
+aliases: ${JSON.stringify(input.aliases || [])}
+jira_keys: ${JSON.stringify(input.jiraKeys || [])}
+source_refs: ${JSON.stringify(input.sourceRefs || ["src-orbit-charter-v1"])}
+source_updated_at: ${JSON.stringify(input.sourceUpdatedAt || "2026-01-02T12:00:00Z")}
+ingested_at: ${JSON.stringify(input.ingestedAt || "2026-01-03T12:00:00Z")}
+verification_status: ${JSON.stringify(input.verification || "verified")}
+confidence: ${input.confidence ?? 88}
+tags: ${JSON.stringify(input.tags || ["synthetic"])}
+supersedes: ${JSON.stringify(input.supersedes || [])}
+---
+
+${input.body.trim()}
+`;
+}
+
+function writeWikiPage(input: Parameters<typeof pageText>[0]): void {
+  mkdirSync(join(wikiRoot, "wiki", input.section), { recursive: true });
+  writeFileSync(join(wikiRoot, "wiki", input.section, `${input.id}.md`), pageText(input));
+}
+
+function createWikiFixture(): void {
+  wikiCommand("init", "--with-samples");
+
+  const sections = ["projects", "features", "decisions", "systems", "research", "glossary"];
+  for (let number = 0; number < 25; number += 1) {
+    const pageId = `fixture-${String(number).padStart(4, "0")}`;
+    writeWikiPage({
+      id: pageId,
+      section: sections[number % sections.length],
+      title: `Synthetic fixture page ${String(number).padStart(4, "0")}`,
+      aliases: [`Fixture ${String(number).padStart(4, "0")}`],
+      jiraKeys: [`ORBIT-${1000 + number}`],
+      confidence: 80 + (number % 20),
+      tags: ["fixture", `group-${number % 5}`],
+      body: `# Synthetic fixture ${String(number).padStart(4, "0")}
+
+This fictional fixture documents orbit cache scenario ${String(number).padStart(4, "0")}. [[source:src-orbit-charter-v1]]
+
+Use [[page:acme-orbit-overview]] as the synthetic reference point.`,
+    });
+  }
+
+  for (const pageId of ["alpha-shared", "beta-shared"]) {
+    writeWikiPage({
+      id: pageId,
+      section: "research",
+      title: "Shared synthetic page",
+      aliases: ["shared-token"],
+      tags: ["shared"],
+      body: "# Shared synthetic page\n\nsharedtoken [[source:src-orbit-charter-v1]]\n",
+    });
+  }
+
+  writeWikiPage({
+    id: "orbit-note-legacy",
+    section: "decisions",
+    title: "Orbit note",
+    verification: "superseded",
+    tags: ["decision", "legacy"],
+    body: "# Orbit note\n\nLegacy orbit note. [[source:src-orbit-charter-v1]]\n",
+  });
+  writeWikiPage({
+    id: "orbit-note-current",
+    section: "decisions",
+    title: "Orbit note",
+    jiraKeys: ["ORBIT-501"],
+    tags: ["decision", "current"],
+    supersedes: ["orbit-note-legacy"],
+    body: "# Orbit note\n\nCurrent orbit note. [[source:src-orbit-charter-v1]]\n",
+  });
+
+  wikiCommand("validate");
+  command("git", ["init", "-b", "main"], wikiRoot);
+  command("git", ["config", "user.name", "Codex"], wikiRoot);
+  command("git", ["config", "user.email", "codex@local"], wikiRoot);
+  command("git", ["add", "."], wikiRoot);
+  command("git", ["commit", "-m", "chore: synthetic wiki fixture"], wikiRoot);
+  wikiCommand("index", "--full");
+  wiki = new WikiData(wikiCli, project, wikiRoot);
 }
 
 function createFixture(): void {
@@ -70,6 +185,7 @@ function createFixture(): void {
   };
   makeRun("run-complete", "complete"); makeRun("run-failed", "failed"); makeRun("run-running", "running");
   data = new SwarmData(dbPath, runRoot);
+  createWikiFixture();
 }
 
 before(createFixture);
@@ -130,16 +246,28 @@ describe("MCP protocol and widget", () => {
   before(async () => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     client = new Client({ name: "swarm-control-tests", version: "1.0.0" }, { capabilities: {} });
-    await Promise.all([createServer(data).connect(serverTransport), client.connect(clientTransport)]);
+    await Promise.all([createServer(data, wiki).connect(serverTransport), client.connect(clientTransport)]);
   });
 
-  test("initialization lists only seven read-only tools with schemas", async () => {
+  test("initialization lists eleven read-only tools with schemas", async () => {
     const listed = await client.listTools();
-    assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), ["get_swarm_model", "get_swarm_run_details", "get_swarm_run_summary", "get_swarm_status", "list_swarm_models", "list_swarm_runs", "render_swarm_control"]);
+    assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), [
+      "get_swarm_model",
+      "get_swarm_run_details",
+      "get_swarm_run_summary",
+      "get_swarm_status",
+      "list_swarm_models",
+      "list_swarm_runs",
+      "render_swarm_control",
+      "wiki.page",
+      "wiki.related",
+      "wiki.search",
+      "wiki.status",
+    ]);
     for (const tool of listed.tools) {
       assert.equal(tool.annotations?.readOnlyHint, true); assert.equal(tool.annotations?.destructiveHint, false); assert.equal(tool.annotations?.openWorldHint, false);
       assert.equal(tool.inputSchema.type, "object"); assert.equal(tool.outputSchema?.type, "object");
-      assert.ok(!/(start|cancel|probe|update|delete|restart|execute|write)/i.test(tool.name));
+      assert.ok(!/(start|cancel|probe|update|delete|restart|execute|write|create|rename|backup|restore|rebuild|import)/i.test(tool.name));
     }
   });
 
@@ -179,11 +307,104 @@ describe("MCP protocol and widget", () => {
     for (const [name, args] of [
       ["get_swarm_status", {}], ["list_swarm_runs", { limit: 1 }], ["get_swarm_run_summary", { runId: "run-complete" }],
       ["list_swarm_models", { enabled: true }], ["get_swarm_model", { modelId: "vendor/code-model" }], ["render_swarm_control", {}],
+      ["wiki.search", { query: "ORBIT-7", limit: 2 }], ["wiki.page", { pageId: "acme-orbit-overview" }],
+      ["wiki.related", { pageId: "acme-orbit-overview", limit: 2 }], ["wiki.status", {}],
     ] as const) {
       const response = await client.callTool({ name, arguments: args }); assert.equal(response.isError, undefined); assert.ok((response.structuredContent as Json).data);
     }
     const detail = await client.callTool({ name: "get_swarm_run_details", arguments: { runId: "run-complete" } });
     assert.ok((detail.structuredContent as Json).data); assert.ok((detail._meta as Json).swarmControl.detail); assert.ok(JSON.stringify(detail.structuredContent).length < JSON.stringify(detail._meta).length);
+  });
+
+  test("wiki.search returns filtered, ranked, deterministic, and unicode-safe results", async () => {
+    const jira = await client.callTool({ name: "wiki.search", arguments: { query: "ORBIT-7", limit: 5 } });
+    assert.equal(((jira.structuredContent as Json).data.results as Json[])[0].page_id, "acme-orbit-cache-decision");
+
+    const unicode = await client.callTool({ name: "wiki.search", arguments: { query: "Órbita de ejemplo", limit: 5 } });
+    assert.equal(((unicode.structuredContent as Json).data.results as Json[])[0].page_id, "acme-orbit-overview");
+
+    const filtered = await client.callTool({
+      name: "wiki.search",
+      arguments: { query: "Synthetic fixture", limit: 5, verification: "verified", minConfidence: 85, jiraKey: "orbit-1007" },
+    });
+    assert.equal(((filtered.structuredContent as Json).data.results as Json[])[0].page_id, "fixture-0007");
+
+    const shared = await client.callTool({ name: "wiki.search", arguments: { query: "sharedtoken", limit: 2 } });
+    assert.deepEqual(((shared.structuredContent as Json).data.results as Json[]).map((item) => item.page_id), ["alpha-shared", "beta-shared"]);
+
+    const superseded = await client.callTool({ name: "wiki.search", arguments: { query: "Orbit note", limit: 5 } });
+    assert.deepEqual(((superseded.structuredContent as Json).data.results as Json[]).slice(0, 2).map((item) => item.page_id), ["orbit-note-current", "orbit-note-legacy"]);
+
+    const large = await client.callTool({ name: "wiki.search", arguments: { query: "Synthetic fixture", limit: 25 } });
+    assert.equal(((large.structuredContent as Json).data.results as Json[]).length, 25);
+  });
+
+  test("wiki.page, wiki.related, and wiki.status delegate to the canonical wiki view", async () => {
+    const pageById = await client.callTool({ name: "wiki.page", arguments: { pageId: "acme-orbit-overview" } });
+    const pageData = (pageById.structuredContent as Json).data;
+    assert.equal(pageData.metadata.id, "acme-orbit-overview");
+    assert.equal(pageData.canonical_path, "wiki/projects/acme-orbit-overview.md");
+    assert.equal(pageData.sources[0].source_id, "src-orbit-charter-v1");
+    assert.ok(pageData.relationships.linked_from.includes("acme-orbit-cache-decision"));
+
+    const pageBySlug = await client.callTool({ name: "wiki.page", arguments: { slug: "acme-orbit-cache-decision" } });
+    assert.equal(((pageBySlug.structuredContent as Json).data.metadata as Json).id, "acme-orbit-cache-decision");
+
+    const related = await client.callTool({ name: "wiki.related", arguments: { pageId: "orbit-note-legacy", limit: 3 } });
+    const relatedRows = ((related.structuredContent as Json).data.results as Json[]).map((item) => item.page_id);
+    assert.equal(relatedRows[0], "orbit-note-current");
+
+    const status = await client.callTool({ name: "wiki.status", arguments: {} });
+    const statusData = (status.structuredContent as Json).data;
+    assert.equal(statusData.schema_version, "1.0");
+    assert.equal(statusData.validation, "valid");
+    assert.equal(statusData.page_count, 32);
+    assert.equal(statusData.index.freshness, "current");
+    assert.equal(typeof statusData.git.commit, "string");
+    assert.equal(typeof statusData.application_git.commit, "string");
+  });
+
+  test("wiki tools fail safely on missing selectors, malformed queries, invalid filters, and missing pages", async () => {
+    const malformed = await client.callTool({ name: "wiki.search", arguments: { query: "\"unterminated" } });
+    assert.equal(malformed.isError, true);
+    assert.match(String(((malformed.content as Json[])[0] as Json).text), /Invalid FTS query/);
+
+    const missingPage = await client.callTool({ name: "wiki.page", arguments: { pageId: "missing-page" } });
+    assert.equal(missingPage.isError, true);
+    assert.match(String(((missingPage.content as Json[])[0] as Json).text), /Page not found/);
+
+    const missingRelated = await client.callTool({ name: "wiki.related", arguments: { pageId: "missing-page" } });
+    assert.equal(missingRelated.isError, true);
+    assert.match(String(((missingRelated.content as Json[])[0] as Json).text), /Page not found/);
+
+    const missingSelector = await client.callTool({ name: "wiki.page", arguments: {} });
+    assert.equal(missingSelector.isError, true);
+    assert.match(String(((missingSelector.content as Json[])[0] as Json).text), /exactly one of pageId or slug/i);
+
+    for (const call of [
+      { name: "wiki.page", arguments: { pageId: "../escape" } },
+      { name: "wiki.search", arguments: { query: "fixture", verification: "invalid" } },
+      { name: "wiki.search", arguments: { query: "fixture", minConfidence: 101 } },
+    ]) {
+      try {
+        const response = await client.callTool(call);
+        assert.equal(response.isError, true);
+      } catch (error) {
+        assert.match(String(error), /validation|invalid|maximum|pattern/i);
+      }
+    }
+  });
+
+  test("wiki tools support concurrent read-only clients", async () => {
+    const calls = await Promise.all(Array.from({ length: 8 }, () => client.callTool({
+      name: "wiki.search",
+      arguments: { query: "Synthetic fixture", limit: 3 },
+    })));
+    const expected = JSON.stringify((calls[0].structuredContent as Json).data);
+    for (const response of calls) {
+      assert.equal(response.isError, undefined);
+      assert.equal(JSON.stringify((response.structuredContent as Json).data), expected);
+    }
   });
 
   test("missing, malformed, injection, and traversal calls fail safely", async () => {

@@ -905,12 +905,68 @@ class WikiRepository:
         ]
         return sorted(result, key=lambda page: page.id)
 
+    def source_manifests(self) -> list[SourceManifest]:
+        self.require_valid()
+        result = [
+            parse_source(path.read_text(encoding="utf-8"), path.relative_to(self.root).as_posix())
+            for path in sorted((self.root / "sources/manifests").glob("*.yaml"))
+        ]
+        return sorted(result, key=lambda source: source.source_id)
+
     def get_page(self, page_id: str) -> WikiPage:
         page_filename(page_id)
         matches = [page for page in self.pages() if page.id == page_id]
         if not matches:
             raise KeyError(f"Page not found: {page_id}")
         return matches[0]
+
+    def page_view(self, *, page_id: str | None = None, slug: str | None = None) -> dict[str, Any]:
+        selector = page_id if page_id is not None else slug
+        if selector is None:
+            raise ValueError("page_id or slug is required")
+        page_filename(selector)
+        pages = self.pages()
+        page_map = {page.id: page for page in pages}
+        page = page_map.get(selector)
+        if page is None:
+            raise KeyError(f"Page not found: {selector}")
+        source_map = {source.source_id: source for source in self.source_manifests()}
+        source_list = [
+            {
+                **source_map[source_id].as_mapping(),
+                "manifest_path": f"sources/manifests/{source_filename(source_id)}",
+            }
+            for source_id in page.source_refs
+        ]
+        outbound = sorted({target for kind, target in REFERENCE_RE.findall(page.body) if kind == "page"})
+        inbound = sorted({
+            candidate.id
+            for candidate in pages
+            if candidate.id != page.id
+            for kind, target in REFERENCE_RE.findall(candidate.body)
+            if kind == "page" and target == page.id
+        })
+        superseded_by = sorted(candidate.id for candidate in pages if page.id in candidate.supersedes)
+        canonical_path = next(
+            f"wiki/{section}/{page_filename(page.id)}"
+            for section in PAGE_SECTIONS
+            if (self.root / "wiki" / section / page_filename(page.id)).is_file()
+        )
+        return {
+            "metadata": page.metadata(),
+            "content": page.body,
+            "canonical_path": canonical_path,
+            "sources": source_list,
+            "relationships": {
+                "links_to": outbound,
+                "linked_from": inbound,
+                "supersedes": list(page.supersedes),
+                "superseded_by": superseded_by,
+            },
+            "aliases": list(page.aliases),
+            "verification": page.verification_status,
+            "confidence": page.confidence,
+        }
 
     def list_pages(self) -> list[dict[str, Any]]:
         return [page.metadata() for page in self.pages()]
@@ -1016,6 +1072,32 @@ class WikiRepository:
             "dirty": bool(changes), "changes": changes,
         }
 
+    def application_git_info(self) -> dict[str, Any]:
+        repository_root = Path(__file__).resolve().parent.parent
+        if not (repository_root / ".git").is_dir():
+            return {"repository": False, "branch": None, "commit": None, "dirty": False, "changes": []}
+        result = subprocess.run(
+            ["git", "-C", str(repository_root), "branch", "--show-current"],
+            text=True, capture_output=True, check=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+        branch = result.stdout.strip() or None
+        commit_result = subprocess.run(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+            text=True, capture_output=True, check=False,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+        commit = commit_result.stdout.strip() if commit_result.returncode == 0 else None
+        changes = subprocess.run(
+            ["git", "-C", str(repository_root), "status", "--porcelain=v1"],
+            text=True, capture_output=True, check=True,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        ).stdout.splitlines()
+        return {
+            "repository": True, "branch": branch, "commit": commit,
+            "dirty": bool(changes), "changes": changes,
+        }
+
     def git_commit(self, message: str) -> str:
         if not message.strip():
             raise ValueError("Commit message is required")
@@ -1028,6 +1110,7 @@ class WikiRepository:
     def status(self, backup_root: str | Path | None = None) -> dict[str, Any]:
         issues = self.validate()
         git = self.git_info()
+        application_git = self.application_git_info()
         proposals = [
             path for path in (self.root / "proposals").glob("*.md") if path.name != "README.md"
         ] if (self.root / "proposals").is_dir() else []
@@ -1054,7 +1137,9 @@ class WikiRepository:
             }
         return {
             "root": str(self.root),
+            "schema_version": SCHEMA_VERSION,
             "git": git,
+            "application_git": application_git,
             "page_count": len({
                 path.stem for section in PAGE_SECTIONS
                 for path in (self.root / "wiki" / section).glob("*.md")

@@ -123,6 +123,10 @@ def _parser() -> argparse.ArgumentParser:
     wiki_index = wiki_sub.add_parser("index", help="Build or update the derived SQLite FTS5 wiki index.")
     wiki_index.add_argument("--full", action="store_true", help="Force a clean rebuild instead of an incremental update.")
     wiki_index.add_argument("--json", action="store_true", help="Emit JSON output (default).")
+    wiki_page = wiki_sub.add_parser("page", help="Retrieve one exact canonical page with sources and relationships.")
+    page_selector = wiki_page.add_mutually_exclusive_group(required=True)
+    page_selector.add_argument("--page-id")
+    page_selector.add_argument("--slug")
     wiki_get = wiki_sub.add_parser("get", help="Retrieve one exact canonical page.")
     wiki_get.add_argument("page_id")
     wiki_sub.add_parser("list", help="List canonical page metadata in deterministic order.")
@@ -180,6 +184,12 @@ def _run_wiki(args: argparse.Namespace) -> int:
         page = repository.get_page(args.page_id)
         print(json.dumps(
             {"metadata": page.metadata(), "content": page.body},
+            indent=2, ensure_ascii=False,
+        ))
+        return 0
+    if args.wiki_command == "page":
+        print(json.dumps(
+            repository.page_view(page_id=args.page_id, slug=args.slug),
             indent=2, ensure_ascii=False,
         ))
         return 0

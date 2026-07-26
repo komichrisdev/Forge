@@ -1,14 +1,20 @@
+import { execFile } from "node:child_process";
 import Database from "better-sqlite3";
 import { closeSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
+import { promisify } from "node:util";
 export const DEFAULT_DB = "/home/komichris/.local/share/owui-swarm/catalog.sqlite3";
 export const DEFAULT_RUNS = "/home/komichris/.local/share/owui-swarm/runs";
+export const DEFAULT_WIKI_ROOT = "/srv/swarm-wiki";
 export const MAX_PAGE = 100;
 const MAX_FILE = 256 * 1024;
 const MAX_TEXT = 48_000;
 const MAX_META = 700_000;
+const MAX_WIKI_OUTPUT = 8 * 1024 * 1024;
+const DEFAULT_WIKI_CLI = resolve(import.meta.dirname, "../../.venv/bin/owui-swarm");
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SAFE_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const execFileAsync = promisify(execFile);
 export class PublicError extends Error {
 }
 export function redact(value) {
@@ -416,6 +422,74 @@ export class SwarmData {
         finally {
             db.close();
         }
+    }
+}
+export class WikiData {
+    cliBin;
+    projectRoot;
+    wikiRoot;
+    constructor(cliBin = process.env.SWARM_WIKI_CLI_BIN || DEFAULT_WIKI_CLI, projectRoot = resolve(import.meta.dirname, "../.."), wikiRoot = process.env.OWUI_SWARM_WIKI_ROOT || DEFAULT_WIKI_ROOT) {
+        this.cliBin = cliBin.includes(sep) ? resolve(cliBin) : cliBin;
+        this.projectRoot = resolve(projectRoot);
+        this.wikiRoot = resolve(wikiRoot);
+    }
+    async runWiki(command) {
+        try {
+            const { stdout } = await execFileAsync(this.cliBin, ["wiki", "--root", this.wikiRoot, ...command], {
+                cwd: this.projectRoot,
+                encoding: "utf8",
+                timeout: 20_000,
+                maxBuffer: MAX_WIKI_OUTPUT,
+                env: { ...process.env, OWUI_SWARM_WIKI_ROOT: this.wikiRoot },
+            });
+            const parsed = json(stdout, null);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+                return parsed;
+            throw new PublicError("Wiki response is invalid.");
+        }
+        catch (error) {
+            if (error instanceof PublicError)
+                throw error;
+            const failure = error;
+            const tagged = `${failure.stderr || ""}\n${failure.message || ""}`.split(/\r?\n/)
+                .map((line) => line.trim()).filter(Boolean).reverse().find((line) => line.startsWith("ERROR: "));
+            if (tagged)
+                throw new PublicError(tagged.slice("ERROR: ".length));
+            if (failure.code === "ENOENT")
+                throw new PublicError("Wiki helper is unavailable.");
+            if (failure.killed || failure.signal === "SIGTERM")
+                throw new PublicError("Wiki request timed out.");
+            throw new PublicError("Wiki data could not be read.");
+        }
+    }
+    search(input) {
+        const command = ["search", input.query, "--json"];
+        if (input.limit !== undefined)
+            command.push("--limit", String(input.limit));
+        if (input.verification !== undefined)
+            command.push("--verification", input.verification);
+        if (input.minConfidence !== undefined)
+            command.push("--min-confidence", String(input.minConfidence));
+        if (input.jiraKey !== undefined)
+            command.push("--jira-key", input.jiraKey);
+        return this.runWiki(command);
+    }
+    page(input) {
+        const command = ["page"];
+        if (input.pageId)
+            command.push("--page-id", input.pageId);
+        if (input.slug)
+            command.push("--slug", input.slug);
+        return this.runWiki(command);
+    }
+    related(input) {
+        const command = ["related", input.pageId, "--json"];
+        if (input.limit !== undefined)
+            command.push("--limit", String(input.limit));
+        return this.runWiki(command);
+    }
+    status() {
+        return this.runWiki(["status"]);
     }
 }
 //# sourceMappingURL=data.js.map

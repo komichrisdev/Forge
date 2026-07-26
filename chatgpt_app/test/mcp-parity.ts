@@ -22,12 +22,15 @@ function syntheticData(error?: Error) {
     return data;
   };
   return {
-    status: () => value({ state: "synthetic" }),
+    status: () => value({ state: "synthetic", schema_version: "1.0", index: { freshness: "current" }, page_count: 1 }),
     listRuns: (input: unknown) => value({ runs: [], total: 0, input }),
     runSummary: (runId: string) => value({ runId, status: "complete" }),
     runDetails: (runId: string) => value({ concise: { runId }, detail: { evidence: "synthetic" } }),
     listModels: (input: unknown) => value({ models: [], total: 0, input }),
     model: (modelId: string) => value({ modelId, enabled: true }),
+    search: (input: unknown) => value({ query: "synthetic", results: [{ page_id: "synthetic-page" }], input }),
+    page: (input: unknown) => value({ metadata: { id: "synthetic-page" }, content: "# Synthetic", input }),
+    related: (input: unknown) => value({ page_id: "synthetic-page", results: [{ page_id: "related-page" }], input }),
   };
 }
 
@@ -50,8 +53,10 @@ async function comparedCall(left: Client, right: Client, name: string, args: Rec
 test("committed and candidate MCP builds have contract, result, resource, and error parity", async () => {
   const deployed = await modules(project);
   const rebuilt = await modules(candidate);
-  const left = await connect(deployed.server.createServer, syntheticData());
-  const right = await connect(rebuilt.server.createServer, syntheticData());
+  const leftFixture = syntheticData();
+  const rightFixture = syntheticData();
+  const left = await connect((data: any) => deployed.server.createServer(data, data), leftFixture);
+  const right = await connect((data: any) => rebuilt.server.createServer(data, data), rightFixture);
 
   try {
     assert.deepEqual(await left.client.listTools(), await right.client.listTools());
@@ -68,6 +73,11 @@ test("committed and candidate MCP builds have contract, result, resource, and er
       ["list_swarm_models", { enabled: true }],
       ["get_swarm_model", { modelId: "synthetic/model" }],
       ["render_swarm_control", {}],
+      ["wiki.search", { query: "synthetic", limit: 2 }],
+      ["wiki.page", { pageId: "synthetic-page" }],
+      ["wiki.related", { pageId: "synthetic-page", limit: 2 }],
+      ["wiki.status", {}],
+      ["wiki.page", {}],
       ["get_swarm_run_summary", {}],
       ["list_swarm_runs", { limit: "invalid" }],
       ["__phase_0_3_unknown_tool__", {}],
@@ -85,8 +95,8 @@ test("committed and candidate MCP builds have contract, result, resource, and er
     const rightError = failure === "unavailable"
       ? new rebuilt.data.PublicError("Swarm runtime data is unavailable.")
       : new Error("synthetic internal failure");
-    const failedLeft = await connect(deployed.server.createServer, syntheticData(leftError));
-    const failedRight = await connect(rebuilt.server.createServer, syntheticData(rightError));
+    const failedLeft = await connect((data: any) => deployed.server.createServer(data, data), syntheticData(leftError));
+    const failedRight = await connect((data: any) => rebuilt.server.createServer(data, data), syntheticData(rightError));
     try {
       await comparedCall(failedLeft.client, failedRight.client, "get_swarm_status", {});
     } finally {

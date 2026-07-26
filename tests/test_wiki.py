@@ -328,14 +328,43 @@ class WikiStorageTest(unittest.TestCase):
     def test_git_repository_status_reporting(self) -> None:
         commit = self.git_init()
         status = self.repository.status(self.base / "backups")
+        self.assertEqual(status["schema_version"], SCHEMA_VERSION)
         self.assertEqual(status["git"]["commit"], commit)
         self.assertEqual(status["git"]["branch"], "main")
         self.assertFalse(status["git"]["dirty"])
+        self.assertTrue(status["application_git"]["repository"])
+        self.assertEqual(len(status["application_git"]["commit"]), 40)
         (self.root / "README.md").write_text(
             (self.root / "README.md").read_text(encoding="utf-8") + "\n",
             encoding="utf-8",
         )
         self.assertTrue(self.repository.status(self.base / "backups")["git"]["dirty"])
+
+    def test_page_view_includes_sources_and_relationships(self) -> None:
+        view = self.repository.page_view(page_id="acme-orbit-overview")
+        self.assertEqual(view["metadata"]["id"], "acme-orbit-overview")
+        self.assertEqual(view["canonical_path"], "wiki/projects/acme-orbit-overview.md")
+        self.assertEqual(view["verification"], "verified")
+        self.assertEqual(view["confidence"], 95)
+        self.assertEqual(view["sources"][0]["source_id"], "src-orbit-charter-v1")
+        self.assertEqual(view["sources"][0]["manifest_path"], "sources/manifests/src-orbit-charter-v1.yaml")
+        self.assertEqual(
+            view["relationships"]["links_to"],
+            ["acme-orbit-cache-decision", "acme-orbit-recovery-runbook"],
+        )
+        self.assertEqual(
+            view["relationships"]["linked_from"],
+            ["acme-orbit-cache-decision", "acme-orbit-recovery-runbook"],
+        )
+        self.assertEqual(view["aliases"], ["Orbit training project", "Órbita de ejemplo"])
+
+    def test_page_view_accepts_slug_and_rejects_missing_selector(self) -> None:
+        self.assertEqual(
+            self.repository.page_view(slug="acme-orbit-cache-decision")["metadata"]["id"],
+            "acme-orbit-cache-decision",
+        )
+        with self.assertRaisesRegex(ValueError, "page_id or slug is required"):
+            self.repository.page_view()
 
     def test_backup_creation(self) -> None:
         commit = self.git_init()

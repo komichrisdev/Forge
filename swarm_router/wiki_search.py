@@ -290,6 +290,7 @@ class WikiIndex:
                 "verification": row["verification_status"],
                 "confidence": row["confidence"],
                 "jira_keys": lists["jira_keys"],
+                "tags": lists["tags"],
                 "sources": lists["source_refs"],
                 "canonical_path": row["canonical_path"],
                 "current": bool(row["is_current"]),

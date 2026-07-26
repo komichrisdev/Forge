@@ -1,4 +1,8 @@
 {
+  "serverInfo": {
+    "name": "Swarm Control",
+    "version": "1.0.0"
+  },
   "capabilities": {
     "resources": {
       "listChanged": true
@@ -8,94 +12,48 @@
     }
   },
   "capturedTransport": "streamable-http",
-  "errorShapes": {
-    "missingRequiredField": {
-      "code": -32602,
-      "isError": true
-    },
-    "unknownTool": {
-      "code": -32602,
-      "isError": true
-    }
-  },
-  "resourceTemplates": [],
-  "resources": [
-    {
-      "_meta": {
-        "ui": {
-          "csp": {
-            "baseUriDomains": [],
-            "connectDomains": [],
-            "frameDomains": [],
-            "resourceDomains": []
-          },
-          "prefersBorder": true
-        }
-      },
-      "description": "Version 1 of the self-contained, read-only Swarm Control interface.",
-      "mimeType": "text/html;profile=mcp-app",
-      "name": "Swarm Control widget",
-      "uri": "ui://swarm-control/v1/widget.html"
-    }
-  ],
-  "serverInfo": {
-    "name": "Swarm Control",
-    "version": "1.0.0"
-  },
   "tools": [
     {
-      "_meta": {
-        "ui": {
-          "resourceUri": "ui://swarm-control/v1/widget.html",
-          "visibility": [
-            "model",
-            "app"
-          ]
-        },
-        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
-      },
-      "annotations": {
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "readOnlyHint": true
-      },
+      "name": "get_swarm_model",
+      "title": "Get swarm model",
       "description": "Read reliability, quality, role, and benchmark evidence for one exact model ID.",
-      "execution": {
-        "taskSupport": "forbidden"
-      },
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "type": "object",
         "properties": {
           "modelId": {
-            "maxLength": 300,
+            "type": "string",
             "minLength": 1,
-            "type": "string"
+            "maxLength": 300
           }
         },
         "required": [
           "modelId"
         ],
-        "type": "object"
-      },
-      "name": "get_swarm_model",
-      "outputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
         "properties": {
           "data": {
-            "additionalProperties": {},
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {}
           }
         },
         "required": [
           "data"
         ],
-        "type": "object"
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
       },
-      "title": "Get swarm model"
-    },
-    {
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
       "_meta": {
         "ui": {
           "resourceUri": "ui://swarm-control/v1/widget.html",
@@ -105,101 +63,101 @@
           ]
         },
         "ui/resourceUri": "ui://swarm-control/v1/widget.html"
-      },
-      "annotations": {
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "readOnlyHint": true
-      },
-      "description": "Read detailed, bounded run evidence; large widget-only data is returned in result metadata.",
-      "execution": {
-        "taskSupport": "forbidden"
-      },
-      "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
-        "properties": {
-          "runId": {
-            "maxLength": 128,
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "runId"
-        ],
-        "type": "object"
-      },
+      }
+    },
+    {
       "name": "get_swarm_run_details",
-      "outputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
-        "properties": {
-          "data": {
-            "additionalProperties": {},
-            "type": "object"
-          }
-        },
-        "required": [
-          "data"
-        ],
-        "type": "object"
-      },
-      "title": "Get swarm run details"
-    },
-    {
-      "_meta": {
-        "ui": {
-          "resourceUri": "ui://swarm-control/v1/widget.html",
-          "visibility": [
-            "model",
-            "app"
-          ]
-        },
-        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
-      },
-      "annotations": {
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "readOnlyHint": true
-      },
-      "description": "Read a concise summary for one validated run ID.",
-      "execution": {
-        "taskSupport": "forbidden"
-      },
+      "title": "Get swarm run details",
+      "description": "Read detailed, bounded run evidence; large widget-only data is returned in result metadata.",
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "type": "object",
         "properties": {
           "runId": {
-            "maxLength": 128,
+            "type": "string",
             "minLength": 1,
-            "type": "string"
+            "maxLength": 128
           }
         },
         "required": [
           "runId"
         ],
-        "type": "object"
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
       },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "ui": {
+          "resourceUri": "ui://swarm-control/v1/widget.html",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        },
+        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
+      }
+    },
+    {
       "name": "get_swarm_run_summary",
-      "outputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "Get swarm run summary",
+      "description": "Read a concise summary for one validated run ID.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "runId"
+        ],
         "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
         "properties": {
           "data": {
-            "additionalProperties": {},
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {}
           }
         },
         "required": [
           "data"
         ],
-        "type": "object"
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
       },
-      "title": "Get swarm run summary"
-    },
-    {
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
       "_meta": {
         "ui": {
           "resourceUri": "ui://swarm-control/v1/widget.html",
@@ -209,39 +167,39 @@
           ]
         },
         "ui/resourceUri": "ui://swarm-control/v1/widget.html"
-      },
-      "annotations": {
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "readOnlyHint": true
-      },
-      "description": "Read a concise snapshot of swarm runs, reliability, and quality evidence.",
-      "execution": {
-        "taskSupport": "forbidden"
-      },
-      "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "properties": {},
-        "type": "object"
-      },
+      }
+    },
+    {
       "name": "get_swarm_status",
+      "title": "Get swarm status",
+      "description": "Read a concise snapshot of swarm runs, reliability, and quality evidence.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
       "outputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "type": "object",
         "properties": {
           "data": {
-            "additionalProperties": {},
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {}
           }
         },
         "required": [
           "data"
         ],
-        "type": "object"
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
       },
-      "title": "Get swarm status"
-    },
-    {
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
       "_meta": {
         "ui": {
           "resourceUri": "ui://swarm-control/v1/widget.html",
@@ -251,75 +209,75 @@
           ]
         },
         "ui/resourceUri": "ui://swarm-control/v1/widget.html"
-      },
-      "annotations": {
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "readOnlyHint": true
-      },
+      }
+    },
+    {
+      "name": "list_swarm_models",
+      "title": "List swarm models",
       "description": "Read the model catalog with bounded search, filtering, and pagination.",
-      "execution": {
-        "taskSupport": "forbidden"
-      },
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "type": "object",
         "properties": {
-          "chatCompatible": {
-            "type": "boolean"
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000
+          },
+          "search": {
+            "type": "string",
+            "maxLength": 200
           },
           "enabled": {
             "type": "boolean"
           },
+          "chatCompatible": {
+            "type": "boolean"
+          },
           "family": {
-            "maxLength": 200,
-            "type": "string"
-          },
-          "limit": {
-            "maximum": 100,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "offset": {
-            "maximum": 100000,
-            "minimum": 0,
-            "type": "integer"
+            "type": "string",
+            "maxLength": 200
           },
           "recommendedRole": {
+            "type": "string",
             "enum": [
               "planner",
               "implementer",
               "critic",
               "verifier",
               "__judge__"
-            ],
-            "type": "string"
-          },
-          "search": {
-            "maxLength": 200,
-            "type": "string"
+            ]
           }
         },
-        "type": "object"
-      },
-      "name": "list_swarm_models",
-      "outputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
         "properties": {
           "data": {
-            "additionalProperties": {},
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {}
           }
         },
         "required": [
           "data"
         ],
-        "type": "object"
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
       },
-      "title": "List swarm models"
-    },
-    {
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
       "_meta": {
         "ui": {
           "resourceUri": "ui://swarm-control/v1/widget.html",
@@ -329,81 +287,81 @@
           ]
         },
         "ui/resourceUri": "ui://swarm-control/v1/widget.html"
-      },
-      "annotations": {
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "readOnlyHint": true
-      },
+      }
+    },
+    {
+      "name": "list_swarm_runs",
+      "title": "List swarm runs",
       "description": "Read concise run summaries with bounded filtering and pagination.",
-      "execution": {
-        "taskSupport": "forbidden"
-      },
       "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "type": "object",
         "properties": {
-          "dateFrom": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "dateTo": {
-            "format": "date-time",
-            "type": "string"
-          },
           "limit": {
-            "maximum": 100,
+            "type": "integer",
             "minimum": 1,
-            "type": "integer"
-          },
-          "model": {
-            "maxLength": 300,
-            "type": "string"
+            "maximum": 100
           },
           "offset": {
-            "maximum": 100000,
+            "type": "integer",
             "minimum": 0,
-            "type": "integer"
+            "maximum": 100000
           },
           "status": {
+            "type": "string",
             "enum": [
               "running",
               "complete",
               "failed"
-            ],
-            "type": "string"
+            ]
           },
           "taskMode": {
+            "type": "string",
             "enum": [
               "auto",
               "code",
               "spec",
               "research",
               "general"
-            ],
-            "type": "string"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "dateFrom": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "dateTo": {
+            "type": "string",
+            "format": "date-time"
           }
         },
-        "type": "object"
-      },
-      "name": "list_swarm_runs",
-      "outputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
         "properties": {
           "data": {
-            "additionalProperties": {},
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {}
           }
         },
         "required": [
           "data"
         ],
-        "type": "object"
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
       },
-      "title": "List swarm runs"
-    },
-    {
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
       "_meta": {
         "ui": {
           "resourceUri": "ui://swarm-control/v1/widget.html",
@@ -413,37 +371,305 @@
           ]
         },
         "ui/resourceUri": "ui://swarm-control/v1/widget.html"
-      },
-      "annotations": {
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "readOnlyHint": true
-      },
-      "description": "Render the read-only native Swarm Control widget.",
-      "execution": {
-        "taskSupport": "forbidden"
-      },
-      "inputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "properties": {},
-        "type": "object"
-      },
+      }
+    },
+    {
       "name": "render_swarm_control",
+      "title": "Render Swarm Control",
+      "description": "Render the read-only native Swarm Control widget.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
       "outputSchema": {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "additionalProperties": false,
+        "type": "object",
         "properties": {
           "data": {
-            "additionalProperties": {},
-            "type": "object"
+            "type": "object",
+            "additionalProperties": {}
           }
         },
         "required": [
           "data"
         ],
-        "type": "object"
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
       },
-      "title": "Render Swarm Control"
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "ui": {
+          "resourceUri": "ui://swarm-control/v1/widget.html",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        },
+        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
+      }
+    },
+    {
+      "name": "wiki.page",
+      "title": "Get wiki page",
+      "description": "Read one exact canonical wiki page by page ID or slug, including sources and relationships.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+            "maxLength": 200
+          },
+          "slug": {
+            "$ref": "#/properties/pageId"
+          }
+        },
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "ui": {
+          "resourceUri": "ui://swarm-control/v1/widget.html",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        },
+        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
+      }
+    },
+    {
+      "name": "wiki.related",
+      "title": "Get related wiki pages",
+      "description": "Read related canonical wiki pages ranked by the existing derived relationship logic.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+            "maxLength": 200
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "pageId"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "ui": {
+          "resourceUri": "ui://swarm-control/v1/widget.html",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        },
+        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
+      }
+    },
+    {
+      "name": "wiki.search",
+      "title": "Search wiki",
+      "description": "Read the validated wiki search index with bounded filters and deterministic ranking.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "verification": {
+            "type": "string",
+            "enum": [
+              "unverified",
+              "verified",
+              "conflicted",
+              "superseded"
+            ]
+          },
+          "minConfidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "jiraKey": {
+            "type": "string",
+            "maxLength": 32
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "ui": {
+          "resourceUri": "ui://swarm-control/v1/widget.html",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        },
+        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
+      }
+    },
+    {
+      "name": "wiki.status",
+      "title": "Get wiki status",
+      "description": "Read canonical wiki, index, backup, and Git status without rebuilding or mutating anything.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object",
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "_meta": {
+        "ui": {
+          "resourceUri": "ui://swarm-control/v1/widget.html",
+          "visibility": [
+            "model",
+            "app"
+          ]
+        },
+        "ui/resourceUri": "ui://swarm-control/v1/widget.html"
+      }
     }
-  ]
+  ],
+  "resources": [
+    {
+      "name": "Swarm Control widget",
+      "uri": "ui://swarm-control/v1/widget.html",
+      "description": "Version 1 of the self-contained, read-only Swarm Control interface.",
+      "mimeType": "text/html;profile=mcp-app",
+      "_meta": {
+        "ui": {
+          "csp": {
+            "connectDomains": [],
+            "resourceDomains": [],
+            "frameDomains": [],
+            "baseUriDomains": []
+          },
+          "prefersBorder": true
+        }
+      }
+    }
+  ],
+  "resourceTemplates": [],
+  "errorShapes": {
+    "unknownTool": {
+      "code": -32602,
+      "isError": true
+    },
+    "missingRequiredField": {
+      "code": -32602,
+      "isError": true
+    }
+  }
 }
