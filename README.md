@@ -5,11 +5,9 @@ WebUI. Workers and the judge produce untrusted proposals; Codex keeps repository
 access, testing, final verification, changes, and user-facing authority.
 
 The read-only native ChatGPT MCP App is documented in [chatgpt_app/README.md](chatgpt_app/README.md).
-Phase 2.0 adds four read-only wiki MCP tools backed by the same canonical
-Python wiki/search modules: `wiki.search`, `wiki.page`, `wiki.related`, and
-`wiki.status`. The committed build is updated in this repository; the live MCP
-service will not expose them until a separately approved restart loads the new
-code.
+The Node MCP service exposes four read-only wiki tools backed by the same
+canonical Python wiki/search modules: `wiki.search`, `wiki.page`,
+`wiki.related`, and `wiki.status`.
 
 ## Authority
 
@@ -181,6 +179,47 @@ role/model selection and reasons, exact prompts, timestamps, latency, errors,
 raw worker and judge output, final synthesis, confidence, agreements,
 disagreements, verification needs, catalog metadata, ratings, notes, and probe
 history. It never displays API keys or authorization headers.
+
+## Personal task backend
+
+The personal-task backend is a separate local OpenAI-compatible surface for one
+safe model ID: `swarm-personal`. It reuses the same swarm routing, provider
+health, run storage, and wiki modules; it does not add shell execution, file
+writes, Git mutation, or external-system writes.
+
+Start it interactively:
+
+```bash
+owui-swarm personal-serve
+```
+
+Or install the user service:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now owui-swarm-personal.service
+systemctl --user status owui-swarm-personal.service
+```
+
+Configuration lives under `[personal]` in `~/.config/owui-swarm/config.toml`.
+Keep the backend token only in `~/.config/owui-swarm/environment`:
+
+```text
+SWARM_PERSONAL_API_KEY=<local-token>
+```
+
+The backend serves:
+
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `GET /api/personal-tasks/:id`
+- `POST /api/personal-tasks/:id/cancel`
+- `GET /api/personal-tasks/:id/events`
+
+It binds to `127.0.0.1:8788` and, when Docker access is required for Open WebUI
+registration, to detected Docker bridge addresses only. Do not expose it to the
+LAN or internet.
 
 ## Persistent artifacts
 
