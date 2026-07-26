@@ -1,0 +1,21 @@
+[Unit]
+Description=Open WebUI Codex Swarm personal-task OpenAI-compatible backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/openwebui-codex-swarm
+EnvironmentFile=%h/.config/owui-swarm/environment
+ExecStart=%h/openwebui-codex-swarm/.venv/bin/owui-swarm --config %h/.config/owui-swarm/config.toml personal-serve
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/owui-swarm
+
+[Install]
+WantedBy=default.target

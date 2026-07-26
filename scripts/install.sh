@@ -48,6 +48,8 @@ SYSTEMD_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SYSTEMD_DIR"
 install -m 644 "$ROOT/systemd/owui-swarm-dashboard.service" \
   "$SYSTEMD_DIR/owui-swarm-dashboard.service"
+install -m 644 "$ROOT/systemd/owui-swarm-personal.service" \
+  "$SYSTEMD_DIR/owui-swarm-personal.service"
 
 cat <<EOF
 Installed.

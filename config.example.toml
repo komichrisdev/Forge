@@ -43,6 +43,26 @@ port = 8787
 auth_token_env = "SWARM_DASHBOARD_TOKEN"
 metadata_directory = "~/.local/share/owui-swarm/dashboard"
 
+[personal]
+model_id = "swarm-personal"
+loopback_host = "127.0.0.1"
+port = 8788
+auth_token_env = "SWARM_PERSONAL_API_KEY"
+task_directory = "~/.local/share/owui-swarm/personal-tasks"
+max_messages = 24
+max_message_chars = 12000
+max_conversation_chars = 48000
+max_output_chars = 10000
+max_wiki_context_chars = 6000
+max_workers = 2
+max_parallel_workers = 2
+max_retries = 1
+task_timeout_seconds = 240
+worker_timeout_seconds = 180
+max_active_tasks = 2
+completed_task_retention = 200
+event_history_retention = 100
+
 [authority]
 supervisor_name = "Codex"
 worker_trust = "low"

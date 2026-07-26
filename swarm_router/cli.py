@@ -15,6 +15,7 @@ from .client import OpenWebUIClient
 from .config import load_config
 from .dashboard import serve
 from .orchestrator import SwarmOrchestrator
+from .personal import serve_personal
 from .prompts import authority_block, worker_prompt
 from .quality import benchmark_by_id, deterministic_checks, load_benchmarks
 
@@ -77,6 +78,8 @@ def _parser() -> argparse.ArgumentParser:
     dashboard = sub.add_parser("serve", help="Run the local swarm monitoring and dispatch dashboard.")
     dashboard.add_argument("--host")
     dashboard.add_argument("--port", type=int)
+
+    sub.add_parser("personal-serve", help="Run the personal-task OpenAI-compatible backend.")
 
     benchmark = sub.add_parser("benchmark", help="Run or list the compact local quality benchmarks.")
     benchmark.add_argument("benchmark_id", nargs="?")
@@ -337,6 +340,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "serve":
             serve(config, args.host, args.port)
+            return 0
+
+        if args.command == "personal-serve":
+            serve_personal(config)
             return 0
 
         if args.command == "run":

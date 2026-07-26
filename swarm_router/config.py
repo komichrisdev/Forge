@@ -61,6 +61,28 @@ class DashboardConfig:
 
 
 @dataclass(frozen=True)
+class PersonalConfig:
+    model_id: str
+    loopback_host: str
+    port: int
+    auth_token_env: str
+    task_directory: str
+    max_messages: int
+    max_message_chars: int
+    max_conversation_chars: int
+    max_output_chars: int
+    max_wiki_context_chars: int
+    max_workers: int
+    max_parallel_workers: int
+    max_retries: int
+    task_timeout_seconds: int
+    worker_timeout_seconds: int
+    max_active_tasks: int
+    completed_task_retention: int
+    event_history_retention: int
+
+
+@dataclass(frozen=True)
 class AuthorityConfig:
     supervisor_name: str
     worker_trust: str
@@ -83,6 +105,7 @@ class AppConfig:
     probe: ProbeConfig
     reliability: ReliabilityConfig
     dashboard: DashboardConfig
+    personal: PersonalConfig
     authority: AuthorityConfig
     judge: AgentConfig
     workers: tuple[AgentConfig, ...]
@@ -102,6 +125,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
     ow = raw.get("openwebui", {})
     sw = raw.get("swarm", {})
     dash = raw.get("dashboard", {})
+    personal_raw = raw.get("personal", {})
     probe_raw = raw.get("probe", {})
     reliability_raw = raw.get("reliability", {})
     authority_raw = raw.get("authority", {})
@@ -153,6 +177,28 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
             dash.get("metadata_directory", "~/.local/share/owui-swarm/dashboard")
         ),
     )
+    personal = PersonalConfig(
+        model_id=str(personal_raw.get("model_id", "swarm-personal")),
+        loopback_host=str(personal_raw.get("loopback_host", "127.0.0.1")),
+        port=int(personal_raw.get("port", 8788)),
+        auth_token_env=str(personal_raw.get("auth_token_env", "SWARM_PERSONAL_API_KEY")),
+        task_directory=str(
+            personal_raw.get("task_directory", "~/.local/share/owui-swarm/personal-tasks")
+        ),
+        max_messages=max(1, int(personal_raw.get("max_messages", 24))),
+        max_message_chars=max(256, int(personal_raw.get("max_message_chars", 12000))),
+        max_conversation_chars=max(512, int(personal_raw.get("max_conversation_chars", 48000))),
+        max_output_chars=max(256, int(personal_raw.get("max_output_chars", 10000))),
+        max_wiki_context_chars=max(256, int(personal_raw.get("max_wiki_context_chars", 6000))),
+        max_workers=max(1, int(personal_raw.get("max_workers", 2))),
+        max_parallel_workers=max(1, int(personal_raw.get("max_parallel_workers", 2))),
+        max_retries=max(0, min(1, int(personal_raw.get("max_retries", 1)))),
+        task_timeout_seconds=max(5, int(personal_raw.get("task_timeout_seconds", 240))),
+        worker_timeout_seconds=max(5, int(personal_raw.get("worker_timeout_seconds", 180))),
+        max_active_tasks=max(1, int(personal_raw.get("max_active_tasks", 2))),
+        completed_task_retention=max(1, int(personal_raw.get("completed_task_retention", 200))),
+        event_history_retention=max(10, int(personal_raw.get("event_history_retention", 100))),
+    )
     authority = AuthorityConfig(
         supervisor_name=str(authority_raw.get("supervisor_name", "Codex")),
         worker_trust=str(authority_raw.get("worker_trust", "low")),
@@ -202,6 +248,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
         probe=probe,
         reliability=reliability,
         dashboard=dashboard,
+        personal=personal,
         authority=authority,
         judge=judge,
         workers=tuple(workers),
