@@ -256,6 +256,10 @@ ssh -L 8787:127.0.0.1:8787 <debian-user>@<debian-address>
 Then browse to `http://127.0.0.1:8787`. Do not install another swarm service on
 Windows.
 
+For the read-only MCP endpoint on `8790`, use
+[`docs/windows/start-swarm-mcp-tunnel.ps1`](docs/windows/start-swarm-mcp-tunnel.ps1)
+so the forwarded listener stays on `127.0.0.1` only.
+
 ## Security boundaries
 
 - Workers receive prompts only: no shell, filesystem, Docker, SSH, browser, or

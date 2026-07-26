@@ -104,6 +104,8 @@ The Inspector package declares Node 22.7.5 or newer, while this host currently r
 
 Do not register the app until Debian validation passes. The Windows session must later provide an authenticated secure HTTPS MCP tunnel whose upstream is exactly `127.0.0.1:8790`, without exposing ports 3000, 8787, or 8790 directly. Tunnel credentials stay outside this project and service.
 
+The supported tunnel helper is [`docs/windows/start-swarm-mcp-tunnel.ps1`](../docs/windows/start-swarm-mcp-tunnel.ps1); it binds only to Windows loopback and never stores credentials.
+
 ## Troubleshooting
 
 ```bash
