@@ -464,6 +464,7 @@ class PersonalTaskManager:
         latest_user = _latest_user(trimmed)
         rejection = _rejection(latest_user)
         profile = "unsupported" if rejection else _profile(latest_user)
+        task_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
         task_id = f"task-{uuid.uuid4().hex[:16]}"
         forge_task_id = self.journal.next_task_id()
         task_dir = self._task_dir(task_id)
@@ -505,6 +506,7 @@ class PersonalTaskManager:
             "rejection": rejection,
             "model": model,
             "run_id": "",
+            "metadata": task_metadata,
         }
         self._save_task(task_id, task)
         self._emit(task_id, "queued")
@@ -512,7 +514,7 @@ class PersonalTaskManager:
             forge_task_id,
             JournalEventType.TASK_CREATED,
             message=f"Personal task created for profile {profile}.",
-            metadata={"personal_task_id": task_id, "profile": profile, "model": model},
+            metadata={"personal_task_id": task_id, "profile": profile, "model": model, **task_metadata},
             transition_key=f"personal:{task_id}:created",
         )
         self._queue.put(task_id)

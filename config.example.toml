@@ -63,6 +63,11 @@ max_active_tasks = 2
 completed_task_retention = 200
 event_history_retention = 100
 
+[scheduler]
+poll_interval_seconds = 30
+lease_seconds = 60
+timezone = "UTC"
+
 [authority]
 supervisor_name = "Codex"
 worker_trust = "low"

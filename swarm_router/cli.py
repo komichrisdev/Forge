@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 from time import monotonic
 from typing import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +22,7 @@ from .personal import serve_personal
 from .prompts import authority_block, worker_prompt
 from .providers import OpenAICompatibleProvider, provider_items
 from .quality import benchmark_by_id, deterministic_checks, load_benchmarks
+from .scheduler import Schedule, ScheduleError, Scheduler, ScheduleStore, install_signal_handlers, validate_schedule
 
 
 SECRET_NAMES = {".env", "auth.json", "credentials", "credentials.json", "secrets.json"}
@@ -109,6 +111,41 @@ def _parser() -> argparse.ArgumentParser:
     journal_recovery = journal_sub.add_parser("recovery-status", help="Show replay-safety status for one task.")
     journal_recovery.add_argument("task_id")
     journal_recovery.add_argument("--json", action="store_true")
+
+    schedule = sub.add_parser("schedule", help="Manage persistent Forge automation schedules.")
+    schedule_sub = schedule.add_subparsers(dest="schedule_command", required=True)
+    schedule_list = schedule_sub.add_parser("list", help="List schedules.")
+    schedule_list.add_argument("--json", action="store_true")
+    schedule_show = schedule_sub.add_parser("show", help="Show one schedule.")
+    schedule_show.add_argument("schedule_id")
+    schedule_show.add_argument("--json", action="store_true")
+    schedule_create = schedule_sub.add_parser("create", help="Create a schedule from JSON file or stdin.")
+    schedule_create.add_argument("schedule_config", help="Path to JSON schedule config, or '-' for stdin.")
+    schedule_create.add_argument("--json", action="store_true")
+    schedule_validate = schedule_sub.add_parser("validate", help="Validate a schedule JSON file or stdin.")
+    schedule_validate.add_argument("schedule_config", help="Path to JSON schedule config, or '-' for stdin.")
+    schedule_validate.add_argument("--json", action="store_true")
+    schedule_enable = schedule_sub.add_parser("enable", help="Enable a schedule.")
+    schedule_enable.add_argument("schedule_id")
+    schedule_enable.add_argument("--json", action="store_true")
+    schedule_disable = schedule_sub.add_parser("disable", help="Disable a schedule without deleting history.")
+    schedule_disable.add_argument("schedule_id")
+    schedule_disable.add_argument("--json", action="store_true")
+    schedule_run_now = schedule_sub.add_parser("run-now", help="Create one immediate personal task for a schedule.")
+    schedule_run_now.add_argument("schedule_id")
+    schedule_run_now.add_argument("--json", action="store_true")
+    schedule_occurrences = schedule_sub.add_parser("occurrences", help="List schedule occurrences.")
+    schedule_occurrences.add_argument("schedule_id")
+    schedule_occurrences.add_argument("--json", action="store_true")
+
+    scheduler = sub.add_parser("scheduler", help="Run or inspect the local Forge scheduler.")
+    scheduler_sub = scheduler.add_subparsers(dest="scheduler_command", required=True)
+    scheduler_status = scheduler_sub.add_parser("status", help="Show scheduler status.")
+    scheduler_status.add_argument("--json", action="store_true")
+    scheduler_tick = scheduler_sub.add_parser("tick", help="Process due schedules once.")
+    scheduler_tick.add_argument("--json", action="store_true")
+    scheduler_run = scheduler_sub.add_parser("run", help="Run the foreground scheduler loop.")
+    scheduler_run.add_argument("--json", action="store_true")
 
     models = sub.add_parser("models", help="Synchronize and list Open WebUI models with local classifications.")
     models.add_argument("--json", action="store_true")
@@ -401,6 +438,113 @@ def _run_journal(args: argparse.Namespace) -> int:
     return 2
 
 
+def _schedule_json(path: str, default_timezone: str) -> dict[str, object]:
+    data = _read_json_file(path)
+    data.setdefault("timezone", default_timezone)
+    return data
+
+
+def _print_schedule_rows(rows: list[dict[str, object]], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    for item in rows:
+        last = item.get("last_occurrence") or {}
+        task_id = last.get("task_id", "-") if isinstance(last, dict) else "-"
+        print(
+            f"{item['schedule_id']}\t{item['state']}\t"
+            f"enabled={item['enabled']}\tnext={item['next_run_at'] or '-'}\t"
+            f"tz={item['timezone']}\tlast_task={task_id or '-'}\t{item['name']}"
+        )
+
+
+def _run_schedule(args: argparse.Namespace) -> int:
+    needs_execution = args.schedule_command == "run-now"
+    config = load_config(args.config, require_api_key=needs_execution)
+    store = ScheduleStore(config.swarm.catalog_path)
+    if args.schedule_command == "list":
+        _print_schedule_rows(store.status()["schedules"], args.json)
+        return 0
+    if args.schedule_command == "show":
+        item = store.get(args.schedule_id).to_dict()
+        item["occurrences"] = store.occurrences(args.schedule_id)[-5:]
+        if args.json:
+            print(json.dumps(item, indent=2, ensure_ascii=False))
+        else:
+            print(f"{item['schedule_id']}\t{item['name']}\tenabled={item['enabled']}\tnext={item['next_run_at'] or '-'}\ttz={item['timezone']}")
+            print(item["description"])
+        return 0
+    if args.schedule_command == "create":
+        item = store.create(_schedule_json(args.schedule_config, config.scheduler.timezone))
+        if args.json:
+            print(json.dumps(item.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"{item.schedule_id}\tcreated\tnext={item.next_run_at or '-'}\ttz={item.timezone}")
+        return 0
+    if args.schedule_command == "validate":
+        raw = _schedule_json(args.schedule_config, config.scheduler.timezone)
+        schedule = Schedule.from_dict(raw)
+        issues = validate_schedule(schedule, allow_empty_id=True)
+        return _print_validation(args.schedule_config, issues, args.json)
+    if args.schedule_command == "enable":
+        item = store.set_enabled(args.schedule_id, True)
+        if args.json:
+            print(json.dumps(item.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"{item.schedule_id}\tenabled")
+        return 0
+    if args.schedule_command == "disable":
+        item = store.set_enabled(args.schedule_id, False)
+        if args.json:
+            print(json.dumps(item.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"{item.schedule_id}\tdisabled")
+        return 0
+    if args.schedule_command == "run-now":
+        occurrence = Scheduler(config, store=store).run_once(args.schedule_id)
+        if args.json:
+            print(json.dumps(occurrence, indent=2, ensure_ascii=False))
+        else:
+            print(f"{occurrence['occurrence_id']}\t{occurrence['status']}\ttask={occurrence['task_id'] or '-'}")
+        return 0
+    if args.schedule_command == "occurrences":
+        rows = store.occurrences(args.schedule_id)
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        else:
+            for item in rows:
+                print(f"{item['scheduled_for']}\t{item['status']}\ttask={item['task_id'] or '-'}\t{item['occurrence_id']}")
+        return 0
+    return 2
+
+
+def _run_scheduler(args: argparse.Namespace) -> int:
+    config = load_config(args.config, require_api_key=False)
+    scheduler = Scheduler(config)
+    if args.scheduler_command == "status":
+        payload = scheduler.store.status(scheduler.task_status)
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            _print_schedule_rows(payload["schedules"], False)
+        return 0
+    if args.scheduler_command == "tick":
+        result = scheduler.tick()
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"locked={result['locked']}\tprocessed={len(result['processed'])}")
+        return 0 if result["locked"] else 1
+    if args.scheduler_command == "run":
+        if args.json:
+            print(json.dumps({"status": "running", "poll_interval_seconds": config.scheduler.poll_interval_seconds}))
+        stop = Event()
+        install_signal_handlers(stop)
+        scheduler.run_forever(stop)
+        return 0
+    return 2
+
+
 def _provider_rows(catalog: ModelCatalog, provider_id: str) -> list[dict[str, object]]:
     return [item for item in catalog.provider_status()["models"] if item["provider_id"] == provider_id]
 
@@ -474,6 +618,10 @@ def main(argv: list[str] | None = None) -> int:
             return _run_agent(args)
         if args.command == "journal":
             return _run_journal(args)
+        if args.command == "schedule":
+            return _run_schedule(args)
+        if args.command == "scheduler":
+            return _run_scheduler(args)
         config = load_config(args.config)
         client = OpenWebUIClient(
             config.openwebui.base_url,

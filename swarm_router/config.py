@@ -83,6 +83,13 @@ class PersonalConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    poll_interval_seconds: int
+    lease_seconds: int
+    timezone: str
+
+
+@dataclass(frozen=True)
 class AuthorityConfig:
     supervisor_name: str
     worker_trust: str
@@ -106,6 +113,7 @@ class AppConfig:
     reliability: ReliabilityConfig
     dashboard: DashboardConfig
     personal: PersonalConfig
+    scheduler: SchedulerConfig
     authority: AuthorityConfig
     judge: AgentConfig
     workers: tuple[AgentConfig, ...]
@@ -126,6 +134,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
     sw = raw.get("swarm", {})
     dash = raw.get("dashboard", {})
     personal_raw = raw.get("personal", {})
+    scheduler_raw = raw.get("scheduler", {})
     probe_raw = raw.get("probe", {})
     reliability_raw = raw.get("reliability", {})
     authority_raw = raw.get("authority", {})
@@ -199,6 +208,11 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
         completed_task_retention=max(1, int(personal_raw.get("completed_task_retention", 200))),
         event_history_retention=max(10, int(personal_raw.get("event_history_retention", 100))),
     )
+    scheduler = SchedulerConfig(
+        poll_interval_seconds=max(1, int(scheduler_raw.get("poll_interval_seconds", 30))),
+        lease_seconds=max(5, int(scheduler_raw.get("lease_seconds", 60))),
+        timezone=str(scheduler_raw.get("timezone", "UTC")),
+    )
     authority = AuthorityConfig(
         supervisor_name=str(authority_raw.get("supervisor_name", "Codex")),
         worker_trust=str(authority_raw.get("worker_trust", "low")),
@@ -249,6 +263,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
         reliability=reliability,
         dashboard=dashboard,
         personal=personal,
+        scheduler=scheduler,
         authority=authority,
         judge=judge,
         workers=tuple(workers),

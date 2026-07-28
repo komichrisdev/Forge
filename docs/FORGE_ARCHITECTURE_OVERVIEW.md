@@ -1,7 +1,7 @@
 # Forge Architecture Overview
 
-Forge Version: `0.6-dev`
-Architecture Revision: `R6`
+Forge Version: `0.7-dev`
+Architecture Revision: `R7`
 
 This is the starting point for developers new to Forge. It describes the platform shape and the intended boundaries between agents, providers, routing, execution, and future resilience work. It deliberately avoids implementation details.
 
@@ -55,7 +55,7 @@ Forge
 Core contains the platform services that should remain stable as providers and agents change.
 
 - Router: tracks provider inventories, model health, cooldowns, and eventually matches requested capabilities to eligible providers and models.
-- Scheduler: will decide when recurring or delayed work should start. Timers remain explicit and controlled; scheduling should not imply unsafe side effects.
+- Scheduler: stores local automation schedules, creates due personal-task occurrences, and keeps timers explicit and controlled. Scheduling does not execute external side effects directly.
 - Journal: stores durable task lifecycle events, checkpoints, leases, handoff state, and recovery metadata.
 - Memory: stores project knowledge, retrieved context, and summaries that agents can use without depending on hidden model state.
 - Agent Registry: will define stable logical agents, their required capabilities, authority boundaries, and handoff contracts.
@@ -178,7 +178,7 @@ Recoverable
 Retry
 ```
 
-The Persistent Task Journal will be the durable record for this lifecycle. It will store task creation, scheduling decisions, agent assignment, execution attempts, checkpoints, handoff envelopes, failure categories, retry decisions, and final outcomes.
+The Persistent Task Journal is the durable record for this lifecycle. It stores task creation, scheduler metadata, agent assignment, execution attempts, checkpoints, handoff envelopes, failure categories, retry decisions, and final outcomes.
 
 The Journal should make recovery possible without trusting hidden model context. A restarted or replacement worker should resume from recorded state, not from memory that only existed inside a previous model response.
 
@@ -221,7 +221,7 @@ Near-term milestones:
 - Worker handoff: define and validate logical-agent handoff envelopes. See [FORGE_AGENT_REGISTRY.md](FORGE_AGENT_REGISTRY.md).
 - Persistent journal: persist lifecycle events, checkpoints, leases, and recovery state. See [FORGE_TASK_JOURNAL.md](FORGE_TASK_JOURNAL.md).
 - Capability routing: let agents request provider-independent capabilities instead of model names.
-- Scheduler: add controlled recurring and delayed execution.
+- Scheduler: implemented as controlled local recurring and delayed execution. See [FORGE_SCHEDULER.md](FORGE_SCHEDULER.md).
 - Night Owl migration: move Night Owl onto stable Forge agent identity and handoff contracts.
 - Additional providers: add OpenAI, Anthropic, Ollama, and other providers through the same provider model.
 - Avatar pipeline: add visual identity assets without coupling them to execution models.
