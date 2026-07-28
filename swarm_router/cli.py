@@ -16,6 +16,7 @@ from .catalog import ModelCatalog
 from .client import OpenWebUIClient
 from .config import load_config
 from .dashboard import serve
+from .discord_notifications import NotificationStore, deliver, load_config as load_discord_config, notification_from_store
 from .journal import TaskJournal
 from .orchestrator import SwarmOrchestrator
 from .personal import serve_personal
@@ -146,6 +147,22 @@ def _parser() -> argparse.ArgumentParser:
     scheduler_tick.add_argument("--json", action="store_true")
     scheduler_run = scheduler_sub.add_parser("run", help="Run the foreground scheduler loop.")
     scheduler_run.add_argument("--json", action="store_true")
+
+    discord = sub.add_parser("discord", help="Inspect or test Forge Discord notifications.")
+    discord_sub = discord.add_subparsers(dest="discord_command", required=True)
+    discord_status = discord_sub.add_parser("status", help="Show redacted Discord configuration and delivery status.")
+    discord_status.add_argument("--json", action="store_true")
+    discord_test = discord_sub.add_parser("test", help="Send one clearly labelled Discord test notification.")
+    discord_test.add_argument("--deduplication-key", help="Optional stable key for duplicate-suppression validation.")
+    discord_test.add_argument("--json", action="store_true")
+
+    notification = sub.add_parser("notification", help="Inspect persisted Forge notification deliveries.")
+    notification_sub = notification.add_subparsers(dest="notification_command", required=True)
+    notification_list = notification_sub.add_parser("list", help="List notification deliveries.")
+    notification_list.add_argument("--json", action="store_true")
+    notification_show = notification_sub.add_parser("show", help="Show one notification delivery.")
+    notification_show.add_argument("notification_id")
+    notification_show.add_argument("--json", action="store_true")
 
     models = sub.add_parser("models", help="Synchronize and list Open WebUI models with local classifications.")
     models.add_argument("--json", action="store_true")
@@ -545,6 +562,69 @@ def _run_scheduler(args: argparse.Namespace) -> int:
     return 2
 
 
+def _print_notification_rows(rows: list[dict[str, object]], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return
+    for item in rows:
+        print(
+            f"{item['notification_id']}\t{item['status']}\t{item['event_type']}\t"
+            f"{item['severity']}\ttask={item['forge_task_id'] or item['task_id'] or '-'}"
+        )
+
+
+def _run_discord(args: argparse.Namespace) -> int:
+    config = load_config(args.config, require_api_key=False)
+    store = NotificationStore(config.swarm.catalog_path)
+    discord = load_discord_config()
+    if args.discord_command == "status":
+        payload = {"configuration": discord.public(), **store.status()}
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"configured={discord.configured}\tvalid={discord.valid}\thost={discord.host or '-'}\tmode={discord.mode or '-'}")
+            for issue in discord.issues:
+                print(f"issue\t{issue}")
+        return 0 if discord.valid else 1
+    if args.discord_command == "test":
+        key = args.deduplication_key or f"discord-test:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        item = notification_from_store(
+            store,
+            event_type="discord.test",
+            severity="info",
+            title="Forge Discord notification test",
+            message="This is a single explicit Forge Discord test message.",
+            agent_id="manager",
+            deduplication_key=key,
+            metadata={"manual": True},
+        )
+        row = deliver(store, item)
+        if args.json:
+            print(json.dumps(row, indent=2, ensure_ascii=False))
+        else:
+            print(f"{row['notification_id']}\t{row['status']}\t{row['http_classification']}\texternal={row['external_message_id'] or '-'}")
+        return 0 if row["status"] == "confirmed" or row.get("duplicate_suppressed") else 1
+    return 2
+
+
+def _run_notification(args: argparse.Namespace) -> int:
+    config = load_config(args.config, require_api_key=False)
+    store = NotificationStore(config.swarm.catalog_path)
+    if args.notification_command == "list":
+        _print_notification_rows(store.list(), args.json)
+        return 0
+    if args.notification_command == "show":
+        row = store.get(args.notification_id)
+        if args.json:
+            print(json.dumps(row, indent=2, ensure_ascii=False))
+        else:
+            _print_notification_rows([row], False)
+            if row["error_summary"]:
+                print(f"error\t{row['error_summary']}")
+        return 0
+    return 2
+
+
 def _provider_rows(catalog: ModelCatalog, provider_id: str) -> list[dict[str, object]]:
     return [item for item in catalog.provider_status()["models"] if item["provider_id"] == provider_id]
 
@@ -622,6 +702,10 @@ def main(argv: list[str] | None = None) -> int:
             return _run_schedule(args)
         if args.command == "scheduler":
             return _run_scheduler(args)
+        if args.command == "discord":
+            return _run_discord(args)
+        if args.command == "notification":
+            return _run_notification(args)
         config = load_config(args.config)
         client = OpenWebUIClient(
             config.openwebui.base_url,

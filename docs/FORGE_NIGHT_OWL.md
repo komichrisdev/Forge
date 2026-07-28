@@ -1,7 +1,7 @@
 # Forge Night Owl Migration
 
-Forge Version: `0.9-dev`
-Architecture Revision: `R9`
+Forge Version: `0.10-dev`
+Architecture Revision: `R10`
 
 This records the first enabled production Forge automation: Night Owl runs as a Forge task type submitted by the persistent scheduler and recorded in the task journal.
 
@@ -29,7 +29,7 @@ External services used:
 
 - Jira: `https://komichris.atlassian.net`
 - GitHub repositories listed in `projects.json`
-- Discord webhook from the Night Owl environment file
+- Forge Discord webhook from `/home/komichris/.config/owui-swarm/discord.env`
 - Codex CLI
 
 The legacy script uses `flock` to prevent concurrent runs, `timeout` to bound runtime, and writes JSONL logs plus a final message file. Dry-run mode validates prerequisites without processing Jira work.
@@ -38,7 +38,7 @@ Forge live execution uses the repo-owned runner:
 
 - `/home/komichris/openwebui-codex-swarm/scripts/night-owl/run_nightly.sh`
 
-That runner preserves the existing lock, timeout, state, Codex, and report behavior, but repairs Jira queue access by using the existing private Jira REST credentials before invoking Codex.
+That runner preserves the existing lock, timeout, state, Codex, and report artifact behavior, but repairs Jira queue access by using the existing private Jira REST credentials before invoking Codex. Discord delivery is handled by Forge after the subprocess exits.
 
 ## Previous trigger
 
@@ -110,7 +110,7 @@ Repair:
 - JQL is generated from a validated project key and the two supported statuses only: `In Progress` and `To Do`.
 - Authentication, permission, rate-limit, timeout, network, and query-validation failures are classified.
 - Queue snapshots store masked account identity, issue keys, summaries, status buckets, and counts.
-- No token, password, authorization header, cookie, or webhook URL is written to Git, task payloads, logs, or journal metadata.
+- No token, password, authorization header, cookie, or webhook URL is written to Git, task payloads, logs, delivery records, or journal metadata.
 
 ## Journal behavior
 
@@ -134,7 +134,7 @@ Night Owl actions:
 - local state/log writes: idempotent write
 - Jira updates: non-idempotent write
 - GitHub pushes: non-idempotent write
-- Discord reports: non-idempotent write
+- Discord reports: non-idempotent write through Forge notification delivery records
 - file deletion/move: not part of the inspected Night Owl script
 
 Forge does not automatically retry or replay uncertain non-idempotent Night Owl runs.
@@ -168,6 +168,13 @@ Controlled live validation on 2026-07-28 completed with an empty queue:
 - result: completed
 - eligible issues: 0
 
+Discord integration validation on 2026-07-28:
+
+- test notification: `FN-20260728-000001`
+- external Discord message ID: `1531784974527762605`
+- duplicate suppression: same deduplication key returned the existing delivery without sending a second message
+- empty Night Owl run: `FT-20260728-000005`, completed with no Discord message
+
 ## Service deployment
 
 The scheduler runs as a user systemd service:
@@ -186,10 +193,13 @@ It starts cleanly with the enabled Night Owl schedule and preserves the Open Web
 Credentials stay outside Git:
 
 - Forge backend API key: `/home/komichris/.config/owui-swarm/environment`
-- Night Owl Jira and Discord config: `/home/komichris/.config/night-owl/env`
+- Forge Discord webhook: `/home/komichris/.config/owui-swarm/discord.env`
+- Night Owl Jira config: `/home/komichris/.config/night-owl/env`
 - GitHub CLI auth: `/home/komichris/.config/gh/hosts.yml`
 
-The Forge service runs under the existing user systemd scope. `ProtectHome=read-only` allows reading private Night Owl config while keeping writes constrained to `/home/komichris/.local/share/owui-swarm`.
+The Forge service runs under the existing user systemd scope. `ProtectHome=read-only` allows reading private config while keeping writes constrained to `/home/komichris/.local/share/owui-swarm`.
+
+Night Owl no longer stores an active Discord webhook in `/home/komichris/.config/night-owl/env`.
 
 ## Preflight results
 
@@ -209,9 +219,10 @@ GitHub:
 Discord:
 
 - webhook configured: yes
-- metadata GET: HTTP 403
-- one labelled test send: HTTP 403
-- safe-fail policy: existing report-send failure leaves the report queued and makes the Night Owl task fail instead of reporting false success
+- root cause of earlier HTTP 403: Python/urllib default request profile was rejected; Forge now uses an explicit `User-Agent`
+- one labelled Forge test send: confirmed
+- external message ID: `1531784974527762605`
+- safe-fail policy: report-send failure leaves the report queued and makes a report-bearing Night Owl task fail instead of reporting false success
 
 ## CLI inspection
 
@@ -258,6 +269,6 @@ Do not enable both Forge and legacy cron for the same four-hour cadence.
 
 ## Current limitations
 
-- No automatic retry, replay, handoff, Discord integration, dashboard UI, or Codex delegation changes are implemented here.
-- Discord delivery currently returns HTTP 403; Night Owl treats report-send failure as a task failure when a report exists.
+- No automatic retry, replay, handoff, dashboard UI, or Codex delegation changes are implemented here.
+- Inbound Discord commands, bot accounts, and dashboard controls are deferred.
 - If the queue contains work, Codex will use REST for KomiChris Jira because the Atlassian MCP connector is not granted to that cloud.

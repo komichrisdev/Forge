@@ -1,7 +1,7 @@
 # Forge Architecture Overview
 
-Forge Version: `0.9-dev`
-Architecture Revision: `R9`
+Forge Version: `0.10-dev`
+Architecture Revision: `R10`
 
 This is the starting point for developers new to Forge. It describes the platform shape and the intended boundaries between agents, providers, routing, execution, and future resilience work. It deliberately avoids implementation details.
 
@@ -30,7 +30,8 @@ Forge
 │   ├── Journal
 │   ├── Memory
 │   ├── Agent Registry
-│   └── Tool Runtime
+│   ├── Tool Runtime
+│   └── Notifications
 ├── Providers
 │   ├── NVIDIA
 │   ├── OpenAI
@@ -60,6 +61,7 @@ Core contains the platform services that should remain stable as providers and a
 - Memory: stores project knowledge, retrieved context, and summaries that agents can use without depending on hidden model state.
 - Agent Registry: will define stable logical agents, their required capabilities, authority boundaries, and handoff contracts.
 - Tool Runtime: will mediate access to external actions. It should enforce permissions, idempotency, auditability, and fail-safe behavior.
+- Notifications: sends outbound operational messages through Forge-owned delivery records and deduplication. Discord is the first notifier. See [FORGE_DISCORD_NOTIFICATIONS.md](FORGE_DISCORD_NOTIFICATIONS.md).
 
 ### Providers
 

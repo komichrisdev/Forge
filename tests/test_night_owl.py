@@ -322,15 +322,13 @@ class NightOwlTest(unittest.TestCase):
             self.assertIn("queue verified empty", result.stdout)
             self.assertNotIn("codex-should-not-run", result.stderr)
 
-    def test_runner_fails_when_discord_report_send_fails(self) -> None:
+    def test_runner_preserves_report_artifact_for_forge_delivery(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             bin_dir = root / "bin"
             home = root / "home"
             state = root / "state"
-            send_dir = home / ".codex/skills/night-owl/scripts"
             bin_dir.mkdir()
-            send_dir.mkdir(parents=True)
             python = bin_dir / "python3"
             python.write_text(
                 "#!/usr/bin/env bash\n"
@@ -356,9 +354,7 @@ class NightOwlTest(unittest.TestCase):
                 "printf '%s\\n' queued-report > \"$NIGHT_OWL_STATE_DIR/report.md\"\n",
                 encoding="utf-8",
             )
-            sender = send_dir / "send_report.sh"
-            sender.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
-            for item in (python, codex, sender):
+            for item in (python, codex):
                 item.chmod(0o755)
             result = subprocess.run(
                 [str(forge_script_root() / "run_nightly.sh")],
@@ -374,8 +370,8 @@ class NightOwlTest(unittest.TestCase):
                 },
                 timeout=5,
             )
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("Discord report failed", (state / "report.md").read_text(encoding="utf-8"))
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual((state / "report.md").read_text(encoding="utf-8").strip(), "queued-report")
 
     def _wait_task(self, manager: PersonalTaskManager | None, task_id: str) -> dict[str, object]:
         self.assertIsNotNone(manager)

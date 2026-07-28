@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/openwebui-codex-swarm
 EnvironmentFile=%h/.config/owui-swarm/environment
+EnvironmentFile=-%h/.config/owui-swarm/discord.env
 ExecStart=%h/openwebui-codex-swarm/.venv/bin/owui-swarm --config %h/.config/owui-swarm/config.toml personal-serve
 Restart=on-failure
 RestartSec=3

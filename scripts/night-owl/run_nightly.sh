@@ -65,7 +65,7 @@ timeout --signal=TERM --kill-after=5m "$run_limit" \
   "$codex_bin" -a never exec --skip-git-repo-check -C "$HOME" \
   -m gpt-5.4-mini -c 'model_reasoning_effort="medium"' \
   -s workspace-write --json -o "$last_message" \
-  "Use \$night-owl with \$codex-colage to process the eligible Jira queue sequentially. The KomiChris Atlassian MCP cloud is not granted in this Codex session; do not use atlassian_rovo for KomiChris Jira. Use Jira REST credentials from ~/.config/night-owl/env and the verified queue snapshot at $queue_snapshot. Process only issues in that snapshot, stop before $deadline so Jira and GitHub handoffs finish on time, and end the final response with NIGHT_OWL_REST_QUEUE_VERIFIED." \
+  "Use \$night-owl with \$codex-colage to process the eligible Jira queue sequentially. The KomiChris Atlassian MCP cloud is not granted in this Codex session; do not use atlassian_rovo for KomiChris Jira. Use Jira REST credentials from ~/.config/night-owl/env and the verified queue snapshot at $queue_snapshot. Process only issues in that snapshot. Do not send Discord directly; leave report artifacts in $state_dir/report.md for Forge delivery. Stop before $deadline so Jira and GitHub handoffs finish on time, and end the final response with NIGHT_OWL_REST_QUEUE_VERIFIED." \
   >>"$log" 2>&1
 status=$?
 set -e
@@ -78,12 +78,6 @@ elif (( status != 0 )); then
 - Automation failed with exit code $status.
 - Log: $log
 EOF
-fi
-
-skill_dir="$HOME/.codex/skills/night-owl"
-if [[ -f "$state_dir/report.md" && -x "$skill_dir/scripts/send_report.sh" ]] && ! "$skill_dir/scripts/send_report.sh"; then
-  echo '- Night Owl Discord report failed; the report remains queued.' >>"$state_dir/report.md"
-  status=1
 fi
 
 exit "$status"

@@ -20,6 +20,7 @@ import uuid
 from .catalog import ModelCatalog, ModelRecord
 from .config import AppConfig
 from .dashboard import DashboardApp
+from .discord_notifications import DiscordError, notify_night_owl
 from .journal import CheckpointRecord, JournalEventType, SideEffectState, TaskJournal, validate_task_id
 from .night_owl import NightOwlError, run_night_owl
 from .orchestrator import SwarmOrchestrator
@@ -811,7 +812,24 @@ class PersonalTaskManager:
             f"STDOUT\n{result.stdout or '-'}\n\n"
             f"STDERR\n{result.stderr or '-'}"
         )
+        delivery = None
+        try:
+            delivery = notify_night_owl(
+                self.config.swarm.catalog_path,
+                result=result,
+                task=task,
+                task_id=task_id,
+                forge_task_id=forge_task_id,
+                agent_id=agent_id,
+            )
+        except DiscordError as exc:
+            delivery = {"status": "failed", "error_summary": str(exc)}
+        if delivery:
+            output += f"\n\nDISCORD\nnotification={delivery['notification_id']} status={delivery['status']} classification={delivery['http_classification'] or '-'}"
         if result.status == "completed":
+            if delivery and delivery["status"] != "confirmed" and not delivery.get("duplicate_suppressed"):
+                self._fail(task_id, output, "discord_notification", started)
+                return
             self._complete(
                 task_id,
                 output[: self.config.personal.max_output_chars],
