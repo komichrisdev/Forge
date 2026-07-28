@@ -432,6 +432,7 @@ class ModelCatalog:
         successes = sum(status == "success" for status in statuses)
         timeouts = sum(status == "timeout" for status in statuses)
         protocol_failures = sum(status == "protocol" for status in statuses)
+        capacity_failures = sum(status == "capacity" for status in statuses)
         consecutive_failures = 0
         for status in statuses:
             if status == "success":
@@ -450,7 +451,7 @@ class ModelCatalog:
             penalty += protocol_failures * policy.failure_penalty
         cooldown_until = ""
         in_cooldown = False
-        if tasks and consecutive_failures >= policy.cooldown_after_consecutive_failures:
+        if tasks and (statuses[0] == "capacity" or consecutive_failures >= policy.cooldown_after_consecutive_failures):
             latest = datetime.fromisoformat(str(tasks[0]["attempted_at"]))
             until = latest + timedelta(minutes=policy.cooldown_minutes)
             in_cooldown = until > datetime.now(timezone.utc)
@@ -462,6 +463,7 @@ class ModelCatalog:
             "recent_timeout_rate": None if not tasks else round(timeouts / len(tasks), 3),
             "consecutive_failures": consecutive_failures,
             "recent_protocol_failures": protocol_failures,
+            "recent_capacity_failures": capacity_failures,
             "recent_median_latency_ms": None if not successful_latencies else int(statistics.median(successful_latencies)),
             "last_successful_completion": last_success,
             "probe_attempts": len(probes),

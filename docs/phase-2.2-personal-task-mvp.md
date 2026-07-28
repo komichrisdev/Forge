@@ -170,3 +170,44 @@ Rollback status:
   - stop `owui-swarm-personal.service`
   - remove or disable `owui-swarm-personal.service`
   - restore `~/.config/owui-swarm/` from the Phase 2.2 backup
+
+## Material milestone 4
+
+Phase 2.2 completion fixes applied:
+
+- OpenAI-compatible chat requests now ignore currently unsupported compatibility fields at the API boundary:
+  - `tools`
+  - `tool_choice`
+  - `parallel_tool_calls`
+  - `response_format`
+  - `modalities`
+- Open WebUI chat through `swarm-personal` was verified after the compatibility fix.
+- Upstream `ResourceExhausted`, quota, capacity, and rate-limit HTTP failures are categorized as `capacity`.
+- Capacity-exhausted models enter immediate reliability cooldown, so routing avoids repeatedly selecting a locally exhausted worker.
+- Personal backend startup now marks stale `queued`/`running` task files as `interrupted`; service restarts no longer leave the queue permanently full.
+- The synchronous chat-completion wait budget now accounts for worker plus judge time instead of cancelling valid tasks at the old single `task_timeout_seconds` boundary.
+- The Phase 2.2 bundle now:
+  - detects the Open WebUI Compose service from the container's Compose label before falling back to `docker compose config`
+  - treats an already visible authenticated `swarm-personal` model as successful registration without rewriting `/opt/open-webui/.env`
+  - accepts both `OPENWEBUI_API_KEY` and `OPEN_WEBUI_API_KEY`
+  - uses one direct and one authenticated Open WebUI live chat smoke test instead of a quota-heavy five-prompt stress suite
+  - requires the streaming marker response, not only `data: [DONE]`
+  - gives curl a client-side timeout margin over the backend task timeout
+
+Final Phase 2.2 bundle result:
+
+- Report: `/home/komichris/swarm-phase22-reports/20260728T181824Z/SUMMARY.md`
+- Overall: `PASS`
+- Passing steps:
+  - `02-restart-personal`
+  - `03-test-personal`
+  - `04-inspect-openwebui`
+  - `05-register-openwebui`
+  - `06-live-tests`
+- Remaining warning:
+  - `01-preflight` reported the repository as dirty because these Phase 2.2 completion fixes are local changes.
+
+Validation after source changes:
+
+- `python -m unittest tests.test_personal tests.test_smoke`: `23/23` passed
+- `bash -n` passed for the edited Phase 2.2 scripts.

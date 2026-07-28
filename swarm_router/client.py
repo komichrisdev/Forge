@@ -64,7 +64,13 @@ class OpenWebUIClient:
                 data = response.read().decode("utf-8")
         except error.HTTPError as exc:
             detail = self._redact(exc.read().decode("utf-8", errors="replace"))
-            category = "authentication" if exc.code in {401, 403} else "http"
+            lower = detail.lower()
+            if exc.code in {401, 403}:
+                category = "authentication"
+            elif any(token in lower for token in ("resourceexhausted", "resource exhausted", "quota", "capacity", "rate limit", "ratelimit")):
+                category = "capacity"
+            else:
+                category = "http"
             raise RequestFailure(
                 f"Open WebUI returned HTTP {exc.code} for {path}: {detail[:1000]}",
                 category,

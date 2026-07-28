@@ -4,6 +4,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from dataclasses import replace
+from urllib import error
+from io import BytesIO
 import json
 import os
 import tempfile
@@ -320,6 +322,13 @@ class SwarmSmokeTest(unittest.TestCase):
             self.assertFalse(recovered["cooldown"])
             self.assertEqual(recovered["consecutive_failures"], 0)
 
+            catalog.record_task_attempt("r5", "other/b-reasoning", "planner", "code", "capacity", 10)
+            self.assertTrue(catalog.reliability_summary("other/b-reasoning", config.reliability)["cooldown"])
+            self.assertNotIn(
+                "other/b-reasoning",
+                {item.model_id for item in catalog.recommend("code", 4, config.reliability, "planner")},
+            )
+
     def test_recent_success_latency_is_only_a_tie_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -349,6 +358,21 @@ class SwarmSmokeTest(unittest.TestCase):
         self.assertEqual(raised.exception.category, "protocol")
         self.assertNotIn("test-only", str(raised.exception))
         self.assertIn("[REDACTED]", str(raised.exception))
+
+    def test_client_resource_exhausted_is_capacity(self) -> None:
+        os.environ["TEST_SWARM_KEY"] = "test-only"
+        client = OpenWebUIClient("http://127.0.0.1:9", "/chat", "TEST_SWARM_KEY", 1)
+        http_error = error.HTTPError(
+            "http://127.0.0.1:9/chat",
+            400,
+            "Bad Request",
+            {},
+            BytesIO(b'{"detail":"ResourceExhausted: Worker local total request limit reached (48/48)"}'),
+        )
+        with patch("swarm_router.client.request.urlopen", side_effect=http_error):
+            with self.assertRaises(RequestFailure) as raised:
+                client.chat("model", "system", "user", 10, 0.0)
+        self.assertEqual(raised.exception.category, "capacity")
 
 
 if __name__ == "__main__":

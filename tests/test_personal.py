@@ -244,6 +244,42 @@ class PersonalApiTest(unittest.TestCase):
         self.assertEqual(task["message_metadata"][0]["role"], "user")
         self.assertNotIn("preview", json.dumps(task))
 
+    def test_openai_tool_fields_are_ignored_for_compatibility(self) -> None:
+        with patch("swarm_router.personal.SwarmOrchestrator.run", return_value=("Hello", self.root, {"answer": "Hello"})):
+            status, payload = self.api(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "swarm-personal",
+                    "messages": [{"role": "user", "content": "Say hello"}],
+                    "tools": [{"type": "function", "function": {"name": "noop", "parameters": {}}}],
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": True,
+                    "response_format": {"type": "text"},
+                    "modalities": ["text"],
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["choices"][0]["message"]["content"], "Hello")
+
+    def test_transient_task_failure_retries_once(self) -> None:
+        with patch(
+            "swarm_router.personal.SwarmOrchestrator.run",
+            side_effect=[RuntimeError("transient upstream failure"), ("Recovered", self.root, {"answer": "Recovered"})],
+        ):
+            status, payload = self.api(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "swarm-personal",
+                    "messages": [{"role": "user", "content": "Say hello"}],
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["choices"][0]["message"]["content"], "Recovered")
+        task = self.manager.task_view(str(payload["task_id"]))
+        self.assertEqual(task["retry_count"], 1)
+
     def test_streaming_completion_emits_status_and_final_text(self) -> None:
         with patch("swarm_router.personal.SwarmOrchestrator.run", return_value=("Orbit answer", self.root, {"answer": "Orbit answer"})):
             body = self.stream(
@@ -443,6 +479,29 @@ class PersonalApiTest(unittest.TestCase):
             final = self.manager.task_view(task_id)
             self.assertEqual(final["status"], "cancelled")
             self.assertEqual(final["failure_category"], "cancelled")
+
+    def test_startup_marks_stale_running_tasks_interrupted(self) -> None:
+        root = Path(self.temporary.name) / "stale"
+        root.mkdir()
+        config = write_config(root)
+        task_dir = Path(config.personal.task_directory) / "task-stale000000000"
+        task_dir.mkdir(parents=True)
+        (task_dir / "task.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "task-stale000000000",
+                    "status": "running",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch("swarm_router.personal.DashboardApp", FakeDashboard):
+            manager = PersonalTaskManager(config)
+        task = manager.task_view("task-stale000000000")
+        self.assertEqual(task["status"], "failed")
+        self.assertEqual(task["failure_category"], "interrupted")
 
 
 class PersonalApiDisconnectTest(unittest.TestCase):

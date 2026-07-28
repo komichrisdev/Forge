@@ -51,6 +51,13 @@ STREAM_STATUSES = {
     "consulting_workers": "Consulting workers...\n",
     "synthesizing": "Synthesizing...\n\n",
 }
+OPENAI_COMPAT_IGNORED_FIELDS = {
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "response_format",
+    "modalities",
+}
 
 
 class PersonalError(RuntimeError):
@@ -73,6 +80,12 @@ def _epoch_seconds(value: str) -> int:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4) if text else 0
+
+
+def _sync_wait_seconds(config: AppConfig) -> int:
+    judge_timeout = min(config.personal.task_timeout_seconds, config.swarm.judge_timeout_seconds)
+    margin = min(60, max(1, config.personal.task_timeout_seconds // 4))
+    return max(config.personal.task_timeout_seconds, config.personal.worker_timeout_seconds + judge_timeout + margin)
 
 
 def _message_digest(text: str) -> str:
@@ -307,7 +320,23 @@ class PersonalTaskManager:
         self._queue: Queue[str] = Queue()
         self._started = False
         self._lock = Lock()
+        self._recover_interrupted_tasks()
         self._start_workers()
+
+    def _recover_interrupted_tasks(self) -> None:
+        for path in self.root.iterdir():
+            if not path.is_dir():
+                continue
+            task = _read_json(path / "task.json", {})
+            if not isinstance(task, dict) or task.get("status") not in {"queued", "running"}:
+                continue
+            task["status"] = "failed"
+            task["updated_at"] = _utc_now()
+            task["completion_time"] = task["updated_at"]
+            task["failure_category"] = "interrupted"
+            task["final_response"] = "Task interrupted by service restart."
+            _write_private(path / "task.json", json.dumps(task, indent=2, ensure_ascii=False) + "\n")
+            _append_event(path / "events.jsonl", {"time": task["updated_at"], "event": "failed", "category": "interrupted"})
 
     def _start_workers(self) -> None:
         with self._lock:
@@ -362,6 +391,7 @@ class PersonalTaskManager:
             "unsupported_fields": (400, "unsupported_fields"),
             "no_healthy_model": (503, "no_healthy_model"),
             "timeout": (504, "timeout"),
+            "interrupted": (500, "interrupted"),
             "internal": (500, "internal"),
             "task_state": (500, "task_state"),
         }.get(category, (500, category or "task_failed"))
@@ -586,9 +616,9 @@ class PersonalTaskManager:
             self._fail(task_id, str(exc), exc.code, started)
         except Exception as exc:
             current = self._load_task(task_id)
-            if current["retry_count"] < self.config.personal.max_retries and "Every worker failed" in str(exc):
+            if current["retry_count"] < self.config.personal.max_retries and not self._cancelled(task_id):
                 self._update(task_id, retry_count=int(current["retry_count"]) + 1)
-                self._emit(task_id, "retrying", category="all_workers_failed")
+                self._emit(task_id, "retrying", category="task_failed")
                 self._queue.put(task_id)
                 return
             category = "cancelled" if self._cancelled(task_id) else "internal"
@@ -972,20 +1002,14 @@ class PersonalHandler(BaseHTTPRequestHandler):
                 self._error(401, "Bearer token required.", "unauthorized")
                 return
             if path == "/v1/chat/completions":
-                body = self._body()
-                unsupported = [key for key in body if key in {"tools", "tool_choice", "response_format", "modalities"}]
-                if unsupported:
-                    raise PersonalError(
-                        "Unsupported request fields: " + ", ".join(sorted(unsupported)),
-                        code="unsupported_fields",
-                    )
+                body = {key: value for key, value in self._body().items() if key not in OPENAI_COMPAT_IGNORED_FIELDS}
                 task = self.manager.create_task(body)
                 request_id = f"chatcmpl-{task['task_id']}"
                 created = _epoch_seconds(str(task["created_at"]))
                 if body.get("stream", False):
                     self._stream_task(task["task_id"], request_id, created, str(task["model"]))
                     return
-                deadline = monotonic() + self.manager.config.personal.task_timeout_seconds
+                deadline = monotonic() + _sync_wait_seconds(self.manager.config)
                 while monotonic() < deadline:
                     current = self.manager.task_view(str(task["task_id"]))
                     if current["status"] in {"failed", "cancelled"}:
