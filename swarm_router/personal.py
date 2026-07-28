@@ -20,7 +20,8 @@ import uuid
 from .catalog import ModelCatalog, ModelRecord
 from .config import AppConfig
 from .dashboard import DashboardApp
-from .journal import CheckpointRecord, JournalEventType, TaskJournal, validate_task_id
+from .journal import CheckpointRecord, JournalEventType, SideEffectState, TaskJournal, validate_task_id
+from .night_owl import NightOwlError, run_night_owl
 from .orchestrator import SwarmOrchestrator
 from .wiki import WikiRepository
 from .wiki_search import WikiIndex, WikiSearchError
@@ -462,8 +463,10 @@ class PersonalTaskManager:
             )
         trimmed = _window(messages, self.config.personal.max_conversation_chars)
         latest_user = _latest_user(trimmed)
-        rejection = _rejection(latest_user)
-        profile = "unsupported" if rejection else _profile(latest_user)
+        task_type = str(body.get("task_type", "personal_chat")).strip() or "personal_chat"
+        task_payload = body.get("task_payload") if isinstance(body.get("task_payload"), dict) else {}
+        rejection = None if task_type == "night_owl" else _rejection(latest_user)
+        profile = "night_owl" if task_type == "night_owl" else ("unsupported" if rejection else _profile(latest_user))
         task_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
         task_id = f"task-{uuid.uuid4().hex[:16]}"
         forge_task_id = self.journal.next_task_id()
@@ -507,6 +510,9 @@ class PersonalTaskManager:
             "model": model,
             "run_id": "",
             "metadata": task_metadata,
+            "task_type": task_type,
+            "agent_id": str(body.get("agent_id", "")).strip(),
+            "task_payload": task_payload,
         }
         self._save_task(task_id, task)
         self._emit(task_id, "queued")
@@ -514,7 +520,13 @@ class PersonalTaskManager:
             forge_task_id,
             JournalEventType.TASK_CREATED,
             message=f"Personal task created for profile {profile}.",
-            metadata={"personal_task_id": task_id, "profile": profile, "model": model, **task_metadata},
+            metadata={
+                "personal_task_id": task_id,
+                "profile": profile,
+                "model": model,
+                "task_type": task_type,
+                **task_metadata,
+            },
             transition_key=f"personal:{task_id}:created",
         )
         self._queue.put(task_id)
@@ -603,6 +615,9 @@ class PersonalTaskManager:
         )
         self._journal_stage(task_id, "planning", retry_count)
         try:
+            if task.get("task_type") == "night_owl":
+                self._run_night_owl_task(task_id, task, forge_task_id, started, retry_count)
+                return
             if task.get("rejection"):
                 self._complete(
                     task_id,
@@ -719,6 +734,98 @@ class PersonalTaskManager:
             self._fail(task_id, str(exc), category, started)
         finally:
             self._prune_completed()
+
+    def _run_night_owl_task(
+        self,
+        task_id: str,
+        task: dict[str, Any],
+        forge_task_id: str,
+        started: float,
+        retry_count: int,
+    ) -> None:
+        payload = task.get("task_payload") if isinstance(task.get("task_payload"), dict) else {}
+        agent_id = str(task.get("agent_id") or "night_owl")
+        run_id = f"night-owl-{task_id}-r{retry_count}"
+        dry_run = bool(payload.get("dry_run", str(payload.get("mode", "dry_run")) != "live"))
+        self.journal.append_event(
+            forge_task_id,
+            JournalEventType.TASK_ASSIGNED,
+            agent_id=agent_id,
+            run_id=run_id,
+            metadata={"personal_task_id": task_id, "handler": "night_owl"},
+            transition_key=f"personal:{task_id}:assigned:{run_id}:night_owl",
+        )
+        self.journal.append_event(
+            forge_task_id,
+            JournalEventType.STAGE_STARTED,
+            agent_id=agent_id,
+            run_id=run_id,
+            stage="night_owl_subprocess",
+            side_effect_state=SideEffectState.NONE if dry_run else SideEffectState.STARTED,
+            metadata={"personal_task_id": task_id, "dry_run": dry_run},
+            transition_key=f"personal:{task_id}:stage:night_owl_subprocess:r{retry_count}",
+        )
+        try:
+            result = run_night_owl(payload)
+        except NightOwlError as exc:
+            self._fail(task_id, str(exc), "night_owl", started)
+            return
+        self.journal.add_checkpoint(
+            CheckpointRecord(
+                task_id=forge_task_id,
+                stage="night_owl_subprocess",
+                agent_id=agent_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                checkpoint_reference=result.checkpoint_reference,
+                summary=f"Night Owl subprocess {result.status}.",
+                metadata={
+                    "personal_task_id": task_id,
+                    "returncode": result.returncode,
+                    "timed_out": result.timed_out,
+                    "duration_ms": result.duration_ms,
+                },
+            ),
+            transition_key=f"personal:{task_id}:checkpoint:night_owl:r{retry_count}",
+        )
+        self.journal.append_event(
+            forge_task_id,
+            JournalEventType.STAGE_STARTED,
+            agent_id=agent_id,
+            run_id=run_id,
+            stage="night_owl_finished",
+            side_effect_state=result.side_effect_state,
+            message=f"Night Owl subprocess {result.status}.",
+            metadata={
+                "personal_task_id": task_id,
+                "returncode": result.returncode,
+                "timed_out": result.timed_out,
+                "duration_ms": result.duration_ms,
+            },
+            transition_key=f"personal:{task_id}:stage:night_owl_finished:r{retry_count}",
+        )
+        output = (
+            f"Night Owl {result.status}.\n\n"
+            f"Return code: {result.returncode}\n"
+            f"Timed out: {result.timed_out}\n"
+            f"Checkpoint: {result.checkpoint_reference}\n\n"
+            f"STDOUT\n{result.stdout or '-'}\n\n"
+            f"STDERR\n{result.stderr or '-'}"
+        )
+        if result.status == "completed":
+            self._complete(
+                task_id,
+                output[: self.config.personal.max_output_chars],
+                profile="night_owl",
+                selected_workers=[agent_id],
+                selected_models=[],
+                selected_providers=[],
+                wiki_used=False,
+                wiki_page_ids=[],
+                run_id=run_id,
+                started=started,
+            )
+        else:
+            self._fail(task_id, output, "night_owl_timeout" if result.timed_out else "night_owl", started)
 
     def _complete(
         self,
@@ -1174,6 +1281,10 @@ class PersonalHandler(BaseHTTPRequestHandler):
                     sleep(0.1)
                 self.manager.cancel(str(task["task_id"]))
                 raise PersonalError("Task timed out before completion.", status=504, code="timeout")
+            if path == "/api/personal-tasks":
+                task = self.manager.create_task(self._body())
+                self._json(202, task)
+                return
             if path.startswith("/api/personal-tasks/") and path.endswith("/cancel"):
                 task_id = path.removeprefix("/api/personal-tasks/").removesuffix("/cancel").strip("/")
                 self._json(200, self.manager.cancel(task_id))

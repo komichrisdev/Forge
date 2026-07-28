@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable
+from urllib import request
 from zoneinfo import ZoneInfo
 import json
 import os
@@ -16,7 +17,7 @@ import uuid
 
 from .agents import default_registry
 from .config import AppConfig
-from .personal import PersonalTaskManager
+from .night_owl import validate_night_owl_payload
 
 
 SCHEDULE_ID_RE = re.compile(r"^FS-\d{8}-\d{6}$")
@@ -182,7 +183,10 @@ def validate_schedule(schedule: Schedule, *, allow_empty_id: bool = False) -> li
         issues.append("misfire_policy must be skip or run_once")
     if schedule.overlap_policy not in {"skip", "wait"}:
         issues.append("overlap_policy must be skip or wait")
-    issues.extend(_validate_payload(schedule.payload))
+    if schedule.task_type == "night_owl":
+        issues.extend(validate_night_owl_payload(schedule.payload))
+    else:
+        issues.extend(_validate_payload(schedule.payload))
     try:
         if schedule.trigger_type == "one_time":
             parse_time(str(schedule.trigger_configuration.get("run_at", "")))
@@ -636,7 +640,6 @@ class Scheduler:
         self.clock = clock
         self.store = store or ScheduleStore(config.swarm.catalog_path, clock=clock)
         self.owner = owner or f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self._manager: PersonalTaskManager | None = None
         self._submit_task = submit_task
 
     def task_status(self, task_id: str) -> str:
@@ -720,7 +723,14 @@ class Scheduler:
                 status="failed",
                 metadata={"error": "previous scheduler claim had no task_id; manual review required"},
             )
-        task = self._submit(schedule, occurrence)
+        try:
+            task = self._submit(schedule, occurrence)
+        except Exception as exc:
+            return self.store.finish_occurrence(
+                occurrence["occurrence_id"],
+                status="failed",
+                metadata={"error": str(exc)[:500]},
+            )
         self.store.mark_run(schedule.schedule_id, now)
         return self.store.finish_occurrence(
             occurrence["occurrence_id"],
@@ -738,19 +748,39 @@ class Scheduler:
     def _submit(self, schedule: Schedule, occurrence: dict[str, Any]) -> dict[str, Any]:
         if self._submit_task:
             return self._submit_task(schedule, occurrence)
-        if self._manager is None:
-            self._manager = PersonalTaskManager(self.config)
-        return self._manager.create_task(self._task_body(schedule, occurrence))
+        body = json.dumps(self._task_body(schedule, occurrence)).encode("utf-8")
+        token = os.environ.get(self.config.personal.auth_token_env, "")
+        if not token:
+            raise ScheduleError(f"{self.config.personal.auth_token_env} is required to submit scheduled tasks")
+        url = f"http://{self.config.personal.loopback_host}:{self.config.personal.port}/api/personal-tasks"
+        req = request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        return data if isinstance(data, dict) else {}
 
     def _task_body(self, schedule: Schedule, occurrence: dict[str, Any]) -> dict[str, Any]:
         messages = schedule.payload.get("messages")
         if not messages:
-            messages = [{"role": "user", "content": str(schedule.payload.get("prompt", "")).strip()}]
+            content = str(schedule.payload.get("prompt", "")).strip()
+            if schedule.task_type == "night_owl":
+                content = "Forge Night Owl automation occurrence."
+            messages = [{"role": "user", "content": content}]
         metadata = self._schedule_metadata(schedule, str(occurrence["scheduled_for"]))
         metadata["occurrence_id"] = str(occurrence["occurrence_id"])
         return {
             "model": self.config.personal.model_id,
             "messages": messages,
+            "task_type": schedule.task_type,
+            "agent_id": schedule.agent_id,
+            "task_payload": schedule.payload,
             "metadata": metadata,
         }
 

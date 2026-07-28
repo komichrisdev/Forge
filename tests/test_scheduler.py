@@ -279,12 +279,19 @@ class SchedulerTest(unittest.TestCase):
                 "swarm_router.personal.SwarmOrchestrator.run",
                 return_value=("done", root, {"answer": "done"}),
             ):
-                scheduler = Scheduler(config, store=store)
+                manager = PersonalTaskManager(config)
+                scheduler_ref: dict[str, Scheduler] = {}
+
+                def submit(schedule: Schedule, occurrence: dict[str, object]) -> dict[str, object]:
+                    return manager.create_task(scheduler_ref["scheduler"]._task_body(schedule, occurrence))
+
+                scheduler = Scheduler(config, store=store, submit_task=submit)
+                scheduler_ref["scheduler"] = scheduler
                 occurrence = scheduler.run_once(schedule.schedule_id)
                 deadline = monotonic() + 5
                 task = {}
                 while monotonic() < deadline:
-                    task = scheduler._manager.task_view(occurrence["task_id"])  # type: ignore[union-attr]
+                    task = manager.task_view(occurrence["task_id"])
                     if task["status"] == "completed":
                         break
                     sleep(0.05)
@@ -293,6 +300,16 @@ class SchedulerTest(unittest.TestCase):
             created = next(event for event in events if event.event_type == "TASK_CREATED")
             self.assertEqual(created.metadata["schedule_id"], schedule.schedule_id)
             self.assertEqual(created.metadata["occurrence_id"], occurrence["occurrence_id"])
+
+    def test_run_now_submission_failure_marks_occurrence_failed(self) -> None:
+        with TemporaryDirectory() as temp:
+            config = load_test_config(Path(temp))
+            store = ScheduleStore(config.swarm.catalog_path, clock=Clock())
+            schedule = store.create(base_schedule())
+            scheduler = Scheduler(config, store=store, submit_task=lambda _s, _o: (_ for _ in ()).throw(RuntimeError("backend down")))
+            occurrence = scheduler.run_once(schedule.schedule_id)
+            self.assertEqual(occurrence["status"], "failed")
+            self.assertIn("backend down", occurrence["metadata"]["error"])
 
     def test_malformed_unknown_task_and_unknown_agent_are_rejected(self) -> None:
         bad = Schedule.from_dict(base_schedule(agent_id="ghost"))

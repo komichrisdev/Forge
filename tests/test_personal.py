@@ -269,6 +269,22 @@ class PersonalApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["choices"][0]["message"]["content"], "Hello")
 
+    def test_task_create_endpoint_queues_existing_personal_backend_work(self) -> None:
+        with patch("swarm_router.personal.SwarmOrchestrator.run", return_value=("Queued", self.root, {"answer": "Queued"})):
+            status, payload = self.api(
+                "POST",
+                "/api/personal-tasks",
+                {
+                    "model": "swarm-personal",
+                    "messages": [{"role": "user", "content": "Summarize this"}],
+                    "metadata": {"schedule_id": "FS-20260728-000001"},
+                },
+            )
+            self.assertEqual(status, 202)
+            task = self.wait_for_status(str(payload["task_id"]), "completed")
+        self.assertEqual(task["final_response"], "Queued")
+        self.assertEqual(task["metadata"]["schedule_id"], "FS-20260728-000001")
+
     def test_transient_task_failure_retries_once(self) -> None:
         with patch(
             "swarm_router.personal.SwarmOrchestrator.run",

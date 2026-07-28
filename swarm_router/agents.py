@@ -186,7 +186,7 @@ DEFAULT_AGENTS = (
     AgentManifest("judge", "Judge", "Reviews candidate outputs and produces bounded synthesis.", supported_task_types=("review", "synthesis"), preferred_capabilities=("reasoning.high",)),
     AgentManifest("manager", "Manager", "Coordinates multi-step work and delegates to specialized logical agents.", supported_task_types=("planning", "coordination"), preferred_capabilities=("reasoning.high",)),
     AgentManifest("media_manager", "Media Manager", "Handles media-library planning and conservative organization workflows.", supported_task_types=("media", "maintenance")),
-    AgentManifest("night_owl", "Night Owl", "Processes asynchronous project work and prepares handoffs.", supported_task_types=("automation", "triage"), preferred_capabilities=("reasoning.fast", "tool_use")),
+    AgentManifest("night_owl", "Night Owl", "Processes asynchronous project work and prepares handoffs.", supported_task_types=("automation", "triage", "night_owl"), preferred_capabilities=("reasoning.fast", "tool_use")),
     AgentManifest("planner", "Planner", "Breaks work into safe steps and identifies constraints.", supported_task_types=("planning",), preferred_capabilities=("reasoning.high",)),
     AgentManifest("researcher", "Researcher", "Collects and summarizes evidence with source boundaries.", supported_task_types=("research",), preferred_capabilities=("long_context", "reasoning.fast")),
     AgentManifest("security_monitor", "Security Monitor", "Reviews system-security posture and reports risks.", supported_task_types=("security", "monitoring"), preferred_capabilities=("reasoning.high",)),
