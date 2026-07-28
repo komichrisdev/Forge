@@ -1,7 +1,7 @@
 # Forge Task Journal
 
-Forge Version: `0.8-dev`
-Architecture Revision: `R8`
+Forge Version: `0.9-dev`
+Architecture Revision: `R9`
 
 The Forge Task Journal is the persistent execution history for local Forge automation. It records what happened, who owned it, where checkpoints live, and whether recovery would be safe after a restart.
 

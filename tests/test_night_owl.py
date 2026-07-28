@@ -8,11 +8,14 @@ from time import monotonic, sleep
 from unittest.mock import Mock, patch
 import json
 import os
+import subprocess
+import urllib.error
 import unittest
 
 from swarm_router.config import AppConfig, load_config
 from swarm_router.journal import TaskJournal
-from swarm_router.night_owl import NightOwlResult, run_night_owl, validate_night_owl_payload
+from swarm_router.night_owl import NightOwlResult, forge_script_root, run_night_owl, validate_night_owl_payload
+from swarm_router.night_owl_jira import JiraError, classify_http_error, preflight, queue_jql
 from swarm_router.personal import PersonalTaskManager
 from swarm_router.scheduler import Scheduler, ScheduleStore
 
@@ -83,6 +86,20 @@ def fake_script(root: Path, body: str) -> Path:
     return path
 
 
+class FakeResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = json.dumps(payload).encode()
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.payload
+
+
 class NightOwlTest(unittest.TestCase):
     def test_payload_validation_rejects_unknown_fields_and_unsafe_paths(self) -> None:
         with TemporaryDirectory() as temp:
@@ -107,6 +124,8 @@ class NightOwlTest(unittest.TestCase):
                 allowed_script_roots=(script.parent,),
                 allowed_state_roots=(root / "state",),
             ))
+            forge_runner = forge_script_root() / "run_nightly.sh"
+            self.assertEqual(validate_night_owl_payload({"script_path": str(forge_runner), "mode": "live", "dry_run": False}), [])
 
     def test_dry_run_success_captures_output_and_redacts_secrets(self) -> None:
         with TemporaryDirectory() as temp:
@@ -219,6 +238,144 @@ class NightOwlTest(unittest.TestCase):
             recovery = TaskJournal(config.swarm.catalog_path).recovery_status(str(task["forge_task_id"]))
             self.assertEqual(recovery["replay_safety"], "unsafe")
             self.assertFalse(recovery["recovery_allowed"])
+
+    def test_jira_preflight_classifies_errors_and_validates_queries(self) -> None:
+        self.assertEqual(classify_http_error(401), "auth")
+        self.assertEqual(classify_http_error(403), "permission")
+        self.assertEqual(classify_http_error(429), "rate_limited")
+        with self.assertRaises(JiraError) as invalid:
+            queue_jql("bad project", "To Do")
+        self.assertEqual(invalid.exception.category, "query_validation")
+
+        with TemporaryDirectory() as temp:
+            config_path = Path(temp) / "env"
+            missing = preflight(config_path=config_path)
+            self.assertEqual(missing.error_category, "auth")
+            config_path.write_text(
+                "ATLASSIAN_SITE_URL=https://example.atlassian.net\nATLASSIAN_EMAIL=user@example.com\nATLASSIAN_API_TOKEN=secret-token\n",
+                encoding="utf-8",
+            )
+            responses = iter([
+                FakeResponse({"accountId": "account-1", "emailAddress": "user@example.com"}),
+                FakeResponse({"issues": [{"key": "KAN-1", "fields": {"summary": "Do work"}}]}),
+                FakeResponse({"issues": []}),
+            ])
+            result = preflight(config_path=config_path, open_url=lambda _req, timeout=10: next(responses))
+            self.assertTrue(result.ok)
+            self.assertEqual(result.to_dict()["issue_count"], 1)
+            self.assertEqual(result.account["email"], "us***@example.com")
+
+            def forbidden(_req: object, timeout: float = 10) -> FakeResponse:
+                raise urllib.error.HTTPError("https://example.atlassian.net", 403, "Forbidden", {}, None)
+
+            denied = preflight(config_path=config_path, open_url=forbidden)
+            self.assertFalse(denied.ok)
+            self.assertEqual(denied.error_category, "permission")
+
+            def timeout(_req: object, timeout: float = 10) -> FakeResponse:
+                raise urllib.error.URLError(TimeoutError("timed out"))
+
+            slow = preflight(config_path=config_path, open_url=timeout)
+            self.assertFalse(slow.ok)
+            self.assertEqual(slow.error_category, "timeout")
+
+    def test_live_mode_runner_empty_queue_completes_without_codex_or_discord(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            python = bin_dir / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if [[ ${1:-} == -m ]]; then\n"
+                "  out=''\n"
+                "  while (($#)); do if [[ $1 == --output ]]; then shift; out=$1; fi; shift || true; done\n"
+                "  payload='{ \"ok\": true, \"project\": \"KAN\", \"account\": {\"email\": \"us***@example.com\"}, \"statuses\": {\"In Progress\": [], \"To Do\": []}, \"issue_count\": 0, \"error_category\": \"\", \"message\": \"\" }'\n"
+                "  [[ -n $out ]] && printf '%s\\n' \"$payload\" > \"$out\"\n"
+                "  printf '%s\\n' \"$payload\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "/usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            codex = bin_dir / "codex"
+            codex.write_text("#!/usr/bin/env bash\necho codex-should-not-run >&2\nexit 9\n", encoding="utf-8")
+            codex.chmod(0o755)
+            runner = forge_script_root() / "run_nightly.sh"
+            env = {
+                **os.environ,
+                "NIGHT_OWL_CODEX": str(codex),
+                "NIGHT_OWL_STATE_DIR": str(root / "state"),
+                "NIGHT_OWL_JIRA_PROJECT": "KAN",
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                result = run_night_owl(
+                    {"script_path": str(runner), "state_dir": str(root / "state"), "mode": "live", "dry_run": False},
+                    allowed_script_roots=(runner.parent,),
+                    allowed_state_roots=(root,),
+                    grace_seconds=0.1,
+                )
+            self.assertEqual(result.status, "completed")
+            self.assertIn("queue verified empty", result.stdout)
+            self.assertNotIn("codex-should-not-run", result.stderr)
+
+    def test_runner_fails_when_discord_report_send_fails(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "bin"
+            home = root / "home"
+            state = root / "state"
+            send_dir = home / ".codex/skills/night-owl/scripts"
+            bin_dir.mkdir()
+            send_dir.mkdir(parents=True)
+            python = bin_dir / "python3"
+            python.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if [[ ${1:-} == -m ]]; then\n"
+                "  out=''\n"
+                "  while (($#)); do if [[ $1 == --output ]]; then shift; out=$1; fi; shift || true; done\n"
+                "  payload='{ \"ok\": true, \"project\": \"KAN\", \"account\": {}, \"statuses\": {\"In Progress\": [{\"key\":\"KAN-1\"}], \"To Do\": []}, \"issue_count\": 1, \"error_category\": \"\", \"message\": \"\" }'\n"
+                "  [[ -n $out ]] && printf '%s\\n' \"$payload\" > \"$out\"\n"
+                "  printf '%s\\n' \"$payload\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "/usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            codex = bin_dir / "codex"
+            codex.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "out=''\n"
+                "while (($#)); do if [[ $1 == -o ]]; then shift; out=$1; fi; shift || true; done\n"
+                "printf '%s\\n' NIGHT_OWL_REST_QUEUE_VERIFIED > \"$out\"\n"
+                "printf '%s\\n' queued-report > \"$NIGHT_OWL_STATE_DIR/report.md\"\n",
+                encoding="utf-8",
+            )
+            sender = send_dir / "send_report.sh"
+            sender.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+            for item in (python, codex, sender):
+                item.chmod(0o755)
+            result = subprocess.run(
+                [str(forge_script_root() / "run_nightly.sh")],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                    "NIGHT_OWL_CODEX": str(codex),
+                    "NIGHT_OWL_STATE_DIR": str(state),
+                },
+                timeout=5,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Discord report failed", (state / "report.md").read_text(encoding="utf-8"))
 
     def _wait_task(self, manager: PersonalTaskManager | None, task_id: str) -> dict[str, object]:
         self.assertIsNotNone(manager)

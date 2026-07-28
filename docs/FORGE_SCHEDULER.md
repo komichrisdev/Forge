@@ -1,7 +1,7 @@
 # Forge Scheduler
 
-Forge Version: `0.8-dev`
-Architecture Revision: `R8`
+Forge Version: `0.9-dev`
+Architecture Revision: `R9`
 
 The Forge Scheduler is the local timer layer for Forge automations. It decides when work should be queued, then submits a normal task to the existing personal-task backend.
 

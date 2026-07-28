@@ -1,9 +1,9 @@
 # Forge Night Owl Migration
 
-Forge Version: `0.8-dev`
-Architecture Revision: `R8`
+Forge Version: `0.9-dev`
+Architecture Revision: `R9`
 
-This records the first production Forge automation migration: Night Owl runs as a Forge task type submitted by the persistent scheduler and recorded in the task journal.
+This records the first enabled production Forge automation: Night Owl runs as a Forge task type submitted by the persistent scheduler and recorded in the task journal.
 
 ## Existing Night Owl automation
 
@@ -32,7 +32,13 @@ External services used:
 - Discord webhook from the Night Owl environment file
 - Codex CLI
 
-The existing script uses `flock` to prevent concurrent runs, `timeout` to bound runtime, and writes JSONL logs plus a final message file. Dry-run mode validates prerequisites without processing Jira work.
+The legacy script uses `flock` to prevent concurrent runs, `timeout` to bound runtime, and writes JSONL logs plus a final message file. Dry-run mode validates prerequisites without processing Jira work.
+
+Forge live execution uses the repo-owned runner:
+
+- `/home/komichris/openwebui-codex-swarm/scripts/night-owl/run_nightly.sh`
+
+That runner preserves the existing lock, timeout, state, Codex, and report behavior, but repairs Jira queue access by using the existing private Jira REST credentials before invoking Codex.
 
 ## Previous trigger
 
@@ -61,6 +67,8 @@ Payload fields are structured and validated:
 
 Unknown fields are rejected. Arbitrary shell commands are not accepted.
 
+The live production payload points to the Forge-owned runner and keeps secrets out of the schedule payload.
+
 ## Execution path
 
 ```text
@@ -74,12 +82,35 @@ Task journal records creation, assignment, start, checkpoints, and terminal stat
   ↓
 Night Owl handler invokes run_nightly.sh with subprocess argv
   ↓
+Runner validates Jira queue through REST
+  ↓
 stdout/stderr are captured, size-limited, and redacted
   ↓
 Task completes or fails normally
 ```
 
 The scheduler does not execute Night Owl directly. It submits a normal personal task to the running backend over the authenticated loopback API so task execution survives the scheduler CLI process exiting.
+
+If the Jira queue is empty, the runner writes a queue snapshot and exits successfully without starting Codex or sending Discord. If the queue has work, the runner starts Codex with the Night Owl skill and an explicit REST-based Jira instruction.
+
+## Jira repair
+
+Root cause:
+
+- The legacy Night Owl prompt instructed spawned Codex to use `atlassian_rovo.searchJiraIssuesUsingJql`.
+- The Atlassian MCP connector available to Codex is granted to `qublixgames.atlassian.net`, not `komichris.atlassian.net`.
+- Direct MCP reproduction against `https://komichris.atlassian.net` returned `INVALID_ARGUMENT`.
+- Existing private REST credentials in `/home/komichris/.config/night-owl/env` successfully authenticated to `komichris.atlassian.net`.
+
+Repair:
+
+- Added a stdlib Jira REST preflight helper in Forge.
+- The Forge runner reads the existing Night Owl credential file at runtime.
+- Queue checks use bounded REST calls to `/rest/api/3/myself` and `/rest/api/3/search/jql`.
+- JQL is generated from a validated project key and the two supported statuses only: `In Progress` and `To Do`.
+- Authentication, permission, rate-limit, timeout, network, and query-validation failures are classified.
+- Queue snapshots store masked account identity, issue keys, summaries, status buckets, and counts.
+- No token, password, authorization header, cookie, or webhook URL is written to Git, task payloads, logs, or journal metadata.
 
 ## Journal behavior
 
@@ -98,6 +129,7 @@ Dry-run executions use side-effect state `none`. Live executions enter `started`
 
 Night Owl actions:
 
+- Jira REST preflight: read-only
 - dry-run prerequisite checks: read-only
 - local state/log writes: idempotent write
 - Jira updates: non-idempotent write
@@ -109,7 +141,7 @@ Forge does not automatically retry or replay uncertain non-idempotent Night Owl 
 
 ## Forge schedule
 
-Production schedule created:
+Production schedule:
 
 - schedule ID: `FS-20260728-000001`
 - name: `Night Owl Jira queue check`
@@ -119,10 +151,22 @@ Production schedule created:
 - timezone: `America/New_York`
 - misfire policy: `skip`
 - overlap policy: `skip`
-- initial payload: dry-run
-- initial state: disabled
+- payload mode: live
+- runner: `/home/komichris/openwebui-codex-swarm/scripts/night-owl/run_nightly.sh`
+- timeout: 14,400 seconds
+- state: enabled
+- next validated run: `2026-07-29T00:00:00Z`
 
-The schedule is disabled until a live Night Owl run is safe. Recent live Night Owl logs showed Jira query failures, so enabling a production cadence would create duplicate or failed automation without adding value.
+Controlled live validation on 2026-07-28 completed with an empty queue:
+
+- occurrence: `FO-20260728-000001-20260728T214244Z`
+- personal task: `task-08e49acdfea04db2`
+- Forge task: `FT-20260728-000004`
+- Night Owl checkpoint: `night-owl/20260728T214244Z`
+- personal checkpoint: `personal/task-08e49acdfea04db2/task.json`
+- Jira snapshot: `/home/komichris/.local/share/owui-swarm/night-owl/20260728T214244Z-jira-queue.json`
+- result: completed
+- eligible issues: 0
 
 ## Service deployment
 
@@ -135,7 +179,39 @@ The scheduler runs as a user systemd service:
 - Night Owl Forge state: `/home/komichris/.local/share/owui-swarm/night-owl`
 - logs: user journald
 
-It starts cleanly with no enabled schedules and preserves the Open WebUI and personal backend services.
+It starts cleanly with the enabled Night Owl schedule and preserves the Open WebUI and personal backend services.
+
+## Credential and service behavior
+
+Credentials stay outside Git:
+
+- Forge backend API key: `/home/komichris/.config/owui-swarm/environment`
+- Night Owl Jira and Discord config: `/home/komichris/.config/night-owl/env`
+- GitHub CLI auth: `/home/komichris/.config/gh/hosts.yml`
+
+The Forge service runs under the existing user systemd scope. `ProtectHome=read-only` allows reading private Night Owl config while keeping writes constrained to `/home/komichris/.local/share/owui-swarm`.
+
+## Preflight results
+
+Jira:
+
+- REST `/myself`: HTTP 200
+- REST queue JQL for `In Progress`: HTTP 200, 0 issues
+- REST queue JQL for `To Do`: HTTP 200, 0 issues
+- identity: `ch***@gmail.com`
+
+GitHub:
+
+- `gh auth status -h github.com`: authenticated as `komichrisdev`
+- `/home/komichris/misc`: `git ls-remote --heads origin` succeeded
+- `/home/komichris/crypto-keeper`: `git ls-remote --heads origin` succeeded
+
+Discord:
+
+- webhook configured: yes
+- metadata GET: HTTP 403
+- one labelled test send: HTTP 403
+- safe-fail policy: existing report-send failure leaves the report queued and makes the Night Owl task fail instead of reporting false success
 
 ## CLI inspection
 
@@ -182,6 +258,6 @@ Do not enable both Forge and legacy cron for the same four-hour cadence.
 
 ## Current limitations
 
-- Live Night Owl cadence remains disabled until Jira authentication/query behavior is verified.
 - No automatic retry, replay, handoff, Discord integration, dashboard UI, or Codex delegation changes are implemented here.
-- This migration wraps the proven Night Owl script; it does not rewrite Night Owl internals.
+- Discord delivery currently returns HTTP 403; Night Owl treats report-send failure as a task failure when a report exists.
+- If the queue contains work, Codex will use REST for KomiChris Jira because the Atlassian MCP connector is not granted to that cloud.

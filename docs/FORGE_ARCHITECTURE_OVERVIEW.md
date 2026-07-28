@@ -1,7 +1,7 @@
 # Forge Architecture Overview
 
-Forge Version: `0.8-dev`
-Architecture Revision: `R8`
+Forge Version: `0.9-dev`
+Architecture Revision: `R9`
 
 This is the starting point for developers new to Forge. It describes the platform shape and the intended boundaries between agents, providers, routing, execution, and future resilience work. It deliberately avoids implementation details.
 
@@ -222,7 +222,7 @@ Near-term milestones:
 - Persistent journal: persist lifecycle events, checkpoints, leases, and recovery state. See [FORGE_TASK_JOURNAL.md](FORGE_TASK_JOURNAL.md).
 - Capability routing: let agents request provider-independent capabilities instead of model names.
 - Scheduler: implemented as controlled local recurring and delayed execution. See [FORGE_SCHEDULER.md](FORGE_SCHEDULER.md).
-- Night Owl migration: move Night Owl onto stable Forge agent identity and handoff contracts. See [FORGE_NIGHT_OWL.md](FORGE_NIGHT_OWL.md).
+- Night Owl migration: Night Owl now runs as the first enabled Forge scheduler workload. See [FORGE_NIGHT_OWL.md](FORGE_NIGHT_OWL.md).
 - Additional providers: add OpenAI, Anthropic, Ollama, and other providers through the same provider model.
 - Avatar pipeline: add visual identity assets without coupling them to execution models.
 - Windows desktop integration: support local desktop workflows while preserving Forge authority and safety boundaries.

@@ -90,6 +90,10 @@ def default_state_dir() -> Path:
     return Path.home() / ".local/share/owui-swarm/night-owl"
 
 
+def forge_script_root() -> Path:
+    return Path(__file__).resolve().parents[1] / "scripts/night-owl"
+
+
 def _within(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(path == root or root in path.parents for root in roots)
 
@@ -144,6 +148,7 @@ def validate_night_owl_payload(
 
     script = Path(payload.script_path).expanduser().resolve() if payload.script_path else default_script_path().resolve()
     roots = allowed_script_roots or (
+        forge_script_root().resolve(),
         (Path.home() / ".codex/skills/night-owl/scripts").resolve(),
         (Path.home() / "misc/skills/night-owl/scripts").resolve(),
     )
