@@ -20,6 +20,7 @@ import uuid
 from .catalog import ModelCatalog, ModelRecord
 from .config import AppConfig
 from .dashboard import DashboardApp
+from .journal import CheckpointRecord, JournalEventType, TaskJournal, validate_task_id
 from .orchestrator import SwarmOrchestrator
 from .wiki import WikiRepository
 from .wiki_search import WikiIndex, WikiSearchError
@@ -308,6 +309,7 @@ class PersonalTaskManager:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.catalog = ModelCatalog(config.swarm.catalog_path)
+        self.journal = TaskJournal(config.swarm.catalog_path)
         self.dashboard = DashboardApp(config)
         self.root = Path(config.personal.task_directory).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=TASK_DIR_MODE)
@@ -335,8 +337,18 @@ class PersonalTaskManager:
             task["completion_time"] = task["updated_at"]
             task["failure_category"] = "interrupted"
             task["final_response"] = "Task interrupted by service restart."
+            forge_task_id = str(task.get("forge_task_id") or self.journal.next_task_id())
+            task["forge_task_id"] = forge_task_id
             _write_private(path / "task.json", json.dumps(task, indent=2, ensure_ascii=False) + "\n")
             _append_event(path / "events.jsonl", {"time": task["updated_at"], "event": "failed", "category": "interrupted"})
+            self.journal.append_event(
+                forge_task_id,
+                JournalEventType.TASK_FAILED,
+                agent_id="manager",
+                message="Task interrupted by service restart.",
+                metadata={"personal_task_id": str(task.get("task_id") or path.name), "category": "interrupted"},
+                transition_key=f"personal:{path.name}:interrupted",
+            )
 
     def _start_workers(self) -> None:
         with self._lock:
@@ -375,6 +387,26 @@ class PersonalTaskManager:
 
     def _emit(self, task_id: str, event: str, **payload: Any) -> None:
         _append_event(self._events_path(task_id), {"time": _utc_now(), "event": event, **payload})
+
+    def _forge_task_id(self, task_id: str) -> str:
+        task = self._load_task(task_id)
+        forge_task_id = str(task.get("forge_task_id") or "")
+        if validate_task_id(forge_task_id):
+            return forge_task_id
+        forge_task_id = self.journal.next_task_id()
+        task["forge_task_id"] = forge_task_id
+        self._save_task(task_id, task)
+        return forge_task_id
+
+    def _journal_stage(self, task_id: str, stage: str, retry_count: int = 0) -> None:
+        self.journal.append_event(
+            self._forge_task_id(task_id),
+            JournalEventType.STAGE_STARTED,
+            agent_id="manager",
+            stage=stage,
+            metadata={"personal_task_id": task_id},
+            transition_key=f"personal:{task_id}:stage:{stage}:r{retry_count}",
+        )
 
     def _status_error(self, task: dict[str, Any]) -> tuple[int, str]:
         category = str(task.get("failure_category") or "")
@@ -433,6 +465,7 @@ class PersonalTaskManager:
         rejection = _rejection(latest_user)
         profile = "unsupported" if rejection else _profile(latest_user)
         task_id = f"task-{uuid.uuid4().hex[:16]}"
+        forge_task_id = self.journal.next_task_id()
         task_dir = self._task_dir(task_id)
         task_dir.mkdir(parents=True, mode=TASK_DIR_MODE)
         task_dir.chmod(TASK_DIR_MODE)
@@ -440,6 +473,7 @@ class PersonalTaskManager:
         now = _utc_now()
         task = {
             "task_id": task_id,
+            "forge_task_id": forge_task_id,
             "status": "queued",
             "created_at": now,
             "updated_at": now,
@@ -474,6 +508,13 @@ class PersonalTaskManager:
         }
         self._save_task(task_id, task)
         self._emit(task_id, "queued")
+        self.journal.append_event(
+            forge_task_id,
+            JournalEventType.TASK_CREATED,
+            message=f"Personal task created for profile {profile}.",
+            metadata={"personal_task_id": task_id, "profile": profile, "model": model},
+            transition_key=f"personal:{task_id}:created",
+        )
         self._queue.put(task_id)
         return task
 
@@ -489,6 +530,14 @@ class PersonalTaskManager:
             task["failure_category"] = "cancelled"
             task["completion_time"] = _utc_now()
             self._emit(task_id, "cancelled")
+            self.journal.append_event(
+                self._forge_task_id(task_id),
+                JournalEventType.TASK_CANCELLED,
+                agent_id="manager",
+                message="Personal task cancelled.",
+                metadata={"personal_task_id": task_id},
+                transition_key=f"personal:{task_id}:cancelled",
+            )
         self._save_task(task_id, task)
         return task
 
@@ -535,6 +584,22 @@ class PersonalTaskManager:
         started = monotonic()
         task = self._update(task_id, status="running", start_time=_utc_now())
         self._emit(task_id, "planning")
+        retry_count = int(task.get("retry_count") or 0)
+        forge_task_id = self._forge_task_id(task_id)
+        self.journal.append_event(
+            forge_task_id,
+            JournalEventType.TASK_STARTED,
+            agent_id="manager",
+            metadata={"personal_task_id": task_id, "retry_count": retry_count},
+            transition_key=f"personal:{task_id}:started:r{retry_count}",
+        )
+        self.journal.grant_lease(
+            forge_task_id,
+            "manager",
+            self.config.personal.task_timeout_seconds,
+            transition_key=f"personal:{task_id}:lease:r{retry_count}",
+        )
+        self._journal_stage(task_id, "planning", retry_count)
         try:
             if task.get("rejection"):
                 self._complete(
@@ -563,6 +628,7 @@ class PersonalTaskManager:
                 context_parts.append(("swarm-status", json.dumps(self._swarm_status_context(), indent=2, ensure_ascii=False)))
             if _wiki_needed(str(task["profile"]), latest_user):
                 self._emit(task_id, "retrieving_wiki_context")
+                self._journal_stage(task_id, "retrieving_wiki_context", retry_count)
                 wiki_context, wiki_page_ids = self._wiki_context(latest_user)
                 if wiki_context:
                     wiki_used = True
@@ -571,7 +637,24 @@ class PersonalTaskManager:
                 self.cancel(task_id)
                 return
             self._emit(task_id, "consulting_workers")
+            self._journal_stage(task_id, "consulting_workers", retry_count)
             run_id = f"personal-{task_id}-r{int(task.get('retry_count') or 0)}"
+            for role in (*roles, "__judge__"):
+                logical_agent = "judge" if role == "__judge__" else role
+                record = selected[role]
+                self.journal.append_event(
+                    forge_task_id,
+                    JournalEventType.TASK_ASSIGNED,
+                    agent_id=logical_agent,
+                    run_id=run_id,
+                    metadata={
+                        "personal_task_id": task_id,
+                        "role": role,
+                        "model_id": record.model_id,
+                        "provider": record.provider,
+                    },
+                    transition_key=f"personal:{task_id}:assigned:{run_id}:{logical_agent}",
+                )
             run_config = replace(
                 self.config,
                 swarm=replace(
@@ -595,6 +678,7 @@ class PersonalTaskManager:
                 run_id=run_id,
             )
             self._emit(task_id, "synthesizing")
+            self._journal_stage(task_id, "synthesizing", retry_count)
             answer = str(parsed.get("answer", "")).strip() or bounded.strip()
             if wiki_used and wiki_page_ids:
                 refs = " ".join(f"[wiki:{page_id}]" for page_id in wiki_page_ids[:5])
@@ -619,6 +703,14 @@ class PersonalTaskManager:
             if current["retry_count"] < self.config.personal.max_retries and not self._cancelled(task_id):
                 self._update(task_id, retry_count=int(current["retry_count"]) + 1)
                 self._emit(task_id, "retrying", category="task_failed")
+                self.journal.append_event(
+                    self._forge_task_id(task_id),
+                    JournalEventType.RECOVERY_PROPOSED,
+                    agent_id="manager",
+                    message="Existing personal-task retry path proposed one retry.",
+                    metadata={"personal_task_id": task_id, "category": "task_failed"},
+                    transition_key=f"personal:{task_id}:recovery-proposed:r{int(current['retry_count'])}",
+                )
                 self._queue.put(task_id)
                 return
             category = "cancelled" if self._cancelled(task_id) else "internal"
@@ -660,6 +752,29 @@ class PersonalTaskManager:
             failure_category="",
         )
         self._emit(task_id, "completed")
+        forge_task_id = self._forge_task_id(task_id)
+        self.journal.add_checkpoint(
+            CheckpointRecord(
+                task_id=forge_task_id,
+                stage="completed",
+                agent_id="manager",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                checkpoint_reference=f"personal/{task_id}/task.json",
+                summary="Personal task completed.",
+                metadata={"personal_task_id": task_id, "run_id": run_id},
+            ),
+            transition_key=f"personal:{task_id}:checkpoint:completed",
+        )
+        self.journal.append_event(
+            forge_task_id,
+            JournalEventType.TASK_COMPLETED,
+            agent_id="manager",
+            run_id=run_id,
+            checkpoint_reference=f"personal/{task_id}/task.json",
+            message="Personal task completed.",
+            metadata={"personal_task_id": task_id},
+            transition_key=f"personal:{task_id}:completed",
+        )
 
     def _fail(self, task_id: str, message: str, category: str, started: float) -> None:
         status = "cancelled" if category == "cancelled" else "failed"
@@ -673,6 +788,14 @@ class PersonalTaskManager:
         }
         self._update(task_id, **payload)
         self._emit(task_id, "cancelled" if status == "cancelled" else "failed", category=category)
+        self.journal.append_event(
+            self._forge_task_id(task_id),
+            JournalEventType.TASK_CANCELLED if status == "cancelled" else JournalEventType.TASK_FAILED,
+            agent_id="manager",
+            message=message[:2000],
+            metadata={"personal_task_id": task_id, "category": category},
+            transition_key=f"personal:{task_id}:{status}:{category}",
+        )
 
     def _prune_completed(self) -> None:
         finished: list[tuple[str, Path]] = []

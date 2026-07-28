@@ -1,7 +1,7 @@
 # Forge Architecture Overview
 
-Forge Version: `0.5-dev`
-Architecture Revision: `R5`
+Forge Version: `0.6-dev`
+Architecture Revision: `R6`
 
 This is the starting point for developers new to Forge. It describes the platform shape and the intended boundaries between agents, providers, routing, execution, and future resilience work. It deliberately avoids implementation details.
 
@@ -56,7 +56,7 @@ Core contains the platform services that should remain stable as providers and a
 
 - Router: tracks provider inventories, model health, cooldowns, and eventually matches requested capabilities to eligible providers and models.
 - Scheduler: will decide when recurring or delayed work should start. Timers remain explicit and controlled; scheduling should not imply unsafe side effects.
-- Journal: will store durable task lifecycle events, checkpoints, leases, handoff state, and recovery metadata.
+- Journal: stores durable task lifecycle events, checkpoints, leases, handoff state, and recovery metadata.
 - Memory: stores project knowledge, retrieved context, and summaries that agents can use without depending on hidden model state.
 - Agent Registry: will define stable logical agents, their required capabilities, authority boundaries, and handoff contracts.
 - Tool Runtime: will mediate access to external actions. It should enforce permissions, idempotency, auditability, and fail-safe behavior.
@@ -219,7 +219,7 @@ This keeps routing provider-independent and model-independent. A future provider
 Near-term milestones:
 
 - Worker handoff: define and validate logical-agent handoff envelopes. See [FORGE_AGENT_REGISTRY.md](FORGE_AGENT_REGISTRY.md).
-- Persistent journal: persist lifecycle events, checkpoints, leases, and recovery state.
+- Persistent journal: persist lifecycle events, checkpoints, leases, and recovery state. See [FORGE_TASK_JOURNAL.md](FORGE_TASK_JOURNAL.md).
 - Capability routing: let agents request provider-independent capabilities instead of model names.
 - Scheduler: add controlled recurring and delayed execution.
 - Night Owl migration: move Night Owl onto stable Forge agent identity and handoff contracts.

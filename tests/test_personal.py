@@ -14,6 +14,7 @@ import unittest
 
 from swarm_router.catalog import ModelCatalog
 from swarm_router.config import AppConfig, load_config
+from swarm_router.journal import TaskJournal
 from swarm_router.personal import PersonalError, PersonalHandler, PersonalTaskManager
 from swarm_router.wiki import WikiRepository
 from swarm_router.wiki_search import WikiIndex
@@ -243,6 +244,12 @@ class PersonalApiTest(unittest.TestCase):
         self.assertFalse(task["wiki_used"])
         self.assertEqual(task["message_metadata"][0]["role"], "user")
         self.assertNotIn("preview", json.dumps(task))
+        forge_task_id = str(task["forge_task_id"])
+        journal = TaskJournal(self.config.swarm.catalog_path)
+        self.assertEqual(journal.reconstruct(forge_task_id)["status"], "completed")
+        self.assertIn("TASK_CREATED", [event.event_type for event in journal.events(forge_task_id)])
+        self.assertIn("TASK_ASSIGNED", [event.event_type for event in journal.events(forge_task_id)])
+        self.assertEqual(journal.checkpoints(forge_task_id)[0].checkpoint_reference, f"personal/{task_id}/task.json")
 
     def test_openai_tool_fields_are_ignored_for_compatibility(self) -> None:
         with patch("swarm_router.personal.SwarmOrchestrator.run", return_value=("Hello", self.root, {"answer": "Hello"})):

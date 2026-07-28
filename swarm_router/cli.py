@@ -15,6 +15,7 @@ from .catalog import ModelCatalog
 from .client import OpenWebUIClient
 from .config import load_config
 from .dashboard import serve
+from .journal import TaskJournal
 from .orchestrator import SwarmOrchestrator
 from .personal import serve_personal
 from .prompts import authority_block, worker_prompt
@@ -89,6 +90,25 @@ def _parser() -> argparse.ArgumentParser:
     handoff_validate = handoff_sub.add_parser("validate", help="Validate a handoff envelope JSON file or stdin.")
     handoff_validate.add_argument("envelope", help="Path to JSON envelope, or '-' for stdin.")
     handoff_validate.add_argument("--json", action="store_true")
+
+    journal = sub.add_parser("journal", help="Inspect the persistent Forge task journal.")
+    journal_sub = journal.add_subparsers(dest="journal_command", required=True)
+    journal_list = journal_sub.add_parser("list", help="List journaled tasks.")
+    journal_list.add_argument("--json", action="store_true")
+    journal_show = journal_sub.add_parser("show", help="Show reconstructed state for one task.")
+    journal_show.add_argument("task_id")
+    journal_show.add_argument("--json", action="store_true")
+    journal_events = journal_sub.add_parser("events", help="Show append-only events for one task.")
+    journal_events.add_argument("task_id")
+    journal_events.add_argument("--json", action="store_true")
+    journal_checkpoints = journal_sub.add_parser("checkpoints", help="Show checkpoint records for one task.")
+    journal_checkpoints.add_argument("task_id")
+    journal_checkpoints.add_argument("--json", action="store_true")
+    journal_orphans = journal_sub.add_parser("orphans", help="Show read-only suspected orphan tasks.")
+    journal_orphans.add_argument("--json", action="store_true")
+    journal_recovery = journal_sub.add_parser("recovery-status", help="Show replay-safety status for one task.")
+    journal_recovery.add_argument("task_id")
+    journal_recovery.add_argument("--json", action="store_true")
 
     models = sub.add_parser("models", help="Synchronize and list Open WebUI models with local classifications.")
     models.add_argument("--json", action="store_true")
@@ -328,6 +348,59 @@ def _run_agent(args: argparse.Namespace) -> int:
     return 2
 
 
+def _run_journal(args: argparse.Namespace) -> int:
+    config = load_config(args.config, require_api_key=False)
+    journal = TaskJournal(config.swarm.catalog_path)
+    if args.journal_command == "list":
+        rows = journal.list_tasks()
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        else:
+            for item in rows:
+                print(f"{item['task_id']}\t{item['status']}\t{item['event_count']}\t{item['updated_at']}")
+        return 0
+    if args.journal_command == "show":
+        item = journal.reconstruct(args.task_id)
+        if args.json:
+            print(json.dumps(item, indent=2, ensure_ascii=False))
+        else:
+            print(f"{item['task_id']}\t{item['status']}\t{item['event_count']}")
+            print(f"agents\t{','.join(item['agents']) or '-'}")
+        return 0
+    if args.journal_command == "events":
+        rows = [event.to_dict() for event in journal.events(args.task_id)]
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        else:
+            for event in rows:
+                print(f"{event['sequence']}\t{event['timestamp']}\t{event['event_type']}\t{event['agent_id']}\t{event['message']}")
+        return 0
+    if args.journal_command == "checkpoints":
+        rows = [checkpoint.to_dict() for checkpoint in journal.checkpoints(args.task_id)]
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        else:
+            for item in rows:
+                print(f"{item['timestamp']}\t{item['task_id']}\t{item['stage']}\t{item['agent_id']}\t{item['checkpoint_reference']}")
+        return 0
+    if args.journal_command == "orphans":
+        rows = journal.orphan_candidates()
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        else:
+            for item in rows:
+                print(f"{item['task_id']}\t{item['orphan_status']}\t{item.get('lease_expires_at', '-')}")
+        return 0
+    if args.journal_command == "recovery-status":
+        item = journal.recovery_status(args.task_id)
+        if args.json:
+            print(json.dumps(item, indent=2, ensure_ascii=False))
+        else:
+            print(f"{item['task_id']}\t{item['status']}\t{item['replay_safety']}\trecovery_allowed={item['recovery_allowed']}")
+        return 0
+    return 2
+
+
 def _provider_rows(catalog: ModelCatalog, provider_id: str) -> list[dict[str, object]]:
     return [item for item in catalog.provider_status()["models"] if item["provider_id"] == provider_id]
 
@@ -399,6 +472,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_wiki(args)
         if args.command in {"agent", "handoff", "status"}:
             return _run_agent(args)
+        if args.command == "journal":
+            return _run_journal(args)
         config = load_config(args.config)
         client = OpenWebUIClient(
             config.openwebui.base_url,

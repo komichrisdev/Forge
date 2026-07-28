@@ -180,7 +180,9 @@ class AgentRegistry:
 
 
 DEFAULT_AGENTS = (
+    AgentManifest("critic", "Critic", "Reviews candidate plans for gaps, risks, and unsupported claims.", supported_task_types=("review",), preferred_capabilities=("reasoning.high",)),
     AgentManifest("crypto_keeper", "Crypto Keeper", "Monitors crypto context and produces bounded market/task summaries.", supported_task_types=("research", "monitoring")),
+    AgentManifest("implementer", "Implementer", "Produces concrete implementation proposals within supervisor constraints.", supported_task_types=("implementation",), preferred_capabilities=("coding",)),
     AgentManifest("judge", "Judge", "Reviews candidate outputs and produces bounded synthesis.", supported_task_types=("review", "synthesis"), preferred_capabilities=("reasoning.high",)),
     AgentManifest("manager", "Manager", "Coordinates multi-step work and delegates to specialized logical agents.", supported_task_types=("planning", "coordination"), preferred_capabilities=("reasoning.high",)),
     AgentManifest("media_manager", "Media Manager", "Handles media-library planning and conservative organization workflows.", supported_task_types=("media", "maintenance")),
@@ -188,6 +190,7 @@ DEFAULT_AGENTS = (
     AgentManifest("planner", "Planner", "Breaks work into safe steps and identifies constraints.", supported_task_types=("planning",), preferred_capabilities=("reasoning.high",)),
     AgentManifest("researcher", "Researcher", "Collects and summarizes evidence with source boundaries.", supported_task_types=("research",), preferred_capabilities=("long_context", "reasoning.fast")),
     AgentManifest("security_monitor", "Security Monitor", "Reviews system-security posture and reports risks.", supported_task_types=("security", "monitoring"), preferred_capabilities=("reasoning.high",)),
+    AgentManifest("verifier", "Verifier", "Checks proposed outcomes against evidence and acceptance criteria.", supported_task_types=("verification",), preferred_capabilities=("reasoning.high",)),
 )
 
 
