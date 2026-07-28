@@ -9,6 +9,9 @@ The Node MCP service exposes four read-only wiki tools backed by the same
 canonical Python wiki/search modules: `wiki.search`, `wiki.page`,
 `wiki.related`, and `wiki.status`.
 
+For the high-level Forge platform model, start with
+[docs/FORGE_ARCHITECTURE_OVERVIEW.md](docs/FORGE_ARCHITECTURE_OVERVIEW.md).
+
 ## Authority
 
 The enforced order is:
