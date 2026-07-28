@@ -166,8 +166,20 @@ Start interactively:
 owui-swarm serve
 ```
 
-Open `http://127.0.0.1:8787`. The server rejects every bind address other than
-`127.0.0.1`; do not expose it through a public reverse proxy.
+Open `http://127.0.0.1:8787` locally or the deployed LAN URL documented in
+[docs/FORGE_LAN_DASHBOARD.md](docs/FORGE_LAN_DASHBOARD.md). The Forge dashboard
+is for operations: health, schedules, journal history, Night Owl, Discord
+notifications, providers, agents, and approved manual task dispatch. It is not a
+replacement chat UI.
+
+Open WebUI remains the direct model-conversation interface:
+
+- LAN dashboard: `http://192.168.2.12:8787`
+- Open WebUI: `http://192.168.2.12:3000`
+
+The dashboard requires an owner secret from
+`~/.config/owui-swarm/dashboard.env`. Do not expose it through a public reverse
+proxy or the internet without HTTPS and a separate security review.
 
 For the installed user service:
 
@@ -177,11 +189,8 @@ systemctl --user enable --now owui-swarm-dashboard.service
 systemctl --user status owui-swarm-dashboard.service
 ```
 
-The dashboard shows run history, objectives, criteria, mode, context accounting,
-role/model selection and reasons, exact prompts, timestamps, latency, errors,
-raw worker and judge output, final synthesis, confidence, agreements,
-disagreements, verification needs, catalog metadata, ratings, notes, and probe
-history. It never displays API keys or authorization headers.
+The dashboard shows operational state and keeps secrets out of HTML, JSON,
+SQLite, and logs.
 
 ## Personal task backend
 

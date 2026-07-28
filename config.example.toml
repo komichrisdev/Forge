@@ -37,9 +37,9 @@ allow_explicit_override = true
 [dashboard]
 host = "127.0.0.1"
 port = 8787
-# Optional. When set, API requests must include the value of this environment
-# variable in X-Swarm-Token. Keep the dashboard on 127.0.0.1 and use an SSH
-# tunnel unless you deliberately configure authentication and network controls.
+# Set host to the server's private LAN IP for owner-only LAN access. The
+# dashboard also keeps a localhost listener. Store this high-entropy owner
+# secret outside Git, usually in ~/.config/owui-swarm/dashboard.env.
 auth_token_env = "SWARM_DASHBOARD_TOKEN"
 metadata_directory = "~/.local/share/owui-swarm/dashboard"
 

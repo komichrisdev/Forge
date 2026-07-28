@@ -1,7 +1,7 @@
 # Forge Discord Notifications
 
-Forge Version: `0.10-dev`
-Architecture Revision: `R10`
+Forge Version: `0.11-dev`
+Architecture Revision: `R11`
 
 Forge Discord Notifications is the outbound-only notification path for operational Forge messages. It sends concise Discord webhook messages, records delivery state in SQLite, and prevents duplicate sends after restarts or repeated handlers.
 

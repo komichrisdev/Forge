@@ -1,7 +1,7 @@
 # Forge Agent Registry
 
-Forge Version: `0.10-dev`
-Architecture Revision: `R10`
+Forge Version: `0.11-dev`
+Architecture Revision: `R11`
 
 The Agent Registry is the first implementation of Forge's logical agent system. It defines permanent agent identities separately from providers and models.
 
