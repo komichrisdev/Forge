@@ -10,6 +10,7 @@ import json
 import re
 import sys
 
+from .agents import AgentManifest, HandoffEnvelope, default_registry, load_json_object
 from .catalog import ModelCatalog
 from .client import OpenWebUIClient
 from .config import load_config
@@ -69,6 +70,26 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("doctor", help="Check Open WebUI health and synchronize the model catalog.")
+    status = sub.add_parser("status", help="Show read-only Forge registry status.")
+    status.add_argument("--json", action="store_true")
+
+    agent = sub.add_parser("agent", help="Inspect logical Forge agents.")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_list = agent_sub.add_parser("list", help="List registered logical agents.")
+    agent_list.add_argument("--json", action="store_true")
+    agent_show = agent_sub.add_parser("show", help="Show one registered logical agent.")
+    agent_show.add_argument("agent_id")
+    agent_show.add_argument("--json", action="store_true")
+    agent_validate = agent_sub.add_parser("validate", help="Validate the built-in registry or one manifest JSON file.")
+    agent_validate.add_argument("manifest", nargs="?")
+    agent_validate.add_argument("--json", action="store_true")
+
+    handoff = sub.add_parser("handoff", help="Inspect worker handoff envelopes.")
+    handoff_sub = handoff.add_subparsers(dest="handoff_command", required=True)
+    handoff_validate = handoff_sub.add_parser("validate", help="Validate a handoff envelope JSON file or stdin.")
+    handoff_validate.add_argument("envelope", help="Path to JSON envelope, or '-' for stdin.")
+    handoff_validate.add_argument("--json", action="store_true")
+
     models = sub.add_parser("models", help="Synchronize and list Open WebUI models with local classifications.")
     models.add_argument("--json", action="store_true")
 
@@ -250,6 +271,63 @@ def _run_wiki(args: argparse.Namespace) -> int:
     return 2
 
 
+def _read_json_file(path: str) -> dict[str, object]:
+    return load_json_object(sys.stdin.read() if path == "-" else _read_text(path))
+
+
+def _print_validation(name: str, issues: list[str], as_json: bool) -> int:
+    if as_json:
+        print(json.dumps({"valid": not issues, "target": name, "issues": issues}, indent=2, ensure_ascii=False))
+    elif issues:
+        for issue in issues:
+            print(f"{name}\t{issue}")
+    else:
+        print(f"{name}\tvalid")
+    return 1 if issues else 0
+
+
+def _run_agent(args: argparse.Namespace) -> int:
+    registry = default_registry()
+    if args.command == "status":
+        payload = {"forge_version": "0.5-dev", "architecture_revision": "R5", **registry.status()}
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Forge 0.5-dev\tArchitecture R5\t"
+                f"agents={payload['agent_count']}\tenabled={payload['enabled_count']}"
+            )
+        return 0
+    if args.command == "agent":
+        if args.agent_command == "list":
+            agents = [agent.to_dict() for agent in registry.list()]
+            if args.json:
+                print(json.dumps(agents, indent=2, ensure_ascii=False))
+            else:
+                for agent in registry.list():
+                    print(f"{agent.agent_id}\t{agent.display_name}\t{'enabled' if agent.enabled else 'disabled'}")
+            return 0
+        if args.agent_command == "show":
+            agent = registry.get(args.agent_id)
+            if agent is None:
+                raise RuntimeError(f"Unknown agent: {args.agent_id}")
+            if args.json:
+                print(json.dumps(agent.to_dict(), indent=2, ensure_ascii=False))
+            else:
+                print(f"{agent.agent_id}\t{agent.display_name}\t{agent.version}\t{agent.owner}")
+                print(agent.description)
+            return 0
+        if args.agent_command == "validate":
+            if args.manifest:
+                manifest = AgentManifest.from_dict(_read_json_file(args.manifest))
+                return _print_validation(args.manifest, manifest.validate(), args.json)
+            return _print_validation("agent registry", registry.validate(), args.json)
+    if args.command == "handoff" and args.handoff_command == "validate":
+        envelope = HandoffEnvelope.from_dict(_read_json_file(args.envelope))
+        return _print_validation(args.envelope, envelope.validate(registry), args.json)
+    return 2
+
+
 def _provider_rows(catalog: ModelCatalog, provider_id: str) -> list[dict[str, object]]:
     return [item for item in catalog.provider_status()["models"] if item["provider_id"] == provider_id]
 
@@ -319,6 +397,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "wiki":
             return _run_wiki(args)
+        if args.command in {"agent", "handoff", "status"}:
+            return _run_agent(args)
         config = load_config(args.config)
         client = OpenWebUIClient(
             config.openwebui.base_url,

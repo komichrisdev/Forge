@@ -1,7 +1,7 @@
 # Forge Architecture Overview
 
-Forge Version: `0.4-dev`
-Architecture Revision: `R4`
+Forge Version: `0.5-dev`
+Architecture Revision: `R5`
 
 This is the starting point for developers new to Forge. It describes the platform shape and the intended boundaries between agents, providers, routing, execution, and future resilience work. It deliberately avoids implementation details.
 
@@ -218,7 +218,7 @@ This keeps routing provider-independent and model-independent. A future provider
 
 Near-term milestones:
 
-- Worker handoff: define and validate logical-agent handoff envelopes.
+- Worker handoff: define and validate logical-agent handoff envelopes. See [FORGE_AGENT_REGISTRY.md](FORGE_AGENT_REGISTRY.md).
 - Persistent journal: persist lifecycle events, checkpoints, leases, and recovery state.
 - Capability routing: let agents request provider-independent capabilities instead of model names.
 - Scheduler: add controlled recurring and delayed execution.
