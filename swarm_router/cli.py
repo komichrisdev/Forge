@@ -17,6 +17,7 @@ from .dashboard import serve
 from .orchestrator import SwarmOrchestrator
 from .personal import serve_personal
 from .prompts import authority_block, worker_prompt
+from .providers import OpenAICompatibleProvider, provider_items
 from .quality import benchmark_by_id, deterministic_checks, load_benchmarks
 
 
@@ -74,6 +75,28 @@ def _parser() -> argparse.ArgumentParser:
     probe = sub.add_parser("probe", help="Test chat compatibility and latency for selected models.")
     probe.add_argument("model", nargs="*")
     probe.add_argument("--enabled", action="store_true", help="Probe every enabled chat model.")
+
+    provider = sub.add_parser("provider", help="Inspect and reconcile provider model inventories.")
+    provider.add_argument("--provider-id", default="nvidia")
+    provider_sub = provider.add_subparsers(dest="provider_command", required=True)
+    provider_status = provider_sub.add_parser("status", help="Show provider inventory and cooldown state.")
+    provider_status.add_argument("--json", action="store_true")
+    provider_refresh = provider_sub.add_parser("refresh", help="Fetch provider inventory and reconcile it.")
+    provider_refresh.add_argument("--mode", choices=["shadow", "live"], default="shadow")
+    provider_refresh.add_argument("--json", action="store_true")
+    provider_diff = provider_sub.add_parser("diff", help="Show quarantined or missing provider models.")
+    provider_diff.add_argument("--json", action="store_true")
+    provider_probe = provider_sub.add_parser("probe", help="Probe provider models that need validation.")
+    provider_probe.add_argument("--new-and-recovered", action="store_true")
+    provider_probe.add_argument("--limit", type=int, default=8)
+    provider_probe.add_argument("model", nargs="*")
+    provider_cooldown = provider_sub.add_parser(
+        "cooldown", aliases=["cooldowns"], help="Show or set provider cooldown state."
+    )
+    provider_cooldown.add_argument("--minutes", type=int)
+    provider_cooldown.add_argument("--clear", action="store_true")
+    provider_cooldown.add_argument("--clear-model")
+    provider_cooldown.add_argument("--json", action="store_true")
 
     dashboard = sub.add_parser("serve", help="Run the local swarm monitoring and dispatch dashboard.")
     dashboard.add_argument("--host")
@@ -227,6 +250,70 @@ def _run_wiki(args: argparse.Namespace) -> int:
     return 2
 
 
+def _provider_rows(catalog: ModelCatalog, provider_id: str) -> list[dict[str, object]]:
+    return [item for item in catalog.provider_status()["models"] if item["provider_id"] == provider_id]
+
+
+def _print_provider_status(catalog: ModelCatalog, provider_id: str) -> None:
+    status = catalog.provider_status()
+    for provider in status["providers"]:
+        if provider["provider_id"] == provider_id:
+            print(
+                f"{provider['provider_id']}\trevision={provider['inventory_revision']}\t"
+                f"{provider['last_inventory_status']}\t"
+                f"health={provider['health']}\t"
+                f"cooldown={provider['cooldown_until'] or '-'}\t"
+                f"last_success={provider['last_successful_inventory']}"
+            )
+            if provider["last_inventory_error"]:
+                print(f"error\t{provider['last_inventory_error']}")
+    for item in _provider_rows(catalog, provider_id):
+        flags = []
+        if item["quarantined"]:
+            flags.append("quarantine")
+        if not item["observed_available"]:
+            flags.append(f"missing:{item['consecutive_missing']}")
+        if item["cooldown_until"]:
+            flags.append(f"cooldown:{item['cooldown_until']}")
+        print(
+            f"{item['model_id']}\t{item['kind']}\t"
+            f"{'available' if item['available'] else 'unavailable'}\t"
+            f"{item['health']}\t{','.join(flags) or '-'}"
+        )
+
+
+def _probe_ids(
+    args: argparse.Namespace, catalog: ModelCatalog, client: OpenWebUIClient
+) -> list[str]:
+    if args.model:
+        return sorted(set(args.model))
+    if args.new_and_recovered:
+        rows = [
+            item for item in _provider_rows(catalog, args.provider_id)
+            if item["observed_available"] and item["quarantined"]
+        ]
+        return [str(item["model_id"]) for item in rows[: max(1, args.limit)]]
+    raise RuntimeError("Provide model IDs or use --new-and-recovered.")
+
+
+def _probe_model(catalog: ModelCatalog, client: OpenWebUIClient, config, model_id: str) -> tuple[str, str, int, str]:
+    started = monotonic()
+    try:
+        result = client.chat(
+            model_id, "Return only the requested token.",
+            "Return exactly: HEALTHY", 20, 0.0,
+            timeout_seconds=config.probe.timeout_seconds,
+        )
+        elapsed = int((monotonic() - started) * 1000)
+        status = "healthy" if result.content.strip() == "HEALTHY" else "failed"
+        detail = "" if status == "healthy" else f"Unexpected response: {result.content[:200]}"
+    except Exception as exc:
+        elapsed = int((monotonic() - started) * 1000)
+        status, detail = "failed", str(exc)
+    catalog.record_probe(model_id, status, elapsed, detail)
+    return model_id, status, elapsed, detail
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -291,6 +378,84 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"health": health, "model_count": len(records), "catalog": str(catalog.path)}, indent=2))
             return 0
 
+        if args.command == "provider":
+            if args.provider_command == "status":
+                status = catalog.provider_status()
+                if args.json:
+                    print(json.dumps(status, indent=2, ensure_ascii=False))
+                else:
+                    _print_provider_status(catalog, args.provider_id)
+                return 0
+            if args.provider_command == "refresh":
+                provider = OpenAICompatibleProvider(args.provider_id, client)
+                try:
+                    result = catalog.reconcile_inventory(
+                        args.provider_id,
+                        provider_items(provider.list_models()),
+                        mode=args.mode,
+                    )
+                except Exception as exc:
+                    result = catalog.record_inventory_failure(args.provider_id, str(exc))
+                if args.json:
+                    print(json.dumps(result, indent=2, ensure_ascii=False))
+                else:
+                    print(
+                        f"{result['provider_id']}\t{result['mode']}\t"
+                        f"revision={result['inventory_revision']}\t"
+                        f"observed={result.get('observed_count', 0)}"
+                    )
+                    for key in ("added", "recovered", "missing_once", "unavailable"):
+                        values = result.get(key, [])
+                        if values:
+                            print(f"{key}\t" + "\t".join(map(str, values)))
+                    if result.get("error"):
+                        print(f"error\t{result['error']}")
+                return 0 if result.get("mode") != "failure" else 1
+            if args.provider_command == "diff":
+                diff = catalog.provider_diff(args.provider_id)
+                if args.json:
+                    print(json.dumps(diff, indent=2, ensure_ascii=False))
+                else:
+                    for item in diff:
+                        print(
+                            f"{item['model_id']}\t"
+                            f"{'quarantine' if item['quarantined'] else 'known'}\t"
+                            f"missing={item['consecutive_missing']}\t"
+                            f"available={item['available']}"
+                        )
+                return 0
+            if args.provider_command == "probe":
+                ids = _probe_ids(args, catalog, client)
+                for model_id in ids:
+                    model_id, status, elapsed, detail = _probe_model(catalog, client, config, model_id)
+                    suffix = f": {detail}" if detail else ""
+                    print(f"{model_id}: {status} ({elapsed} ms){suffix}")
+                return 0
+            if args.provider_command in {"cooldown", "cooldowns"}:
+                provider_state = catalog.set_provider_cooldown(
+                    args.provider_id, minutes=args.minutes, clear=args.clear
+                )
+                if args.clear_model:
+                    catalog.clear_cooldown(args.clear_model)
+                rows = [
+                    item for item in _provider_rows(catalog, args.provider_id)
+                    if item["cooldown_until"]
+                ]
+                if args.json:
+                    print(json.dumps(
+                        {"provider": provider_state, "models": rows},
+                        indent=2, ensure_ascii=False,
+                    ))
+                else:
+                    print(
+                        f"{provider_state['provider_id']}\t"
+                        f"cooldown={provider_state['cooldown_until'] or '-'}\t"
+                        f"health={provider_state['health']}"
+                    )
+                    for item in rows:
+                        print(f"{item['model_id']}\t{item['cooldown_until']}\t{item['health']}")
+                return 0
+
         if args.command == "models":
             records = catalog.sync(client.list_model_entries())
             payload = [catalog.as_dict(record, config.reliability) for record in records]
@@ -311,27 +476,11 @@ def main(argv: list[str] | None = None) -> int:
             ids = sorted(set(ids))
             if not ids:
                 raise RuntimeError("Provide model IDs or use --enabled.")
-            def probe_one(model_id: str) -> tuple[str, str, int, str]:
-                started = monotonic()
-                try:
-                    result = client.chat(
-                        model_id, "Return only the requested token.",
-                        "Return exactly: HEALTHY", 20, 0.0,
-                        timeout_seconds=config.probe.timeout_seconds,
-                    )
-                    elapsed = int((monotonic() - started) * 1000)
-                    status = "healthy" if result.content.strip() == "HEALTHY" else "failed"
-                    detail = "" if status == "healthy" else f"Unexpected response: {result.content[:200]}"
-                except Exception as exc:
-                    elapsed = int((monotonic() - started) * 1000)
-                    status, detail = "failed", str(exc)
-                catalog.record_probe(model_id, status, elapsed, detail)
-                return model_id, status, elapsed, detail
 
             with ThreadPoolExecutor(
                 max_workers=min(config.probe.max_parallel, len(ids))
             ) as executor:
-                futures = [executor.submit(probe_one, model_id) for model_id in ids]
+                futures = [executor.submit(_probe_model, catalog, client, config, model_id) for model_id in ids]
                 for future in as_completed(futures):
                     model_id, status, elapsed, detail = future.result()
                     suffix = f": {detail}" if detail else ""

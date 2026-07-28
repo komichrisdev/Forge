@@ -17,12 +17,30 @@ from .quality import HALLUCINATION_CATEGORIES, POSITIVE_CATEGORIES, QUALITY_CATE
 class ModelRecord:
     model_id: str
     provider: str
+    provider_id: str
+    display_name: str
     family: str
     kind: str
     capabilities: tuple[str, ...]
     enabled: bool
     available: bool
+    observed_available: bool
+    quarantined: bool
     context_length: int | None
+    supports_tools: bool
+    supports_streaming: bool
+    supports_images: bool
+    supports_reasoning: bool
+    cost_hint: str
+    latency_hint: str
+    health: str
+    cooldown_until: str
+    inventory_revision: int
+    first_seen: str
+    inventory_last_seen: str
+    consecutive_present: int
+    consecutive_missing: int
+    last_inventory_error: str
     quality: int
     speed: int
     notes: str
@@ -87,6 +105,52 @@ def _context_length(item: dict[str, Any]) -> int | None:
     return None
 
 
+def _bool_meta(item: dict[str, Any], *keys: str, default: bool = False) -> bool:
+    info = item.get("info") if isinstance(item.get("info"), dict) else {}
+    meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+    for source in (item, info, meta):
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.lower() in {"true", "yes", "1"}:
+                return True
+            if isinstance(value, str) and value.lower() in {"false", "no", "0"}:
+                return False
+    return default
+
+
+def _generic_capabilities(model_id: str, item: dict[str, Any]) -> tuple[str, ...]:
+    kind, inferred = infer_model_metadata(model_id)
+    caps = list(inferred)
+    name = model_id.lower()
+    context_length = _context_length(item) or 0
+    if "code" in caps and "coding" not in caps:
+        caps.append("coding")
+    if "reasoning" in caps:
+        caps.append("reasoning.high" if any(token in name for token in ("pro", "reason", "r1")) else "reasoning.fast")
+    if _bool_meta(item, "supports_tools", "tool_use") and "tool_use" not in caps:
+        caps.append("tool_use")
+    if kind == "image" and "image_generation" not in caps:
+        caps.append("image_generation")
+    if _bool_meta(item, "supports_images", "vision") and "vision" not in caps:
+        caps.append("vision")
+    if context_length >= 32768 and "long_context" not in caps:
+        caps.append("long_context")
+    if any(token in name for token in ("translate", "translation")) and "translation" not in caps:
+        caps.append("translation")
+    return tuple(dict.fromkeys(caps))
+
+
+def _future_iso(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        return datetime.fromisoformat(value) > datetime.now(timezone.utc)
+    except ValueError:
+        return False
+
+
 class ModelCatalog:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -112,12 +176,30 @@ class ModelCatalog:
                 CREATE TABLE IF NOT EXISTS models (
                     model_id TEXT PRIMARY KEY,
                     provider TEXT NOT NULL DEFAULT '',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
                     family TEXT NOT NULL DEFAULT '',
                     kind TEXT NOT NULL,
                     capabilities TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     available INTEGER NOT NULL DEFAULT 1,
+                    observed_available INTEGER NOT NULL DEFAULT 1,
+                    quarantined INTEGER NOT NULL DEFAULT 0,
                     context_length INTEGER,
+                    supports_tools INTEGER NOT NULL DEFAULT 0,
+                    supports_streaming INTEGER NOT NULL DEFAULT 1,
+                    supports_images INTEGER NOT NULL DEFAULT 0,
+                    supports_reasoning INTEGER NOT NULL DEFAULT 0,
+                    cost_hint TEXT NOT NULL DEFAULT '',
+                    latency_hint TEXT NOT NULL DEFAULT '',
+                    health TEXT NOT NULL DEFAULT 'unknown',
+                    cooldown_until TEXT NOT NULL DEFAULT '',
+                    inventory_revision INTEGER NOT NULL DEFAULT 0,
+                    first_seen TEXT NOT NULL DEFAULT '',
+                    inventory_last_seen TEXT NOT NULL DEFAULT '',
+                    consecutive_present INTEGER NOT NULL DEFAULT 0,
+                    consecutive_missing INTEGER NOT NULL DEFAULT 0,
+                    last_inventory_error TEXT NOT NULL DEFAULT '',
                     quality INTEGER NOT NULL DEFAULT 0,
                     speed INTEGER NOT NULL DEFAULT 0,
                     notes TEXT NOT NULL DEFAULT '',
@@ -155,9 +237,27 @@ class ModelCatalog:
             existing = {row[1] for row in db.execute("PRAGMA table_info(models)")}
             for name, definition in {
                 "provider": "TEXT NOT NULL DEFAULT ''",
+                "provider_id": "TEXT NOT NULL DEFAULT ''",
+                "display_name": "TEXT NOT NULL DEFAULT ''",
                 "family": "TEXT NOT NULL DEFAULT ''",
                 "available": "INTEGER NOT NULL DEFAULT 1",
+                "observed_available": "INTEGER NOT NULL DEFAULT 1",
+                "quarantined": "INTEGER NOT NULL DEFAULT 0",
                 "context_length": "INTEGER",
+                "supports_tools": "INTEGER NOT NULL DEFAULT 0",
+                "supports_streaming": "INTEGER NOT NULL DEFAULT 1",
+                "supports_images": "INTEGER NOT NULL DEFAULT 0",
+                "supports_reasoning": "INTEGER NOT NULL DEFAULT 0",
+                "cost_hint": "TEXT NOT NULL DEFAULT ''",
+                "latency_hint": "TEXT NOT NULL DEFAULT ''",
+                "health": "TEXT NOT NULL DEFAULT 'unknown'",
+                "cooldown_until": "TEXT NOT NULL DEFAULT ''",
+                "inventory_revision": "INTEGER NOT NULL DEFAULT 0",
+                "first_seen": "TEXT NOT NULL DEFAULT ''",
+                "inventory_last_seen": "TEXT NOT NULL DEFAULT ''",
+                "consecutive_present": "INTEGER NOT NULL DEFAULT 0",
+                "consecutive_missing": "INTEGER NOT NULL DEFAULT 0",
+                "last_inventory_error": "TEXT NOT NULL DEFAULT ''",
                 "last_probe": "TEXT NOT NULL DEFAULT ''",
                 "last_successful_probe": "TEXT NOT NULL DEFAULT ''",
                 "last_failure": "TEXT NOT NULL DEFAULT ''",
@@ -221,8 +321,45 @@ class ModelCatalog:
             db.execute(
                 "CREATE INDEX IF NOT EXISTS benchmark_results_model_role ON benchmark_results(model_id, role, evaluated_at DESC)"
             )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provider_inventory (
+                    provider_id TEXT PRIMARY KEY,
+                    inventory_revision INTEGER NOT NULL DEFAULT 0,
+                    last_successful_inventory TEXT NOT NULL DEFAULT '',
+                    last_refresh_attempt TEXT NOT NULL DEFAULT '',
+                    last_inventory_status TEXT NOT NULL DEFAULT 'never',
+                    last_inventory_error TEXT NOT NULL DEFAULT '',
+                    health TEXT NOT NULL DEFAULT 'unknown',
+                    cooldown_until TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            provider_existing = {row[1] for row in db.execute("PRAGMA table_info(provider_inventory)")}
+            for name, definition in {
+                "last_refresh_attempt": "TEXT NOT NULL DEFAULT ''",
+                "health": "TEXT NOT NULL DEFAULT 'unknown'",
+                "cooldown_until": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if name not in provider_existing:
+                    db.execute(f"ALTER TABLE provider_inventory ADD COLUMN {name} {definition}")
 
     def sync(self, models: Iterable[str | dict[str, Any]]) -> list[ModelRecord]:
+        self.reconcile_inventory("openwebui", models, mode="live")
+        return self.list()
+
+    def reconcile_inventory(
+        self,
+        provider_id: str,
+        models: Iterable[str | dict[str, Any]],
+        *,
+        mode: str = "shadow",
+        removal_misses: int = 2,
+    ) -> dict[str, Any]:
+        if mode not in {"shadow", "live"}:
+            raise ValueError("mode must be shadow or live")
+        provider_id = provider_id.strip() or "unknown"
+        removal_misses = max(1, removal_misses)
         now = datetime.now(timezone.utc).isoformat()
         items: dict[str, dict[str, Any]] = {}
         for value in models:
@@ -230,20 +367,90 @@ class ModelCatalog:
             model_id = item.get("id") or item.get("name")
             if model_id:
                 items[str(model_id)] = item
+        added: list[str] = []
+        present: list[str] = []
+        recovered: list[str] = []
+        missing_once: list[str] = []
+        unavailable: list[str] = []
         with self._connect() as db:
-            db.execute("UPDATE models SET available=0")
+            state = db.execute(
+                "SELECT inventory_revision FROM provider_inventory WHERE provider_id=?",
+                (provider_id,),
+            ).fetchone()
+            revision = 1 if state is None else int(state["inventory_revision"]) + 1
+            db.execute(
+                """
+                INSERT INTO provider_inventory(
+                    provider_id, inventory_revision, last_successful_inventory,
+                    last_refresh_attempt, last_inventory_status, last_inventory_error,
+                    health
+                ) VALUES (?, ?, ?, ?, 'success', '', 'healthy')
+                ON CONFLICT(provider_id) DO UPDATE SET
+                    inventory_revision=excluded.inventory_revision,
+                    last_successful_inventory=excluded.last_successful_inventory,
+                    last_refresh_attempt=excluded.last_refresh_attempt,
+                    last_inventory_status='success',
+                    last_inventory_error='',
+                    health='healthy'
+                """,
+                (provider_id, revision, now, now),
+            )
             for model_id, item in sorted(items.items()):
                 kind, capabilities = infer_model_metadata(model_id)
+                capabilities = _generic_capabilities(model_id, item)
                 provider, family = infer_provider_family(model_id, str(item.get("provider", "")))
+                row = db.execute(
+                    "SELECT model_id, quarantined, consecutive_missing FROM models WHERE model_id=?",
+                    (model_id,),
+                ).fetchone()
+                is_new = row is None
+                was_missing = row is not None and int(row["consecutive_missing"]) > 0
+                if is_new:
+                    added.append(model_id)
+                elif was_missing:
+                    recovered.append(model_id)
+                else:
+                    present.append(model_id)
+                supports_tools = _bool_meta(item, "supports_tools", "tool_use")
+                supports_streaming = _bool_meta(item, "supports_streaming", "streaming", default=True)
+                supports_images = _bool_meta(item, "supports_images", "vision")
+                supports_reasoning = "reasoning" in capabilities or any(cap.startswith("reasoning.") for cap in capabilities)
                 db.execute(
                     """
-                    INSERT INTO models(model_id, provider, family, kind, capabilities, enabled, available, context_length, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    INSERT INTO models(
+                        model_id, provider, provider_id, display_name, family, kind,
+                        capabilities, enabled, available, observed_available,
+                        quarantined, context_length, supports_tools, supports_streaming,
+                        supports_images, supports_reasoning, cost_hint, latency_hint,
+                        health, inventory_revision, first_seen, inventory_last_seen,
+                        consecutive_present, consecutive_missing, last_inventory_error,
+                        last_seen
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?, 1, 0, '', ?)
                     ON CONFLICT(model_id) DO UPDATE SET
                         last_seen=excluded.last_seen,
-                        available=1,
+                        available=CASE
+                            WHEN ?=1 THEN 0
+                            WHEN ?='live' AND models.quarantined=0 THEN 1
+                            ELSE models.available
+                        END,
+                        observed_available=1,
+                        quarantined=CASE WHEN ?=1 THEN 1 ELSE models.quarantined END,
                         provider=excluded.provider,
+                        provider_id=excluded.provider_id,
+                        display_name=excluded.display_name,
                         family=excluded.family,
+                        supports_tools=excluded.supports_tools,
+                        supports_streaming=excluded.supports_streaming,
+                        supports_images=excluded.supports_images,
+                        supports_reasoning=excluded.supports_reasoning,
+                        cost_hint=excluded.cost_hint,
+                        latency_hint=excluded.latency_hint,
+                        inventory_revision=excluded.inventory_revision,
+                        inventory_last_seen=excluded.inventory_last_seen,
+                        consecutive_present=models.consecutive_present + 1,
+                        consecutive_missing=0,
+                        last_inventory_error='',
                         context_length=COALESCE(excluded.context_length, models.context_length),
                         kind=CASE WHEN models.kind='unknown' THEN excluded.kind ELSE models.kind END,
                         capabilities=CASE WHEN models.capabilities='[]' THEN excluded.capabilities ELSE models.capabilities END
@@ -251,15 +458,175 @@ class ModelCatalog:
                     (
                         model_id,
                         provider,
+                        provider_id,
+                        str(item.get("name") or item.get("id") or model_id),
                         family,
                         kind,
                         json.dumps(capabilities),
                         0 if kind != "chat" else 1,
+                        0 if is_new or kind != "chat" else (1 if mode == "live" else 0),
                         _context_length(item),
+                        int(supports_tools),
+                        int(supports_streaming),
+                        int(supports_images),
+                        int(supports_reasoning),
+                        str(item.get("cost_hint", "")),
+                        str(item.get("latency_hint", "")),
+                        revision,
                         now,
+                        now,
+                        now,
+                        int(was_missing),
+                        mode,
+                        int(was_missing),
                     ),
                 )
-        return self.list()
+            known_rows = db.execute(
+                """
+                SELECT model_id, consecutive_missing, available FROM models
+                WHERE provider_id=? AND inventory_revision < ?
+                """,
+                (provider_id, revision),
+            ).fetchall()
+            for row in known_rows:
+                misses = int(row["consecutive_missing"]) + 1
+                model_id = str(row["model_id"])
+                if misses >= removal_misses:
+                    unavailable.append(model_id)
+                else:
+                    missing_once.append(model_id)
+                db.execute(
+                    """
+                    UPDATE models SET
+                        observed_available=0,
+                        consecutive_present=0,
+                        consecutive_missing=?,
+                        inventory_revision=?,
+                        available=CASE WHEN ?='live' AND ? >= ? THEN 0 ELSE available END
+                    WHERE model_id=?
+                    """,
+                    (misses, revision, mode, misses, removal_misses, model_id),
+                )
+        return {
+            "provider_id": provider_id,
+            "mode": mode,
+            "inventory_revision": revision,
+            "observed_count": len(items),
+            "added": added,
+            "present": present,
+            "recovered": recovered,
+            "missing_once": missing_once,
+            "unavailable": unavailable,
+        }
+
+    def record_inventory_failure(self, provider_id: str, error: str) -> dict[str, Any]:
+        provider_id = provider_id.strip() or "unknown"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as db:
+            state = db.execute(
+                "SELECT inventory_revision FROM provider_inventory WHERE provider_id=?",
+                (provider_id,),
+            ).fetchone()
+            revision = 0 if state is None else int(state["inventory_revision"])
+            db.execute(
+                """
+                INSERT INTO provider_inventory(
+                    provider_id, inventory_revision, last_refresh_attempt,
+                    last_inventory_status, last_inventory_error, health
+                ) VALUES (?, ?, ?, 'failed', ?, 'failed')
+                ON CONFLICT(provider_id) DO UPDATE SET
+                    last_refresh_attempt=excluded.last_refresh_attempt,
+                    last_inventory_status='failed',
+                    last_inventory_error=excluded.last_inventory_error,
+                    health='failed'
+                """,
+                (provider_id, revision, now, error[:2000]),
+            )
+        return {
+            "provider_id": provider_id,
+            "mode": "failure",
+            "inventory_revision": revision,
+            "error": error[:2000],
+            "preserved_last_known_good": True,
+            "time": now,
+        }
+
+    def provider_status(self) -> dict[str, Any]:
+        with self._connect() as db:
+            providers = [dict(row) for row in db.execute("SELECT * FROM provider_inventory ORDER BY provider_id")]
+            rows = db.execute(
+                """
+                SELECT provider_id, model_id, display_name, kind, capabilities, available,
+                    observed_available, quarantined, health, cooldown_until,
+                    inventory_revision, consecutive_present, consecutive_missing,
+                    last_inventory_error, context_length, supports_tools,
+                    supports_streaming, supports_images, supports_reasoning,
+                    cost_hint, latency_hint
+                FROM models ORDER BY provider_id, model_id
+                """
+            ).fetchall()
+        return {
+            "providers": providers,
+            "models": [
+                {
+                    **dict(row),
+                    "capabilities": json.loads(row["capabilities"] or "[]"),
+                    "available": bool(row["available"]),
+                    "observed_available": bool(row["observed_available"]),
+                    "quarantined": bool(row["quarantined"]),
+                    "supports_tools": bool(row["supports_tools"]),
+                    "supports_streaming": bool(row["supports_streaming"]),
+                    "supports_images": bool(row["supports_images"]),
+                    "supports_reasoning": bool(row["supports_reasoning"]),
+                }
+                for row in rows
+            ],
+        }
+
+    def provider_diff(self, provider_id: str = "") -> list[dict[str, Any]]:
+        status = self.provider_status()["models"]
+        return [
+            item for item in status
+            if (not provider_id or item["provider_id"] == provider_id)
+            and (item["quarantined"] or item["consecutive_missing"] or not item["observed_available"])
+        ]
+
+    def clear_cooldown(self, model_id: str) -> None:
+        with self._connect() as db:
+            db.execute("UPDATE models SET cooldown_until='', health='unknown' WHERE model_id=?", (model_id,))
+
+    def set_provider_cooldown(
+        self, provider_id: str, *, minutes: int | None = None, clear: bool = False
+    ) -> dict[str, Any]:
+        provider_id = provider_id.strip() or "unknown"
+        if minutes is not None and minutes < 1:
+            raise ValueError("cooldown minutes must be positive")
+        cooldown_until = "" if clear else (
+            (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+            if minutes is not None else None
+        )
+        with self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO provider_inventory(provider_id)
+                VALUES (?)
+                ON CONFLICT(provider_id) DO NOTHING
+                """,
+                (provider_id,),
+            )
+            if cooldown_until is not None:
+                db.execute(
+                    """
+                    UPDATE provider_inventory
+                    SET cooldown_until=?, health=CASE WHEN ?='' THEN 'unknown' ELSE 'cooldown' END
+                    WHERE provider_id=?
+                    """,
+                    (cooldown_until, cooldown_until, provider_id),
+                )
+        return next(
+            item for item in self.provider_status()["providers"]
+            if item["provider_id"] == provider_id
+        )
 
     def list(self) -> list[ModelRecord]:
         with self._connect() as db:
@@ -308,10 +675,16 @@ class ModelCatalog:
                 UPDATE models
                 SET probe_status=?, probe_ms=?, probe_error=?, last_probe=?,
                     last_successful_probe=CASE WHEN ?='healthy' THEN ? ELSE last_successful_probe END,
-                    last_failure=CASE WHEN ?='failed' THEN ? ELSE last_failure END
+                    last_failure=CASE WHEN ?='failed' THEN ? ELSE last_failure END,
+                    health=CASE WHEN ?='healthy' THEN 'healthy' ELSE 'failed' END,
+                    quarantined=CASE WHEN ?='healthy' THEN 0 ELSE quarantined END,
+                    available=CASE
+                        WHEN ?='healthy' AND observed_available=1 AND kind='chat' THEN 1
+                        ELSE available
+                    END
                 WHERE model_id=?
                 """,
-                (status, elapsed_ms, error[:2000], now, status, now, status, now, model_id),
+                (status, elapsed_ms, error[:2000], now, status, now, status, now, status, status, status, model_id),
             )
             db.execute(
                 "INSERT INTO probe_history(model_id, probed_at, status, elapsed_ms, error) VALUES (?, ?, ?, ?, ?)",
@@ -336,6 +709,13 @@ class ModelCatalog:
         elapsed_ms: int,
         retry_count: int = 0,
     ) -> None:
+        now = datetime.now(timezone.utc)
+        health = "healthy" if status == "success" else status
+        cooldown_until: str | None = None
+        if status == "success":
+            cooldown_until = ""
+        if status == "capacity":
+            cooldown_until = (now + timedelta(minutes=60)).isoformat()
         with self._connect() as db:
             db.execute(
                 """
@@ -348,11 +728,20 @@ class ModelCatalog:
                     model_id,
                     role,
                     mode,
-                    datetime.now(timezone.utc).isoformat(),
+                    now.isoformat(),
                     status,
                     max(0, elapsed_ms),
                     max(0, retry_count),
                 ),
+            )
+            db.execute(
+                """
+                UPDATE models SET
+                    health=?,
+                    cooldown_until=CASE WHEN ? IS NULL THEN cooldown_until ELSE ? END
+                WHERE model_id=?
+                """,
+                (health, cooldown_until, cooldown_until, model_id),
             )
 
     def import_run_history(self, run_directory: str | Path) -> int:
@@ -662,6 +1051,8 @@ class ModelCatalog:
             if record.enabled and record.available and record.kind == "chat"
             and record.probe_status == "healthy"
             and record.model_id not in (excluded_models or set())
+            and not record.quarantined
+            and not _future_iso(record.cooldown_until)
         ]
         metrics = {
             record.model_id: self.reliability_summary(record.model_id, policy)
@@ -748,12 +1139,30 @@ class ModelCatalog:
         return ModelRecord(
             model_id=str(row["model_id"]),
             provider=str(row["provider"]),
+            provider_id=str(row["provider_id"]),
+            display_name=str(row["display_name"]),
             family=str(row["family"]),
             kind=str(row["kind"]),
             capabilities=tuple(json.loads(row["capabilities"] or "[]")),
             enabled=bool(row["enabled"]),
             available=bool(row["available"]),
+            observed_available=bool(row["observed_available"]),
+            quarantined=bool(row["quarantined"]),
             context_length=None if row["context_length"] is None else int(row["context_length"]),
+            supports_tools=bool(row["supports_tools"]),
+            supports_streaming=bool(row["supports_streaming"]),
+            supports_images=bool(row["supports_images"]),
+            supports_reasoning=bool(row["supports_reasoning"]),
+            cost_hint=str(row["cost_hint"]),
+            latency_hint=str(row["latency_hint"]),
+            health=str(row["health"]),
+            cooldown_until=str(row["cooldown_until"]),
+            inventory_revision=int(row["inventory_revision"]),
+            first_seen=str(row["first_seen"]),
+            inventory_last_seen=str(row["inventory_last_seen"]),
+            consecutive_present=int(row["consecutive_present"]),
+            consecutive_missing=int(row["consecutive_missing"]),
+            last_inventory_error=str(row["last_inventory_error"]),
             quality=int(row["quality"]),
             speed=int(row["speed"]),
             notes=str(row["notes"]),

@@ -1,5 +1,8 @@
 # Forge Resilience Architecture Review
 
+Forge Version: `0.3-dev`
+Architecture Revision: `R3`
+
 ## Status
 
 This document starts the Resilience phase after the Phase 2.2 stable Open WebUI deployment.
