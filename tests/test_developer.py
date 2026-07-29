@@ -232,6 +232,9 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             "git diff --check",
             "git diff --stat",
             "git log -n 10 --oneline",
+            "git --no-pager diff --check",
+            "git --no-pager diff --stat",
+            "git --no-pager log -n 3 --oneline",
         )
         for index, command in enumerate(accepted):
             with self.subTest(command=command):
@@ -248,6 +251,7 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             "git commit -m nope",
             "git push origin main",
             "git unknown-subcommand",
+            "git --paginate diff --check",
             "git branch new-branch",
             "git log -n 101 --oneline",
             "touch /workspace/forge/nope",
