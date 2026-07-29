@@ -222,6 +222,124 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                 TOOL_SCHEMAS,
             )
 
+    def test_planner_command_policy_accepts_only_single_read_only_commands(self) -> None:
+        accepted = (
+            "pwd",
+            "ls -la",
+            "git status --short",
+            "git branch --show-current",
+            "git rev-parse HEAD",
+            "git diff --check",
+            "git diff --stat",
+            "git log -n 10 --oneline",
+        )
+        for index, command in enumerate(accepted):
+            with self.subTest(command=command):
+                self.coordinator._validate_tool_calls(
+                    [tool_call(f"call-read-{index}", command)],
+                    TOOL_SCHEMAS,
+                    "planner",
+                )
+        rejected = (
+            "pwd && ls -la",
+            "ls | head",
+            "pwd > /workspace/forge/output",
+            "git add README.md",
+            "git commit -m nope",
+            "git push origin main",
+            "git unknown-subcommand",
+            "git branch new-branch",
+            "git log -n 101 --oneline",
+            "touch /workspace/forge/nope",
+        )
+        for index, command in enumerate(rejected):
+            with self.subTest(command=command), self.assertRaises(DeveloperError):
+                self.coordinator._validate_tool_calls(
+                    [tool_call(f"call-reject-{index}", command)],
+                    TOOL_SCHEMAS,
+                    "planner",
+                )
+        self.coordinator._validate_tool_calls(
+            [tool_call("call-implementer-write", "touch /workspace/forge/allowed.txt")],
+            TOOL_SCHEMAS,
+            "implementer",
+        )
+
+    def test_planner_policy_rejection_retries_same_model_once_before_launch(self) -> None:
+        rejected = tool_call("call-rejected", "pwd && ls -la")
+        accepted = tool_call("call-accepted", "pwd")
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[completion(rejected), completion(accepted)],
+        ) as upstream:
+            result = self.coordinator.complete({
+                "model": "swarm-developer",
+                "messages": [{"role": "user", "content": "Inspect Forge."}],
+                "tools": [TOOL],
+            })
+        self.assertEqual(upstream.call_count, 2)
+        self.assertEqual(
+            upstream.call_args_list[0].args[0]["model"],
+            upstream.call_args_list[1].args[0]["model"],
+        )
+        self.assertIn(
+            "Retry once using one approved read-only equivalent",
+            upstream.call_args_list[1].args[0]["messages"][-1]["content"],
+        )
+        run = self.coordinator._run(result["forge_task_id"])
+        self.assertEqual([item["id"] for item in run["pending_tool_calls"]], ["call-accepted"])
+        with self.coordinator._connect() as db:
+            pending = db.execute(
+                "SELECT tool_call_id FROM forge_developer_pending_calls WHERE task_id=?",
+                (run["task_id"],),
+            ).fetchall()
+            rejection = db.execute(
+                """
+                SELECT metadata FROM forge_journal_events
+                WHERE task_id=? AND stage='policy_rejection'
+                """,
+                (run["task_id"],),
+            ).fetchone()
+        self.assertEqual([row["tool_call_id"] for row in pending], ["call-accepted"])
+        metadata = json.loads(rejection["metadata"])
+        self.assertEqual(metadata["role"], "planner")
+        self.assertEqual(metadata["command"], "pwd && ls -la")
+        self.assertFalse(metadata["executed"])
+
+    def test_repeated_planner_policy_violations_stop_phase(self) -> None:
+        rejected = tool_call("call-rejected", "pwd && ls -la")
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[completion(rejected), completion(rejected)],
+        ) as upstream:
+            with self.assertRaisesRegex(DeveloperError, "repeated command-policy"):
+                self.coordinator.complete({
+                    "model": "swarm-developer",
+                    "messages": [{"role": "user", "content": "Inspect Forge."}],
+                    "tools": [TOOL],
+                })
+        self.assertEqual(upstream.call_count, 2)
+        with self.coordinator._connect() as db:
+            run = db.execute(
+                "SELECT task_id, status FROM forge_developer_runs ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            pending = db.execute(
+                "SELECT COUNT(*) FROM forge_developer_pending_calls WHERE task_id=?",
+                (run["task_id"],),
+            ).fetchone()[0]
+            rejections = db.execute(
+                """
+                SELECT COUNT(*) FROM forge_journal_events
+                WHERE task_id=? AND stage='policy_rejection'
+                """,
+                (run["task_id"],),
+            ).fetchone()[0]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(pending, 0)
+        self.assertEqual(rejections, 2)
+
     def test_writer_lock_is_atomic_releasable_and_stale_recoverable(self) -> None:
         first = self.coordinator.journal.next_task_id()
         second = self.coordinator.journal.next_task_id()
@@ -635,7 +753,7 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             "git -C /workspace/forge grep --open-files-in-pager='sh -c id' needle",
             "git -C /workspace/forge branch --edit-description",
             "git -C /workspace/forge log --no-ext-diff --no-textconv",
-            "git -C /workspace/forge diff --check",
+            "git -C /workspace/forge diff --ext-diff",
             "touch /workspace/forge/.git/hooks/pre-commit",
             "npm test",
             "git -C /workspace/forge reset --hard",
