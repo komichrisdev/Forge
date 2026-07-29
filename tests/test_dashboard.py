@@ -217,7 +217,7 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(overview["forge_version"], "0.12-dev")
             self.assertEqual(overview["night_owl"]["schedule_id"], "FS-20260728-000001")
-        for path in ("/api/tasks", f"/api/tasks/{forge_task_id}", "/api/schedules", "/api/night-owl", "/api/notifications", "/api/agents", "/api/providers"):
+        for path in ("/api/tasks", f"/api/tasks/{forge_task_id}", "/api/developer-runs", "/api/schedules", "/api/night-owl", "/api/notifications", "/api/agents", "/api/providers"):
             status, data, _ = self.call(path, cookie=cookie)
             self.assertEqual(status, 200, path)
             self.assertIsInstance(data, dict)
@@ -230,6 +230,40 @@ class DashboardTest(unittest.TestCase):
         self.assertNotIn('id="imageConfirm"', FORGE_HTML)
         self.assertIn("confirm:'generate image'", FORGE_HTML)
         self.assertIn("/api/tasks/", FORGE_HTML)
+        self.assertIn("Developer Runs", FORGE_HTML)
+
+    def test_developer_runs_requires_auth_and_redacts_secrets(self) -> None:
+        with self.app.developer._connect() as db:
+            db.execute(
+                """
+                INSERT INTO forge_developer_runs(
+                    task_id, status, phase, instruction, instruction_digest,
+                    role_models, created_at, updated_at
+                ) VALUES (?, 'running', 'planner', ?, 'digest', ?, ?, ?)
+                """,
+                (
+                    "FT-20260729-999999",
+                    "Inspect sk-1234567890 safely; password is hunter2",
+                    json.dumps({
+                        "planner": {
+                            "provider": "fake",
+                            "model": "fake/planner",
+                            "health": "healthy",
+                        }
+                    }),
+                    "2026-07-29T12:00:00+00:00",
+                    "2026-07-29T12:01:00+00:00",
+                ),
+            )
+        self.assertEqual(self.call("/api/developer-runs")[0], 401)
+        cookie, _csrf = self.login()
+        status, data, _ = self.call("/api/developer-runs", cookie=cookie)
+        self.assertEqual(status, 200)
+        encoded = json.dumps(data)
+        self.assertNotIn("sk-1234567890", encoded)
+        self.assertNotIn("hunter2", encoded)
+        self.assertEqual(data["runs"][0]["created_at"], "2026-07-29 08:00:00 EDT")
+        self.assertEqual(data["runs"][0]["roles"]["planner"]["model"], "fake/planner")
 
     def test_schedule_actions_and_night_owl_dispatch_controls(self) -> None:
         self.seed_state()

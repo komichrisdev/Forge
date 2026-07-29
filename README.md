@@ -201,10 +201,13 @@ through authenticated dashboard artifact routes. See
 
 ## Personal task backend
 
-The personal-task backend is a separate local OpenAI-compatible surface for one
-safe model ID: `swarm-personal`. It reuses the same swarm routing, provider
-health, run storage, and wiki modules; it does not add shell execution, file
-writes, Git mutation, or external-system writes.
+The personal-task backend is a local OpenAI-compatible surface for the
+read-only `swarm-personal` model and the separately policy-gated
+`swarm-developer` model. `swarm-personal` keeps its existing read-only
+behavior. `swarm-developer` preserves native Open WebUI terminal tool calls
+and coordinates planner, implementer, reviewer, and verifier roles against the
+isolated `/workspace/forge` mount. See
+[docs/FORGE_SWARM_DEVELOPER.md](docs/FORGE_SWARM_DEVELOPER.md).
 
 Start it interactively:
 

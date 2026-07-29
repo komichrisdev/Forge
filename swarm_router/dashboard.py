@@ -32,6 +32,7 @@ from .agents import default_registry
 from .catalog import ModelCatalog
 from .client import OpenWebUIClient
 from .config import AppConfig
+from .developer import DeveloperCoordinator, _redact_text
 from .discord_notifications import NotificationStore, load_config as load_discord_config
 from .image_generation import (
     ComfyUIClient,
@@ -101,7 +102,7 @@ FORGE_HTML = r'''<!doctype html>
 </style></head><body>
 <header><div><h1>Forge LAN Operations</h1><div class="muted">Owner-operated dashboard for local Forge automation.</div></div><div class="row"><a id="openwebui" href="#" target="_blank" rel="noreferrer">Open WebUI</a><button id="refresh">Refresh</button><button id="logout">Logout</button></div></header>
 <section id="login" class="panel login"><h2>Owner login</h2><p class="muted">Use the dashboard secret from the local Forge configuration.</p><input id="secret" type="password" autocomplete="current-password" style="width:100%" placeholder="Dashboard secret"><div class="row" style="margin-top:10px"><button id="loginButton">Login</button><span id="loginStatus" class="muted"></span></div></section>
-<nav id="nav" class="hide" aria-label="Dashboard views"><button data-view="overview" aria-current="true">Overview</button><button data-view="images">Image Generation</button><button data-view="tasks">Tasks</button><button data-view="schedules">Schedules</button><button data-view="nightowl">Night Owl</button><button data-view="notifications">Notifications</button><button data-view="agents">Agents</button><button data-view="providers">Providers</button><button data-view="dispatch">Dispatch</button></nav>
+<nav id="nav" class="hide" aria-label="Dashboard views"><button data-view="overview" aria-current="true">Overview</button><button data-view="images">Image Generation</button><button data-view="developer-runs">Developer Runs</button><button data-view="tasks">Tasks</button><button data-view="schedules">Schedules</button><button data-view="nightowl">Night Owl</button><button data-view="notifications">Notifications</button><button data-view="agents">Agents</button><button data-view="providers">Providers</button><button data-view="dispatch">Dispatch</button></nav>
 <main id="app" class="hide"><div id="content" class="panel">Loading…</div></main>
 <script>
 let csrf='',view='overview',cache={};
@@ -114,9 +115,10 @@ async function session(){try{const d=await api('/api/session');csrf=d.csrf_token
 function card(k,v,s=''){return `<section class="panel"><div class="muted">${esc(k)}</div><strong class="${cls(s||v)}">${esc(v)}</strong></section>`}
 function table(rows,cols){return `<table><thead><tr>${cols.map(c=>`<th>${esc(c[0])}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[1](r)}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${cols.length}" class="muted">No rows.</td></tr>`}</tbody></table>`}
 async function load(){try{cache[view]=await api('/api/'+view.replace('nightowl','night-owl'));render()}catch(e){$('content').innerHTML=`<p class="failed">${esc(e.message)}</p>`}}
-function render(){const d=cache[view]||{};if(view==='overview')return renderOverview(d);if(view==='images')return renderImages(d);if(view==='tasks')return renderTasks(d);if(view==='schedules')return renderSchedules(d);if(view==='nightowl')return renderNightOwl(d);if(view==='notifications')return renderNotifications(d);if(view==='agents')return renderAgents(d);if(view==='providers')return renderProviders(d);renderDispatch(d)}
+function render(){const d=cache[view]||{};if(view==='overview')return renderOverview(d);if(view==='images')return renderImages(d);if(view==='developer-runs')return renderDeveloperRuns(d);if(view==='tasks')return renderTasks(d);if(view==='schedules')return renderSchedules(d);if(view==='nightowl')return renderNightOwl(d);if(view==='notifications')return renderNotifications(d);if(view==='agents')return renderAgents(d);if(view==='providers')return renderProviders(d);renderDispatch(d)}
 function renderOverview(d){$('openwebui').href=d.openwebui?.url||'#';$('content').innerHTML=`<h2>Overview</h2><div class="grid">${card('Forge',`${d.forge_version} / ${d.architecture_revision}`)+card('Personal backend',d.personal_backend?.status||'unknown')+card('Scheduler service',d.scheduler_service?.status||'unknown')+card('Dashboard service',d.dashboard_service?.status||'unknown')+card('Open WebUI',d.openwebui?.status||'unknown')+card('Night Owl',`${d.night_owl?.enabled?'enabled':'disabled'} · ${d.night_owl?.next_run_at||'no next run'}`,d.night_owl?.enabled?'enabled':'disabled')+card('Discord',d.discord?.valid?'configured':'not configured',d.discord?.valid?'healthy':'failed')+card('Notifications',d.discord?.latest_delivery?.status||'none')+card('Providers',`${d.providers?.provider_count||0} providers / ${d.providers?.model_count||0} models`)+card('Quarantined models',d.providers?.quarantined_model_count||0,d.providers?.quarantined_model_count?'warning':'healthy')+card('Active tasks',d.tasks?.active_count||0,d.tasks?.active_count?'warning':'healthy')+card('Failed tasks',d.tasks?.failed_count||0,d.tasks?.failed_count?'failed':'healthy')+card('Suspected orphans',d.tasks?.suspected_orphan_count||0,d.tasks?.suspected_orphan_count?'warning':'healthy')}</div><pre>${esc(JSON.stringify(d,null,2))}</pre>`}
 function renderTasks(d){$('content').innerHTML=`<h2>Tasks</h2>${table(d.tasks||[],[['Forge task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Personal',r=>esc(r.personal_task_id||'')],['Type',r=>esc(r.task_type||'')],['Agent',r=>esc((r.agents||[]).join(', ')||r.agent_id||'')],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Created',r=>esc(r.created_at_display||r.created_at||'')],['Updated',r=>esc(r.updated_at_display||r.updated_at||'')],['Completed',r=>esc(r.completion_time_display||r.completion_time||'')],['Schedule',r=>esc(r.schedule_id||'')],['Recovery',r=>esc(r.recovery_status?.replay_safety||'')]])}<div id="detail"></div>`}
+function renderDeveloperRuns(d){$('content').innerHTML=`<h2>Developer Runs</h2><p class="muted">Read-only orchestration state; terminal output and credentials are hidden.</p>${table(d.runs||[],[['Run',r=>`<button onclick="taskDetail('${esc(r.run_id)}')">${esc(r.run_id)}</button>`],['Task',r=>esc(r.requested_task)],['Phase',r=>esc(r.phase)],['Models',r=>Object.entries(r.roles||{}).map(([k,v])=>`${esc(k)}: ${esc(v.provider)}/${esc(v.model)}`).join('<br>')],['Writer',r=>esc(r.writer_lock?.state||'available')],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Tool',r=>esc(r.last_tool_call)],['Files',r=>esc(r.changed_file_count)],['Tests',r=>esc(r.test_state)],['Review',r=>esc(r.review_state)],['Fallback/failure',r=>esc(r.failure_summary)],['Created',r=>esc(r.created_at)],['Updated',r=>esc(r.updated_at)]])}<div id="detail"></div>`}
 async function taskDetail(id){const d=await api('/api/tasks/'+encodeURIComponent(id));$('detail').innerHTML=`<h3>${esc(id)}</h3><h4>Events</h4>${table(d.events||[],[['Time',r=>esc(r.timestamp_display||r.timestamp)],['Event',r=>esc(r.event_type)],['Agent',r=>esc(r.agent_id)],['Stage',r=>esc(r.stage)],['Side effect',r=>esc(r.side_effect_state)],['Message',r=>esc(r.message)]])}<h4>Checkpoints</h4><pre>${esc(JSON.stringify(d.checkpoints||[],null,2))}</pre><h4>Task</h4><pre>${esc(JSON.stringify(d.personal_task||{},null,2))}</pre>`}
 async function scheduleAction(id,action,confirmText){const body={confirm:confirmText};const d=await api('/api/schedules/'+encodeURIComponent(id)+'/'+action,{method:'POST',body:JSON.stringify(body)});alert(JSON.stringify(d,null,2));await load()}
 function renderSchedules(d){$('content').innerHTML=`<h2>Schedules</h2>${table(d.schedules||[],[['ID',r=>esc(r.schedule_id)],['Name',r=>esc(r.name)],['Task',r=>esc(r.task_type)],['Agent',r=>esc(r.agent_id)],['State',r=>`<span class="${cls(r.state)}">${esc(r.enabled?'enabled':'disabled')} · ${esc(r.state)}</span>`],['Trigger',r=>esc(r.trigger_type+' '+JSON.stringify(r.trigger_configuration))],['Next',r=>esc(r.next_run_at)],['Policies',r=>esc(`${r.overlap_policy}/${r.misfire_policy}`)],['Actions',r=>`<div class="actions"><button onclick="scheduleAction('${esc(r.schedule_id)}','enable','enable ${esc(r.schedule_id)}')">Enable</button><button onclick="scheduleAction('${esc(r.schedule_id)}','disable','disable ${esc(r.schedule_id)}')">Disable</button><button onclick="scheduleAction('${esc(r.schedule_id)}','run-now','run now ${esc(r.schedule_id)}')">Run now</button></div>`]])}`}
@@ -286,6 +288,7 @@ class DashboardApp:
         self.metadata_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.metadata_root.chmod(0o700)
         self.journal = TaskJournal(config.swarm.catalog_path)
+        self.developer = DeveloperCoordinator(config)
         self.schedules = ScheduleStore(config.swarm.catalog_path)
         self.notifications = NotificationStore(config.swarm.catalog_path)
         self.registry = default_registry()
@@ -592,6 +595,41 @@ class DashboardApp:
             ],
         })
 
+    def developer_rows(self) -> dict[str, Any]:
+        rows = []
+        for run in self.developer.list_runs():
+            instruction = _redact_text(str(run.get("instruction", "")))
+            roles = {
+                role: {
+                    "provider": str(item.get("provider", "")),
+                    "model": str(item.get("model", "")),
+                    "health": str(item.get("health", "")),
+                }
+                for role, item in run.get("role_models", {}).items()
+                if isinstance(item, dict)
+            }
+            failures = [
+                f"{item.get('role')}: {item.get('model')} ({item.get('failure')})"
+                for item in run.get("attempts", [])
+                if isinstance(item, dict) and item.get("failure")
+            ]
+            rows.append({
+                "run_id": run["task_id"],
+                "requested_task": instruction[:240],
+                "phase": run["phase"],
+                "roles": roles,
+                "writer_lock": run.get("writer_lock", {}),
+                "status": run["status"],
+                "last_tool_call": str(run.get("last_tool_summary", ""))[:300],
+                "changed_file_count": len(run.get("changed_files", [])),
+                "test_state": run.get("test_state", "not_started"),
+                "review_state": run.get("review_state", "not_started"),
+                "failure_summary": (run.get("failure_summary") or "; ".join(failures))[:500],
+                "created_at": _toronto_time(run.get("created_at", "")),
+                "updated_at": _toronto_time(run.get("updated_at", "")),
+            })
+        return _sanitize({"runs": rows, "writer_lock": self.developer.writer_lock()})
+
     def schedule_rows(self) -> dict[str, Any]:
         return _sanitize(self.schedules.status(self._personal_status))
 
@@ -896,6 +934,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.app.image_status()
         if path == "/api/tasks":
             return {"tasks": self.app.task_rows()}
+        if path == "/api/developer-runs":
+            return self.app.developer_rows()
         if path.startswith("/api/tasks/"):
             return self.app.task_detail(path.removeprefix("/api/tasks/"))
         if path == "/api/schedules":
