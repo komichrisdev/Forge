@@ -9,12 +9,14 @@ from unittest.mock import patch
 from urllib import error, request
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 
 from swarm_router.catalog import ModelCatalog
 from swarm_router.config import load_config
-from swarm_router.dashboard import DashboardApp, Handler
+from swarm_router.dashboard import FORGE_HTML, DashboardApp, Handler, _toronto_time
 from swarm_router.discord_notifications import NotificationStore, notification_from_store
 from swarm_router.journal import JournalEventType
 from swarm_router.night_owl import forge_script_root
@@ -222,7 +224,12 @@ class DashboardTest(unittest.TestCase):
         status, data, _ = self.call("/api/images", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(data["preset"]["preset_id"], "flux-schnell-768-daily")
+        self.assertEqual(data["presets"], [data["preset"]])
         self.assertIn("viewport", request.urlopen(self.base + "/", timeout=3).read().decode("utf-8"))
+        self.assertIn('id="imagePreset"', FORGE_HTML)
+        self.assertNotIn('id="imageConfirm"', FORGE_HTML)
+        self.assertIn("confirm:'generate image'", FORGE_HTML)
+        self.assertIn("/api/tasks/", FORGE_HTML)
 
     def test_schedule_actions_and_night_owl_dispatch_controls(self) -> None:
         self.seed_state()
@@ -261,9 +268,155 @@ class DashboardTest(unittest.TestCase):
         )
         self.assertEqual(status, 202)
         self.assertEqual(image_task["task_payload"]["seed"], 11)
+        status, image_detail, _ = self.call(
+            f"/api/tasks/{image_task['forge_task_id']}", cookie=cookie
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(image_detail["task"]["status"], "created")
+        invalid_image = {
+            "preset_id": "flux-schnell-768-daily",
+            "prompt": "must remain rejected",
+            "confirm": "Generate image",
+        }
+        self.assertEqual(self.call("/api/images/generate", method="POST", cookie=cookie, csrf=csrf, body=invalid_image)[0], 400)
         self.assertEqual(self.call("/api/images/generate", method="POST", cookie=cookie, body={})[0], 403)
         self.assertEqual(self.call("/api/night-owl/live", method="POST", cookie=cookie, csrf=csrf, body={"confirm": "run night owl live"})[0], 400)
         self.assertEqual(self.call("/api/dispatch", method="POST", cookie=cookie, csrf=csrf, body={"task_type": "night_owl", "mode": "dry_run", "confirm": "run night owl dry-run", "command": "bad"})[0], 400)
+        self.assertEqual(self.call("/api/dispatch")[0], 401)
+        status, dispatch_config, _ = self.call("/api/dispatch", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(dispatch_config["task_types"][0]["confirmations"]["dry_run"], "run night owl dry-run")
+        self.assertEqual(self.call("/api/dispatch", method="POST", cookie=cookie, body={})[0], 403)
+        status, dispatched, _ = self.call(
+            "/api/dispatch",
+            method="POST",
+            cookie=cookie,
+            csrf=csrf,
+            body={"task_type": "night_owl", "mode": "dry_run", "confirm": "run night owl dry-run"},
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self.app.journal.reconstruct(dispatched["forge_task_id"])["status"], "created")
+
+    def test_toronto_time_est_and_edt(self) -> None:
+        self.assertEqual(_toronto_time("2026-01-15T12:00:00Z"), "2026-01-15 07:00:00 EST")
+        self.assertEqual(_toronto_time("2026-07-15T12:00:00+00:00"), "2026-07-15 08:00:00 EDT")
+        self.assertEqual(_toronto_time("invalid"), "invalid")
+
+    def test_agent_fixed_dynamic_and_fallback_routing(self) -> None:
+        catalog = ModelCatalog(self.config.swarm.catalog_path)
+        catalog.reconcile_inventory(
+            "nvidia",
+            provider_items([ProviderModel("nvidia", "nvidia/fallback", "Fallback", {"capabilities": ["reasoning"], "supports_streaming": True})]),
+            mode="live",
+        )
+        catalog.record_probe("nvidia/fallback", "healthy", 10, "")
+        task_id = self.app.journal.next_task_id()
+        self.app.journal.append_event(task_id, JournalEventType.TASK_CREATED)
+        self.app.journal.append_event(
+            task_id,
+            JournalEventType.TASK_ASSIGNED,
+            agent_id="planner",
+            metadata={"model_id": "nvidia/old", "provider": "NVIDIA"},
+            timestamp="2026-01-16T01:00:00+14:00",
+        )
+        self.app.journal.append_event(
+            task_id,
+            JournalEventType.TASK_ASSIGNED,
+            agent_id="planner",
+            metadata={"model_id": "nvidia/dynamic", "provider": "NVIDIA"},
+            timestamp="2026-01-15T23:30:00-12:00",
+        )
+        agents = {row["agent_id"]: row for row in self.app.agents_status()["agents"]}
+        self.assertEqual(agents["judge"]["routing"], "fixed")
+        self.assertEqual(agents["planner"]["model_id"], "nvidia/dynamic")
+        self.assertEqual(agents["planner"]["provider"], "NVIDIA")
+        self.assertEqual(agents["planner"]["routing"], "dynamic")
+        self.assertEqual(agents["crypto_keeper"]["model_id"], "nvidia/fallback")
+        self.assertEqual(agents["crypto_keeper"]["routing"], "fallback")
+        with patch.object(self.app.catalog, "recommend", return_value=[]):
+            unassigned = {
+                row["agent_id"]: row for row in self.app.agents_status()["agents"]
+            }
+        self.assertEqual(unassigned["crypto_keeper"]["routing"], "unassigned")
+        self.assertEqual(unassigned["crypto_keeper"]["model_id"], "")
+        self.assertIn("['Model',", FORGE_HTML)
+        self.assertIn("['Provider',", FORGE_HTML)
+        self.assertIn("['Routing',", FORGE_HTML)
+
+    def test_image_status_uses_approved_preset_source(self) -> None:
+        approved = {"preset_id": "registry-approved", "name": "Approved Registry Preset"}
+        status = type("Status", (), {"state": "offline", "queue_depth": 0, "detail": "", "system": None})()
+        with (
+            patch("swarm_router.dashboard.preset_summary", return_value=approved),
+            patch("swarm_router.dashboard.ComfyUIClient.status", return_value=status),
+            patch("swarm_router.dashboard.image_gallery", return_value=[]),
+        ):
+            result = self.app.image_status()
+        self.assertEqual(result["preset"], approved)
+        self.assertEqual(result["presets"], [approved])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard JavaScript validation")
+    def test_image_selector_submit_and_poll_javascript(self) -> None:
+        submit_start = FORGE_HTML.index("async function imageSubmit()")
+        render_start = FORGE_HTML.index("function renderImages", submit_start)
+        render_end = FORGE_HTML.index("async function dispatch", render_start)
+        functions = FORGE_HTML[submit_start:render_start] + FORGE_HTML[render_start:render_end]
+        script = f"""
+const assert=require('assert');
+const elements={{content:{{innerHTML:''}},imagePreset:{{value:'approved-two'}},
+ imagePrompt:{{value:'test prompt'}},imageNegative:{{value:''}},
+ imageSeed:{{value:'7'}},imageDiscord:{{checked:false}},imageResult:{{textContent:''}}}};
+const $=id=>elements[id];
+const esc=value=>String(value??'');
+const card=()=>''; const table=()=>''; const cls=()=>''; let loaded=0;
+let releasePoll; const pollGate=new Promise(resolve=>releasePoll=resolve);
+const calls=[];
+async function api(path,opts={{}}){{
+ calls.push({{path,body:opts.body?JSON.parse(opts.body):null}});
+ if(opts.method==='POST')return {{forge_task_id:'FT-20260729-060000'}};
+ await pollGate; return {{task:{{status:'completed'}}}};
+}}
+async function load(){{loaded++}}
+{functions}
+(async()=>{{
+ renderImages({{connection:{{}},presets:[
+  {{preset_id:'approved-one',name:'Approved One'}},
+  {{preset_id:'approved-two',name:'Approved Two'}}
+ ],tasks:[],gallery:[]}});
+ assert(elements.content.innerHTML.includes('value="approved-one"'));
+ assert(elements.content.innerHTML.includes('Approved Two'));
+ elements.imagePreset.value='approved-two';
+ await imageSubmit();
+ assert(elements.imageResult.textContent.includes('FT-20260729-060000'));
+ assert.deepStrictEqual(calls[0].body.preset_id,'approved-two');
+ assert.deepStrictEqual(calls[0].body.confirm,'generate image');
+ assert.deepStrictEqual(calls[1].path,'/api/tasks/FT-20260729-060000');
+ releasePoll(); await new Promise(resolve=>setImmediate(resolve));
+ assert.strictEqual(loaded,1);
+}})().catch(error=>{{console.error(error);process.exit(1)}});
+"""
+        result = subprocess.run(
+            ["node", "-"], input=script, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_disconnect_write_suppresses_only_client_disconnects(self) -> None:
+        handler = object.__new__(Handler)
+
+        class Broken:
+            def __init__(self, error_type: type[Exception]) -> None:
+                self.error_type = error_type
+
+            def write(self, _payload: bytes) -> None:
+                raise self.error_type()
+
+        handler.wfile = Broken(BrokenPipeError)  # type: ignore[assignment]
+        handler._write(b"test")
+        handler.wfile = Broken(ConnectionResetError)  # type: ignore[assignment]
+        handler._write(b"test")
+        handler.wfile = Broken(ValueError)  # type: ignore[assignment]
+        with self.assertRaises(ValueError):
+            handler._write(b"test")
 
 
 if __name__ == "__main__":

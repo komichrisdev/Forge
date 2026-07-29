@@ -12,6 +12,7 @@ from time import monotonic
 from typing import Any
 from urllib.parse import unquote, urlparse
 from urllib import error, request
+from zoneinfo import ZoneInfo
 import json
 import os
 import secrets
@@ -115,19 +116,19 @@ function table(rows,cols){return `<table><thead><tr>${cols.map(c=>`<th>${esc(c[0
 async function load(){try{cache[view]=await api('/api/'+view.replace('nightowl','night-owl'));render()}catch(e){$('content').innerHTML=`<p class="failed">${esc(e.message)}</p>`}}
 function render(){const d=cache[view]||{};if(view==='overview')return renderOverview(d);if(view==='images')return renderImages(d);if(view==='tasks')return renderTasks(d);if(view==='schedules')return renderSchedules(d);if(view==='nightowl')return renderNightOwl(d);if(view==='notifications')return renderNotifications(d);if(view==='agents')return renderAgents(d);if(view==='providers')return renderProviders(d);renderDispatch(d)}
 function renderOverview(d){$('openwebui').href=d.openwebui?.url||'#';$('content').innerHTML=`<h2>Overview</h2><div class="grid">${card('Forge',`${d.forge_version} / ${d.architecture_revision}`)+card('Personal backend',d.personal_backend?.status||'unknown')+card('Scheduler service',d.scheduler_service?.status||'unknown')+card('Dashboard service',d.dashboard_service?.status||'unknown')+card('Open WebUI',d.openwebui?.status||'unknown')+card('Night Owl',`${d.night_owl?.enabled?'enabled':'disabled'} · ${d.night_owl?.next_run_at||'no next run'}`,d.night_owl?.enabled?'enabled':'disabled')+card('Discord',d.discord?.valid?'configured':'not configured',d.discord?.valid?'healthy':'failed')+card('Notifications',d.discord?.latest_delivery?.status||'none')+card('Providers',`${d.providers?.provider_count||0} providers / ${d.providers?.model_count||0} models`)+card('Quarantined models',d.providers?.quarantined_model_count||0,d.providers?.quarantined_model_count?'warning':'healthy')+card('Active tasks',d.tasks?.active_count||0,d.tasks?.active_count?'warning':'healthy')+card('Failed tasks',d.tasks?.failed_count||0,d.tasks?.failed_count?'failed':'healthy')+card('Suspected orphans',d.tasks?.suspected_orphan_count||0,d.tasks?.suspected_orphan_count?'warning':'healthy')}</div><pre>${esc(JSON.stringify(d,null,2))}</pre>`}
-function renderTasks(d){$('content').innerHTML=`<h2>Tasks</h2>${table(d.tasks||[],[['Forge task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Personal',r=>esc(r.personal_task_id||'')],['Type',r=>esc(r.task_type||'')],['Agent',r=>esc((r.agents||[]).join(', ')||r.agent_id||'')],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Created',r=>esc(r.created_at||'')],['Schedule',r=>esc(r.schedule_id||'')],['Recovery',r=>esc(r.recovery_status?.replay_safety||'')]])}<div id="detail"></div>`}
-async function taskDetail(id){const d=await api('/api/tasks/'+encodeURIComponent(id));$('detail').innerHTML=`<h3>${esc(id)}</h3><h4>Events</h4>${table(d.events||[],[['Time',r=>esc(r.timestamp)],['Event',r=>esc(r.event_type)],['Agent',r=>esc(r.agent_id)],['Stage',r=>esc(r.stage)],['Side effect',r=>esc(r.side_effect_state)],['Message',r=>esc(r.message)]])}<h4>Checkpoints</h4><pre>${esc(JSON.stringify(d.checkpoints||[],null,2))}</pre><h4>Task</h4><pre>${esc(JSON.stringify(d.personal_task||{},null,2))}</pre>`}
+function renderTasks(d){$('content').innerHTML=`<h2>Tasks</h2>${table(d.tasks||[],[['Forge task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Personal',r=>esc(r.personal_task_id||'')],['Type',r=>esc(r.task_type||'')],['Agent',r=>esc((r.agents||[]).join(', ')||r.agent_id||'')],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Created',r=>esc(r.created_at_display||r.created_at||'')],['Updated',r=>esc(r.updated_at_display||r.updated_at||'')],['Completed',r=>esc(r.completion_time_display||r.completion_time||'')],['Schedule',r=>esc(r.schedule_id||'')],['Recovery',r=>esc(r.recovery_status?.replay_safety||'')]])}<div id="detail"></div>`}
+async function taskDetail(id){const d=await api('/api/tasks/'+encodeURIComponent(id));$('detail').innerHTML=`<h3>${esc(id)}</h3><h4>Events</h4>${table(d.events||[],[['Time',r=>esc(r.timestamp_display||r.timestamp)],['Event',r=>esc(r.event_type)],['Agent',r=>esc(r.agent_id)],['Stage',r=>esc(r.stage)],['Side effect',r=>esc(r.side_effect_state)],['Message',r=>esc(r.message)]])}<h4>Checkpoints</h4><pre>${esc(JSON.stringify(d.checkpoints||[],null,2))}</pre><h4>Task</h4><pre>${esc(JSON.stringify(d.personal_task||{},null,2))}</pre>`}
 async function scheduleAction(id,action,confirmText){const body={confirm:confirmText};const d=await api('/api/schedules/'+encodeURIComponent(id)+'/'+action,{method:'POST',body:JSON.stringify(body)});alert(JSON.stringify(d,null,2));await load()}
 function renderSchedules(d){$('content').innerHTML=`<h2>Schedules</h2>${table(d.schedules||[],[['ID',r=>esc(r.schedule_id)],['Name',r=>esc(r.name)],['Task',r=>esc(r.task_type)],['Agent',r=>esc(r.agent_id)],['State',r=>`<span class="${cls(r.state)}">${esc(r.enabled?'enabled':'disabled')} · ${esc(r.state)}</span>`],['Trigger',r=>esc(r.trigger_type+' '+JSON.stringify(r.trigger_configuration))],['Next',r=>esc(r.next_run_at)],['Policies',r=>esc(`${r.overlap_policy}/${r.misfire_policy}`)],['Actions',r=>`<div class="actions"><button onclick="scheduleAction('${esc(r.schedule_id)}','enable','enable ${esc(r.schedule_id)}')">Enable</button><button onclick="scheduleAction('${esc(r.schedule_id)}','disable','disable ${esc(r.schedule_id)}')">Disable</button><button onclick="scheduleAction('${esc(r.schedule_id)}','run-now','run now ${esc(r.schedule_id)}')">Run now</button></div>`]])}`}
 async function night(action,confirmText){const d=await api('/api/night-owl/'+action,{method:'POST',body:JSON.stringify({confirm:confirmText})});alert(JSON.stringify(d,null,2));await load()}
 function renderNightOwl(d){$('content').innerHTML=`<h2>Night Owl</h2><div class="grid">${card('Schedule',d.schedule?.enabled?'enabled':'disabled',d.schedule?.enabled?'enabled':'disabled')+card('Cadence',d.schedule?.trigger_configuration?.expression||'')+card('Next run',d.schedule?.next_run_at||'')+card('Last run',d.schedule?.last_run_at||'')+card('Legacy cron',d.legacy_cron?.status||'unknown')+card('Last Discord',d.last_discord_delivery?.status||'none')}</div><div class="panel actions"><button onclick="night('dry-run','run night owl dry-run')">Run dry-run</button><button onclick="night('live','RUN NIGHT OWL LIVE')">Run live</button></div><pre>${esc(JSON.stringify(d,null,2))}</pre>`}
-function renderNotifications(d){$('content').innerHTML=`<h2>Notifications</h2>${(d.unknown||[]).length?'<p class="warning">Unknown deliveries require manual review.</p>':''}${table(d.notifications||[],[['ID',r=>esc(r.notification_id)],['Event',r=>esc(r.event_type)],['Severity',r=>esc(r.severity)],['State',r=>`<span class="${cls(r.status)}">${esc(r.status)} / ${esc(r.side_effect_state)}</span>`],['Task',r=>esc(r.forge_task_id||r.task_id||'')],['Time',r=>esc(r.created_at)],['External',r=>esc(r.external_message_id||'')],['Error',r=>esc(r.error_summary||'')]])}`}
-function renderAgents(d){$('content').innerHTML=`<h2>Agents</h2>${table(d.agents||[],[['ID',r=>esc(r.agent_id)],['Name',r=>esc(r.display_name)],['Enabled',r=>esc(r.enabled)],['Task types',r=>esc((r.supported_task_types||[]).join(', '))],['Version',r=>esc(r.version)],['Description',r=>esc(r.description)]])}`}
+function renderNotifications(d){$('content').innerHTML=`<h2>Notifications</h2>${(d.unknown||[]).length?'<p class="warning">Unknown deliveries require manual review.</p>':''}${table(d.notifications||[],[['ID',r=>esc(r.notification_id)],['Event',r=>esc(r.event_type)],['Severity',r=>esc(r.severity)],['State',r=>`<span class="${cls(r.status)}">${esc(r.status)} / ${esc(r.side_effect_state)}</span>`],['Task',r=>esc(r.forge_task_id||r.task_id||'')],['Time',r=>esc(r.created_at_display||r.created_at)],['External',r=>esc(r.external_message_id||'')],['Error',r=>esc(r.error_summary||'')]])}`}
+function renderAgents(d){$('content').innerHTML=`<h2>Agents</h2>${table(d.agents||[],[['ID',r=>esc(r.agent_id)],['Name',r=>esc(r.display_name)],['Model',r=>esc(r.model_id||'')],['Provider',r=>esc(r.provider||'')],['Routing',r=>esc(r.routing||'')],['Enabled',r=>esc(r.enabled)],['Task types',r=>esc((r.supported_task_types||[]).join(', '))],['Version',r=>esc(r.version)],['Description',r=>esc(r.description)]])}`}
 function renderProviders(d){$('content').innerHTML=`<h2>Providers</h2>${table(d.providers||[],[['Provider',r=>esc(r.provider_id)],['Health',r=>`<span class="${cls(r.health)}">${esc(r.health)}</span>`],['Revision',r=>esc(r.inventory_revision)],['Last refresh',r=>esc(r.last_refresh_attempt||'')],['Cooldown',r=>esc(r.cooldown_until||'')]])}<h3>Models</h3>${table(d.models||[],[['Provider',r=>esc(r.provider_id)],['Model',r=>esc(r.model_id)],['Health',r=>esc(r.health)],['Capabilities',r=>esc((r.capabilities||[]).join(', '))],['Flags',r=>esc(`${r.quarantined?'quarantined ':''}${r.available?'available':'disabled'}`)]])}`}
-async function imageSubmit(){const body={preset_id:'flux-schnell-768-daily',prompt:$('imagePrompt').value,negative_prompt:$('imageNegative').value,seed:$('imageSeed').value,notification_requested:$('imageDiscord').checked,confirm:$('imageConfirm').value};const d=await api('/api/images/generate',{method:'POST',body:JSON.stringify(body)});$('imageResult').textContent=JSON.stringify(d,null,2);await load()}
-function renderImages(d){$('content').innerHTML=`<h2>Image Generation</h2><div class="grid">${card('ComfyUI',d.connection?.state||'unknown')+card('Queue depth',d.connection?.queue_depth??0)+card('Worker',d.worker_state||'unknown')+card('Preset',d.preset?.name||'FLUX Schnell 768 Daily')}</div><section class="panel"><label>Preset</label><input value="FLUX Schnell 768 Daily" disabled style="width:100%"><label>Prompt</label><textarea id="imagePrompt" maxlength="1200" style="width:100%;min-height:100px"></textarea><label>Negative prompt</label><textarea id="imageNegative" maxlength="1200" style="width:100%;min-height:70px"></textarea><div class="row"><div><label>Seed</label><input id="imageSeed" inputmode="numeric" placeholder="random"></div><label><input id="imageDiscord" type="checkbox"> Discord notification</label></div><label>Confirmation</label><input id="imageConfirm" placeholder="generate image" style="width:100%"><div class="actions" style="margin-top:10px"><button onclick="imageSubmit()">Generate</button></div><pre id="imageResult"></pre></section><h3>Active and Recent</h3>${table(d.tasks||[],[['Task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Progress',r=>esc((r.progress??'')+'')],['Preset',r=>esc(r.preset_id||'')],['Seed',r=>esc(r.seed||'')],['Prompt ID',r=>esc(r.comfyui_prompt_id||'')]])}<div id="detail"></div><h3>Gallery</h3><div class="grid">${(d.gallery||[]).map(g=>`<section class="panel"><a href="${esc(g.image_url)}" target="_blank" rel="noreferrer"><img src="${esc(g.thumbnail_url)}" alt="" style="max-width:100%;height:auto"></a><div><b>${esc(g.forge_task_id)}</b></div><div class="muted">${esc(g.prompt_summary||'')}</div><div>${esc(g.preset_id)} · seed ${esc(g.seed)}</div><div class="actions"><a href="${esc(g.image_url)}" download>Download</a><button onclick="taskDetail('${esc(g.forge_task_id)}')">Journal</button></div></section>`).join('')||'<p class="muted">No generated images.</p>'}</div>`}
+async function imageSubmit(){const body={preset_id:$('imagePreset').value,prompt:$('imagePrompt').value,negative_prompt:$('imageNegative').value,seed:$('imageSeed').value,notification_requested:$('imageDiscord').checked,confirm:'generate image'};const d=await api('/api/images/generate',{method:'POST',body:JSON.stringify(body)});$('imageResult').textContent=JSON.stringify(d,null,2);const taskId=d&&(d.forge_task_id||d.task_id);if(taskId){const poll=async()=>{try{const t=await api('/api/tasks/'+encodeURIComponent(taskId));$('imageResult').textContent=JSON.stringify(t,null,2);const status=String(t?.task?.status||t?.status||'').toLowerCase();if(status==='completed'||status==='failed'||status==='cancelled'){await load();return}}catch(e){$('imageResult').textContent+='\n'+e.message}setTimeout(poll,1500)};poll()}else{await load()}}
+function renderImages(d){$('content').innerHTML=`<h2>Image Generation</h2><div class="grid">${card('ComfyUI',d.connection?.state||'unknown')+card('Queue depth',d.connection?.queue_depth??0)+card('Worker',d.worker_state||'unknown')+card('Preset',d.preset?.name||'FLUX Schnell 768 Daily')}</div><section class="panel"><label>Preset</label><select id="imagePreset" style="width:100%">${(d.presets||[d.preset]).filter(Boolean).map(p=>`<option value="${esc(p.preset_id)}">${esc(p.name)}</option>`).join('')}</select><label>Prompt</label><textarea id="imagePrompt" maxlength="1200" style="width:100%;min-height:100px"></textarea><label>Negative prompt</label><textarea id="imageNegative" maxlength="1200" style="width:100%;min-height:70px"></textarea><div class="row"><div><label>Seed</label><input id="imageSeed" inputmode="numeric" placeholder="random"></div><label><input id="imageDiscord" type="checkbox"> Discord notification</label></div><div class="actions" style="margin-top:10px"><button onclick="imageSubmit()">Generate</button></div><pre id="imageResult"></pre></section><h3>Active and Recent</h3>${table(d.tasks||[],[['Task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Progress',r=>esc((r.progress??'')+'')],['Preset',r=>esc(r.preset_id||'')],['Seed',r=>esc(r.seed||'')],['Prompt ID',r=>esc(r.comfyui_prompt_id||'')]])}<div id="detail"></div><h3>Gallery</h3><div class="grid">${(d.gallery||[]).map(g=>`<section class="panel"><a href="${esc(g.image_url)}" target="_blank" rel="noreferrer"><img src="${esc(g.thumbnail_url)}" alt="" style="max-width:100%;height:auto"></a><div><b>${esc(g.forge_task_id)}</b></div><div class="muted">${esc(g.prompt_summary||'')}</div><div>${esc(g.preset_id)} · seed ${esc(g.seed)}</div><div class="actions"><a href="${esc(g.image_url)}" download>Download</a><button onclick="taskDetail('${esc(g.forge_task_id)}')">Journal</button></div></section>`).join('')||'<p class="muted">No generated images.</p>'}</div>`}
 async function dispatch(action){const body={task_type:$('taskType').value,mode:$('dispatchMode').value,confirm:$('dispatchConfirm').value};const d=await api('/api/dispatch',{method:'POST',body:JSON.stringify(body)});$('dispatchResult').textContent=JSON.stringify(d,null,2)}
-function renderDispatch(){ $('content').innerHTML=`<h2>Dispatch approved Forge task</h2><p class="muted">Only approved task types are available. No shell commands or arbitrary paths are accepted.</p><label>Task type</label><select id="taskType"><option value="night_owl">Night Owl</option></select><label>Mode</label><select id="dispatchMode"><option value="dry_run">dry-run</option><option value="live">live</option></select><label>Confirmation</label><input id="dispatchConfirm" style="width:100%" placeholder="dry-run: run night owl dry-run; live: RUN NIGHT OWL LIVE"><div class="actions" style="margin-top:10px"><button onclick="dispatch()">Submit task</button></div><pre id="dispatchResult"></pre>`}
+function renderDispatch(d){const types=d.task_types||[];$('content').innerHTML=`<h2>Dispatch approved Forge task</h2><p class="muted">Only approved task types are available. No shell commands or arbitrary paths are accepted.</p><label>Task type</label><select id="taskType">${types.map(t=>`<option value="${esc(t.task_type)}">${esc(t.name)}</option>`).join('')}</select><label>Mode</label><select id="dispatchMode"></select><label>Confirmation</label><input id="dispatchConfirm" style="width:100%" readonly><div class="actions" style="margin-top:10px"><button onclick="dispatch()">Submit task</button></div><pre id="dispatchResult"></pre>`;const sync=()=>{const task=types.find(t=>t.task_type===$('taskType').value)||types[0]||{};$('dispatchMode').innerHTML=(task.modes||[]).map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');$('dispatchConfirm').value=task.confirmations?.[$('dispatchMode').value]||''};$('taskType').onchange=sync;$('dispatchMode').onchange=()=>{const task=types.find(t=>t.task_type===$('taskType').value)||{};$('dispatchConfirm').value=task.confirmations?.[$('dispatchMode').value]||''};sync()}
 $('loginButton').onclick=login;$('secret').onkeydown=e=>{if(e.key==='Enter')login()};$('refresh').onclick=load;$('logout').onclick=async()=>{await api('/api/logout',{method:'POST',body:'{}'}).catch(()=>{});csrf='';session()};document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{view=b.dataset.view;document.querySelectorAll('nav button').forEach(x=>x.setAttribute('aria-current',x===b?'true':'false'));load()});session();
 </script></body></html>'''
 
@@ -162,6 +163,24 @@ def _events(path: Path) -> list[dict[str, Any]]:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _toronto_time(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(normalized)
+    except (TypeError, ValueError):
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(ZoneInfo("America/Toronto")).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _public_url(base_url: str, host: str) -> str:
@@ -503,6 +522,7 @@ class DashboardApp:
             "connection": status.__dict__,
             "worker_state": "configured" if self.config.image_generation.comfyui_base_url else "missing_config",
             "preset": preset_summary(),
+            "presets": [preset_summary()],
             "gallery": image_gallery(self.config),
             "tasks": image_tasks[:20],
         })
@@ -542,13 +562,20 @@ class DashboardApp:
                 "schedule_id": metadata.get("schedule_id", ""),
                 "occurrence_id": metadata.get("occurrence_id", ""),
                 "completion_time": personal.get(personal_task_id, {}).get("completion_time", ""),
+                "completion_time_display": _toronto_time(personal.get(personal_task_id, {}).get("completion_time", "")),
+                "created_at_display": _toronto_time(task.get("created_at", "")),
+                "updated_at_display": _toronto_time(task.get("updated_at", "")),
                 "recovery_status": self.journal.recovery_status(task["task_id"]),
             }
             rows.append(_sanitize(item))
         return rows[:100]
 
     def task_detail(self, task_id: str) -> dict[str, Any]:
-        events = [event.to_dict() for event in self.journal.events(task_id)]
+        events = []
+        for event in self.journal.events(task_id):
+            row = event.to_dict()
+            row["timestamp_display"] = _toronto_time(row.get("timestamp", ""))
+            events.append(row)
         metadata: dict[str, Any] = {}
         for event in events:
             metadata.update(event.get("metadata") if isinstance(event.get("metadata"), dict) else {})
@@ -645,10 +672,64 @@ class DashboardApp:
 
     def notification_rows(self) -> dict[str, Any]:
         rows = self.notifications.list(100)
+        for row in rows:
+            row["created_at_display"] = _toronto_time(row.get("created_at", ""))
         return _sanitize({"notifications": rows, "unknown": [row for row in rows if row["status"] == "unknown"]})
 
     def agents_status(self) -> dict[str, Any]:
-        return self.registry.status()
+        status = self.registry.status()
+
+        def provider(model_id: str) -> str:
+            record = self.catalog.get(model_id)
+            return record.provider if record else (model_id.split("/", 1)[0] if "/" in model_id else "openwebui")
+
+        fixed = {
+            worker.name: (worker.model, provider(worker.model))
+            for worker in self.config.workers
+        }
+        fixed.update({
+            "judge": (self.config.judge.model, provider(self.config.judge.model)),
+            "manager": (self.config.personal.model_id, "personal"),
+            "image_generator": (str(preset_summary()["model"]), "local ComfyUI"),
+            "night_owl": ("run_nightly.sh", "local subprocess"),
+        })
+        dynamic: dict[str, tuple[str, str, datetime]] = {}
+        for task in self.journal.list_tasks():
+            for event in self.journal.events(task["task_id"]):
+                model_id = str(event.metadata.get("model_id") or "")
+                if event.event_type != "TASK_ASSIGNED" or not event.agent_id or not model_id:
+                    continue
+                assigned_at = datetime.fromisoformat(
+                    event.timestamp[:-1] + "+00:00"
+                    if event.timestamp.endswith("Z")
+                    else event.timestamp
+                )
+                current = dynamic.get(event.agent_id)
+                if current is None or assigned_at > current[2]:
+                    dynamic[event.agent_id] = (
+                        model_id,
+                        str(event.metadata.get("provider") or provider(model_id)),
+                        assigned_at,
+                    )
+        for agent in status["agents"]:
+            agent_id = str(agent["agent_id"])
+            if agent_id in dynamic:
+                model_id, model_provider, _timestamp = dynamic[agent_id]
+                routing = "dynamic"
+            elif agent_id in fixed:
+                model_id, model_provider = fixed[agent_id]
+                routing = "fixed"
+            else:
+                recommended = self.catalog.recommend(
+                    "auto", 1, self.config.reliability, role=agent_id
+                )
+                model_id = recommended[0].model_id if recommended else ""
+                model_provider = recommended[0].provider if recommended else ""
+                routing = "fallback" if recommended else "unassigned"
+            agent.update(
+                {"model_id": model_id, "provider": model_provider, "routing": routing}
+            )
+        return status
 
     def _scheduler(self) -> Scheduler:
         return Scheduler(self.config, submit_task=self._submit_schedule_task)
@@ -763,6 +844,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
         self.send_header("Cache-Control", "no-store")
 
+    def _write(self, payload: bytes) -> None:
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _json(self, status: int, data: Any) -> None:
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -770,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self._headers()
         self.end_headers()
-        self.wfile.write(payload)
+        self._write(payload)
 
     def _html(self, status: int, text: str) -> None:
         payload = text.encode("utf-8")
@@ -779,7 +866,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self._headers()
         self.end_headers()
-        self.wfile.write(payload)
+        self._write(payload)
 
     def _set_cookie_json(self, status: int, data: Any, session_id: str) -> None:
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -789,7 +876,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Set-Cookie", f"forge_session={session_id}; Path=/; Max-Age={SESSION_SECONDS}; HttpOnly; SameSite=Strict")
         self._headers()
         self.end_headers()
-        self.wfile.write(payload)
+        self._write(payload)
 
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -823,6 +910,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.app.agents_status()
         if path == "/api/providers":
             return self.app.provider_summary()
+        if path == "/api/dispatch":
+            return {
+                "task_types": [
+                    {
+                        "task_type": "night_owl",
+                        "name": "Night Owl",
+                        "modes": ["dry_run", "live"],
+                        "confirmations": {
+                            "dry_run": "run night owl dry-run",
+                            "live": "RUN NIGHT OWL LIVE",
+                        },
+                    }
+                ]
+            }
         if path == "/api/models":
             return {"models": self.app.list_models(), "defaults": self.app.defaults(), "probe_history": self.app.catalog.probe_history(), "probe_timeout_seconds": self.app.config.probe.timeout_seconds, "benchmark_results": self.app.catalog.benchmark_results()}
         if path == "/api/runs":
@@ -883,7 +984,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(payload)))
                 self._headers()
                 self.end_headers()
-                self.wfile.write(payload)
+                self._write(payload)
             except Exception:
                 self._json(404, {"error": "Not found."})
             return
