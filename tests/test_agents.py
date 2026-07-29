@@ -18,7 +18,7 @@ class AgentRegistryTest(unittest.TestCase):
         self.assertIsNone(registry.get("missing"))
         self.assertEqual(registry.validate(), [])
         status = registry.status()
-        self.assertEqual(status["agent_count"], 11)
+        self.assertEqual(status["agent_count"], 12)
         self.assertEqual(status["disabled_count"], 0)
         payload = registry.get("planner").to_dict()  # type: ignore[union-attr]
         self.assertEqual(AgentManifest.from_dict(payload).to_dict(), payload)

@@ -182,6 +182,7 @@ class AgentRegistry:
 DEFAULT_AGENTS = (
     AgentManifest("critic", "Critic", "Reviews candidate plans for gaps, risks, and unsupported claims.", supported_task_types=("review",), preferred_capabilities=("reasoning.high",)),
     AgentManifest("crypto_keeper", "Crypto Keeper", "Monitors crypto context and produces bounded market/task summaries.", supported_task_types=("research", "monitoring")),
+    AgentManifest("image_generator", "Image Generator", "Runs approved local image-generation presets through Forge.", supported_task_types=("image_generate",), preferred_capabilities=("local_image_generation",)),
     AgentManifest("implementer", "Implementer", "Produces concrete implementation proposals within supervisor constraints.", supported_task_types=("implementation",), preferred_capabilities=("coding",)),
     AgentManifest("judge", "Judge", "Reviews candidate outputs and produces bounded synthesis.", supported_task_types=("review", "synthesis"), preferred_capabilities=("reasoning.high",)),
     AgentManifest("manager", "Manager", "Coordinates multi-step work and delegates to specialized logical agents.", supported_task_types=("planning", "coordination"), preferred_capabilities=("reasoning.high",)),

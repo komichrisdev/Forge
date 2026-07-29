@@ -21,6 +21,18 @@ from .catalog import ModelCatalog, ModelRecord
 from .config import AppConfig
 from .dashboard import DashboardApp
 from .discord_notifications import DiscordError, notify_night_owl
+from .image_generation import (
+    ComfyUIClient,
+    IMAGE_AGENT_ID,
+    ImageGenerationError,
+    build_workflow,
+    notify_image_completion,
+    store_artifact,
+    validate_comfyui_requirements,
+    validate_image_payload,
+    validate_workflow,
+    wait_for_output,
+)
 from .journal import CheckpointRecord, JournalEventType, SideEffectState, TaskJournal, validate_task_id
 from .night_owl import NightOwlError, run_night_owl
 from .orchestrator import SwarmOrchestrator
@@ -466,8 +478,8 @@ class PersonalTaskManager:
         latest_user = _latest_user(trimmed)
         task_type = str(body.get("task_type", "personal_chat")).strip() or "personal_chat"
         task_payload = body.get("task_payload") if isinstance(body.get("task_payload"), dict) else {}
-        rejection = None if task_type == "night_owl" else _rejection(latest_user)
-        profile = "night_owl" if task_type == "night_owl" else ("unsupported" if rejection else _profile(latest_user))
+        rejection = None if task_type in {"night_owl", "image_generate"} else _rejection(latest_user)
+        profile = task_type if task_type in {"night_owl", "image_generate"} else ("unsupported" if rejection else _profile(latest_user))
         task_metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
         task_id = f"task-{uuid.uuid4().hex[:16]}"
         forge_task_id = self.journal.next_task_id()
@@ -618,6 +630,9 @@ class PersonalTaskManager:
         try:
             if task.get("task_type") == "night_owl":
                 self._run_night_owl_task(task_id, task, forge_task_id, started, retry_count)
+                return
+            if task.get("task_type") == "image_generate":
+                self._run_image_task(task_id, task, forge_task_id, started, retry_count)
                 return
             if task.get("rejection"):
                 self._complete(
@@ -844,6 +859,207 @@ class PersonalTaskManager:
             )
         else:
             self._fail(task_id, output, "night_owl_timeout" if result.timed_out else "night_owl", started)
+
+    def _run_image_task(
+        self,
+        task_id: str,
+        task: dict[str, Any],
+        forge_task_id: str,
+        started: float,
+        retry_count: int,
+    ) -> None:
+        agent_id = str(task.get("agent_id") or IMAGE_AGENT_ID)
+        run_id = f"image-{task_id}-r{retry_count}"
+        try:
+            payload = validate_image_payload(task.get("task_payload") if isinstance(task.get("task_payload"), dict) else {})
+            workflow = build_workflow(payload)
+            issues = validate_workflow(workflow)
+            if issues:
+                raise ImageGenerationError("; ".join(issues), category="workflow_invalid")
+            client = ComfyUIClient(
+                self.config.image_generation.comfyui_base_url,
+                connect_timeout=self.config.image_generation.connect_timeout_seconds,
+                request_timeout=self.config.image_generation.request_timeout_seconds,
+            )
+            self.journal.append_event(
+                forge_task_id,
+                JournalEventType.TASK_ASSIGNED,
+                agent_id=agent_id,
+                run_id=run_id,
+                metadata={"personal_task_id": task_id, "handler": "image_generate", "preset_id": payload.preset_id},
+                transition_key=f"personal:{task_id}:assigned:{run_id}:image",
+            )
+            self.journal.append_event(
+                forge_task_id,
+                JournalEventType.STAGE_STARTED,
+                agent_id=agent_id,
+                run_id=run_id,
+                stage="connection_validated",
+                metadata={"personal_task_id": task_id, "comfyui_base_url": self.config.image_generation.comfyui_base_url},
+                transition_key=f"personal:{task_id}:stage:connection:r{retry_count}",
+            )
+            status = client.status()
+            if status.state == "offline":
+                raise ImageGenerationError(status.detail or "ComfyUI is offline", category="windows_offline")
+            self._emit(task_id, "checkpoint", stage="connection_validated")
+            remote_issues = validate_comfyui_requirements(client.object_info())
+            if remote_issues:
+                raise ImageGenerationError("; ".join(remote_issues), category="model_missing")
+            self.journal.append_event(
+                forge_task_id,
+                JournalEventType.STAGE_STARTED,
+                agent_id=agent_id,
+                run_id=run_id,
+                stage="workflow_validated",
+                metadata={"personal_task_id": task_id, "preset_id": payload.preset_id},
+                transition_key=f"personal:{task_id}:stage:workflow:r{retry_count}",
+            )
+            self._emit(task_id, "checkpoint", stage="workflow_validated")
+            self.journal.append_event(
+                forge_task_id,
+                JournalEventType.STAGE_STARTED,
+                agent_id=agent_id,
+                run_id=run_id,
+                stage="workflow_submission",
+                side_effect_state=SideEffectState.PROPOSED,
+                metadata={"personal_task_id": task_id, "preset_id": payload.preset_id},
+                transition_key=f"personal:{task_id}:stage:submit-proposed:r{retry_count}",
+            )
+            self.journal.append_event(
+                forge_task_id,
+                JournalEventType.STAGE_STARTED,
+                agent_id=agent_id,
+                run_id=run_id,
+                stage="workflow_submission",
+                side_effect_state=SideEffectState.STARTED,
+                metadata={"personal_task_id": task_id},
+                transition_key=f"personal:{task_id}:stage:submit-started:r{retry_count}",
+            )
+            try:
+                prompt_id = client.submit(workflow)
+            except ImageGenerationError as exc:
+                self.journal.append_event(
+                    forge_task_id,
+                    JournalEventType.STAGE_STARTED,
+                    agent_id=agent_id,
+                    run_id=run_id,
+                    stage="workflow_submission",
+                    side_effect_state=SideEffectState.UNKNOWN,
+                    message=str(exc),
+                    metadata={"personal_task_id": task_id},
+                    transition_key=f"personal:{task_id}:stage:submit-unknown:r{retry_count}",
+                )
+                raise ImageGenerationError(str(exc), category="unknown_submission")
+            self._update(task_id, comfyui_prompt_id=prompt_id, seed=payload.seed, preset_id=payload.preset_id, progress=0)
+            self.journal.append_event(
+                forge_task_id,
+                JournalEventType.STAGE_STARTED,
+                agent_id=agent_id,
+                run_id=run_id,
+                stage="workflow_submitted",
+                side_effect_state=SideEffectState.CONFIRMED,
+                metadata={"personal_task_id": task_id, "comfyui_prompt_id": prompt_id},
+                transition_key=f"personal:{task_id}:stage:submit-confirmed:r{retry_count}",
+            )
+
+            def progress(mark: int) -> None:
+                self._update(task_id, progress=mark)
+                self._emit(task_id, "progress", progress=mark)
+                self.journal.add_checkpoint(
+                    CheckpointRecord(
+                        task_id=forge_task_id,
+                        stage="generation_progress",
+                        agent_id=agent_id,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        checkpoint_reference=f"image/{forge_task_id}/progress-{mark}",
+                        summary=f"Image generation progress {mark}%.",
+                        metadata={"personal_task_id": task_id, "comfyui_prompt_id": prompt_id, "progress": mark},
+                    ),
+                    transition_key=f"personal:{task_id}:checkpoint:image-progress:{mark}",
+                )
+
+            image_ref = wait_for_output(
+                client,
+                prompt_id,
+                timeout_seconds=self.config.image_generation.generation_timeout_seconds,
+                poll_interval_seconds=self.config.image_generation.poll_interval_seconds,
+                progress=progress,
+            )
+            image_bytes = client.retrieve_output(image_ref, self.config.image_generation.max_image_bytes)
+            result = store_artifact(self.config, forge_task_id, prompt_id, payload, image_bytes)
+            result = replace(result, duration_ms=int((monotonic() - started) * 1000))
+            self._update(
+                task_id,
+                progress=100,
+                artifact_dir=result.artifact_dir,
+                image_path=result.image_path,
+                thumbnail_path=result.thumbnail_path,
+                metadata_path=result.metadata_path,
+                checksum_sha256=result.checksum_sha256,
+            )
+            self.journal.add_checkpoint(
+                CheckpointRecord(
+                    task_id=forge_task_id,
+                    stage="artifact_stored",
+                    agent_id=agent_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    checkpoint_reference=f"artifacts/images/{forge_task_id}/metadata.json",
+                    summary="Generated image artifact stored.",
+                    metadata={
+                        "personal_task_id": task_id,
+                        "comfyui_prompt_id": prompt_id,
+                        "preset_id": payload.preset_id,
+                        "seed": payload.seed,
+                        "sha256": result.checksum_sha256,
+                    },
+                ),
+                transition_key=f"personal:{task_id}:checkpoint:image-artifact",
+            )
+            delivery = None
+            if payload.notification_requested:
+                delivery = notify_image_completion(
+                    self.config,
+                    task_id=task_id,
+                    forge_task_id=forge_task_id,
+                    result=result,
+                    dashboard_url=f"/api/images/artifacts/{forge_task_id}/original",
+                )
+            answer = (
+                f"Image generation completed.\n"
+                f"Forge task: {forge_task_id}\n"
+                f"ComfyUI prompt: {prompt_id}\n"
+                f"Preset: {payload.preset_id}\n"
+                f"Seed: {payload.seed}\n"
+                f"Artifact: {result.artifact_dir}\n"
+                f"SHA-256: {result.checksum_sha256}"
+            )
+            if delivery:
+                answer += f"\nDiscord: {delivery['status']}"
+            self._complete(
+                task_id,
+                answer[: self.config.personal.max_output_chars],
+                profile="image_generate",
+                selected_workers=[agent_id],
+                selected_models=[],
+                selected_providers=[],
+                wiki_used=False,
+                wiki_page_ids=[],
+                run_id=run_id,
+                started=started,
+            )
+        except ImageGenerationError as exc:
+            if task.get("task_payload", {}).get("notification_requested"):
+                try:
+                    notify_image_completion(
+                        self.config,
+                        task_id=task_id,
+                        forge_task_id=forge_task_id,
+                        result=None,
+                        failure_category=exc.category,
+                    )
+                except Exception:
+                    pass
+            self._fail(task_id, str(exc), exc.category, started)
 
     def _complete(
         self,

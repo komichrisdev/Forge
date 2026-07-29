@@ -1,0 +1,13 @@
+{
+  "comfyui_root": "C:\\AI\\LocalGen\\app\\ComfyUI_windows_portable\\ComfyUI",
+  "python_exe": "C:\\AI\\LocalGen\\app\\ComfyUI_windows_portable\\python_embeded\\python.exe",
+  "main_py": "C:\\AI\\LocalGen\\app\\ComfyUI_windows_portable\\ComfyUI\\main.py",
+  "comfyui_host": "127.0.0.1",
+  "comfyui_port": 8188,
+  "debian_host": "192.168.2.12",
+  "debian_user": "komichris",
+  "debian_bind": "127.0.0.1",
+  "debian_port": 18188,
+  "identity_file": "",
+  "batch_mode": false
+}

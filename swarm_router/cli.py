@@ -3,13 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event
 from time import monotonic
-from typing import Iterable
+from typing import Any, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import argparse
 import json
+import os
 import re
 import sys
+from urllib import error, request
 
 from .agents import AgentManifest, HandoffEnvelope, default_registry, load_json_object
 from .catalog import ModelCatalog
@@ -17,6 +19,7 @@ from .client import OpenWebUIClient
 from .config import load_config
 from .dashboard import serve
 from .discord_notifications import NotificationStore, deliver, load_config as load_discord_config, notification_from_store
+from .image_generation import ComfyUIClient, PRESET_ID, gallery as image_gallery, preset_summary, validate_image_payload
 from .journal import TaskJournal
 from .orchestrator import SwarmOrchestrator
 from .personal import serve_personal
@@ -163,6 +166,25 @@ def _parser() -> argparse.ArgumentParser:
     notification_show = notification_sub.add_parser("show", help="Show one notification delivery.")
     notification_show.add_argument("notification_id")
     notification_show.add_argument("--json", action="store_true")
+
+    image = sub.add_parser("image", help="Use approved local Forge image generation.")
+    image_sub = image.add_subparsers(dest="image_command", required=True)
+    image_status = image_sub.add_parser("status", help="Show ComfyUI and image artifact status.")
+    image_status.add_argument("--json", action="store_true")
+    image_presets = image_sub.add_parser("presets", help="List approved image presets.")
+    image_presets.add_argument("--json", action="store_true")
+    image_generate = image_sub.add_parser("generate", help="Submit one approved image generation task.")
+    image_generate.add_argument("--prompt", required=True)
+    image_generate.add_argument("--negative-prompt", default="")
+    image_generate.add_argument("--seed")
+    image_generate.add_argument("--notify-discord", action="store_true")
+    image_generate.add_argument("--confirm", default="")
+    image_generate.add_argument("--json", action="store_true")
+    image_jobs = image_sub.add_parser("jobs", help="List recent image generation jobs.")
+    image_jobs.add_argument("--json", action="store_true")
+    image_show = image_sub.add_parser("show", help="Show one image generation Forge task.")
+    image_show.add_argument("forge_task_id")
+    image_show.add_argument("--json", action="store_true")
 
     models = sub.add_parser("models", help="Synchronize and list Open WebUI models with local classifications.")
     models.add_argument("--json", action="store_true")
@@ -363,12 +385,12 @@ def _print_validation(name: str, issues: list[str], as_json: bool) -> int:
 def _run_agent(args: argparse.Namespace) -> int:
     registry = default_registry()
     if args.command == "status":
-        payload = {"forge_version": "0.5-dev", "architecture_revision": "R5", **registry.status()}
+        payload = {"forge_version": "0.12-dev", "architecture_revision": "R12", **registry.status()}
         if args.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
             print(
-                f"Forge 0.5-dev\tArchitecture R5\t"
+                f"Forge 0.12-dev\tArchitecture R12\t"
                 f"agents={payload['agent_count']}\tenabled={payload['enabled_count']}"
             )
         return 0
@@ -625,6 +647,119 @@ def _run_notification(args: argparse.Namespace) -> int:
     return 2
 
 
+def _personal_post(config: Any, body: dict[str, object]) -> dict[str, object]:
+    token = os.environ.get(config.personal.auth_token_env, "")
+    if not token:
+        raise RuntimeError(f"{config.personal.auth_token_env} is required")
+    req = request.Request(
+        f"http://{config.personal.loopback_host}:{config.personal.port}/api/personal-tasks",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        raise RuntimeError(exc.read().decode("utf-8")[:500]) from exc
+    return data if isinstance(data, dict) else {}
+
+
+def _run_image(args: argparse.Namespace) -> int:
+    config = load_config(args.config, require_api_key=False)
+    if args.image_command == "presets":
+        payload = [preset_summary()]
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            item = payload[0]
+            print(f"{item['preset_id']}\t{item['name']}\t{item['width']}x{item['height']}\t{item['model']}")
+        return 0
+    if args.image_command == "status":
+        status = ComfyUIClient(
+            config.image_generation.comfyui_base_url,
+            connect_timeout=config.image_generation.connect_timeout_seconds,
+            request_timeout=config.image_generation.request_timeout_seconds,
+        ).status()
+        payload = {
+            "connection": status.__dict__,
+            "preset": preset_summary(),
+            "artifact_directory": config.image_generation.artifact_directory,
+            "gallery_count": len(image_gallery(config, 100)),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"comfyui\t{status.state}\tqueue={status.queue_depth}\t{status.detail}")
+            print(f"preset\t{PRESET_ID}\tready")
+        return 0 if status.state != "offline" else 1
+    if args.image_command == "generate":
+        if args.confirm != "generate image":
+            raise RuntimeError("Confirmation must be exactly: generate image")
+        payload = validate_image_payload({
+            "preset_id": PRESET_ID,
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+            "seed": args.seed,
+            "notification_requested": args.notify_discord,
+        })
+        task = _personal_post(config, {
+            "model": config.personal.model_id,
+            "messages": [{"role": "user", "content": "Forge CLI image generation request."}],
+            "task_type": "image_generate",
+            "agent_id": "image_generator",
+            "task_payload": payload.__dict__,
+            "metadata": {"cli_action": "image_generate", "manual": True, "task_type": "image_generate"},
+        })
+        if args.json:
+            print(json.dumps(task, indent=2, ensure_ascii=False))
+        else:
+            print(f"{task.get('forge_task_id')}\t{task.get('task_id')}\t{task.get('status')}")
+        return 0
+    journal = TaskJournal(config.swarm.catalog_path)
+    personal_root = Path(config.personal.task_directory).expanduser().resolve()
+    personal: dict[str, dict[str, object]] = {}
+    if personal_root.exists():
+        for path in personal_root.iterdir():
+            data = json.loads((path / "task.json").read_text(encoding="utf-8")) if (path / "task.json").exists() else {}
+            if isinstance(data, dict):
+                personal[path.name] = data
+    rows = []
+    for task in reversed(journal.list_tasks()):
+        events = journal.events(task["task_id"])
+        metadata: dict[str, object] = {}
+        for event in events:
+            metadata.update(event.metadata)
+        personal_task_id = str(metadata.get("personal_task_id") or "")
+        item = personal.get(personal_task_id, {})
+        if item.get("task_type") == "image_generate":
+            rows.append({
+                **task,
+                "personal_task_id": item.get("task_id", ""),
+                **{k: item.get(k, "") for k in ("progress", "preset_id", "seed", "comfyui_prompt_id", "artifact_dir", "checksum_sha256")},
+            })
+    if args.image_command == "jobs":
+        if args.json:
+            print(json.dumps(rows[:50], indent=2, ensure_ascii=False))
+        else:
+            for row in rows[:50]:
+                print(f"{row['task_id']}\t{row['status']}\tprogress={row.get('progress','')}\tprompt={row.get('comfyui_prompt_id','')}")
+        return 0
+    if args.image_command == "show":
+        row = next((item for item in rows if item["task_id"] == args.forge_task_id), None)
+        if row is None:
+            raise RuntimeError(f"Unknown image task: {args.forge_task_id}")
+        detail = {"task": row, "events": [event.to_dict() for event in journal.events(args.forge_task_id)], "checkpoints": [item.to_dict() for item in journal.checkpoints(args.forge_task_id)]}
+        if args.json:
+            print(json.dumps(detail, indent=2, ensure_ascii=False))
+        else:
+            print(f"{row['task_id']}\t{row['status']}\t{row.get('artifact_dir','')}")
+            print(f"prompt_id\t{row.get('comfyui_prompt_id','')}")
+            print(f"sha256\t{row.get('checksum_sha256','')}")
+        return 0
+    return 2
+
+
 def _provider_rows(catalog: ModelCatalog, provider_id: str) -> list[dict[str, object]]:
     return [item for item in catalog.provider_status()["models"] if item["provider_id"] == provider_id]
 
@@ -706,6 +841,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_discord(args)
         if args.command == "notification":
             return _run_notification(args)
+        if args.command == "image":
+            return _run_image(args)
         config = load_config(args.config)
         client = OpenWebUIClient(
             config.openwebui.base_url,

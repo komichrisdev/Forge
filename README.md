@@ -169,8 +169,9 @@ owui-swarm serve
 Open `http://127.0.0.1:8787` locally or the deployed LAN URL documented in
 [docs/FORGE_LAN_DASHBOARD.md](docs/FORGE_LAN_DASHBOARD.md). The Forge dashboard
 is for operations: health, schedules, journal history, Night Owl, Discord
-notifications, providers, agents, and approved manual task dispatch. It is not a
-replacement chat UI.
+notifications, providers, agents, approved manual task dispatch, and the fixed
+local FLUX Schnell 768 image-generation workflow. It is not a replacement chat
+UI.
 
 Open WebUI remains the direct model-conversation interface:
 
@@ -191,6 +192,12 @@ systemctl --user status owui-swarm-dashboard.service
 
 The dashboard shows operational state and keeps secrets out of HTML, JSON,
 SQLite, and logs.
+
+The Image Generation page submits only the approved `flux-schnell-768-daily`
+task through the personal backend. Completed outputs are indexed under
+`~/.local/share/owui-swarm/artifacts/images/<forge-task-id>/` and served only
+through authenticated dashboard artifact routes. See
+[docs/FORGE_LOCAL_IMAGE_GENERATION.md](docs/FORGE_LOCAL_IMAGE_GENERATION.md).
 
 ## Personal task backend
 
@@ -310,6 +317,23 @@ Windows.
 For the read-only MCP endpoint on `8790`, use
 [`docs/windows/start-swarm-mcp-tunnel.ps1`](docs/windows/start-swarm-mcp-tunnel.ps1)
 so the forwarded listener stays on `127.0.0.1` only.
+
+## Local image generation
+
+Forge includes a narrow local image-generation MVP for one approved preset:
+`flux-schnell-768-daily` (FLUX Schnell FP8, 768x768, one image).
+
+```bash
+owui-swarm image status
+owui-swarm image presets
+owui-swarm image generate --prompt "neutral validation image" --confirm "generate image"
+```
+
+ComfyUI stays on Windows loopback. Use the Windows companion bundle in
+[`windows/forge-image-worker/`](windows/forge-image-worker/) to expose it only
+to Debian loopback as `http://127.0.0.1:18188`.
+
+Details: [`docs/FORGE_LOCAL_IMAGE_GENERATION.md`](docs/FORGE_LOCAL_IMAGE_GENERATION.md).
 
 ## Security boundaries
 

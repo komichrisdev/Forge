@@ -1,7 +1,7 @@
 # Forge LAN Dashboard
 
-Forge Version: `0.11-dev`
-Architecture Revision: `R11`
+Forge Version: `0.12-dev`
+Architecture Revision: `R12`
 
 The Forge LAN dashboard is the owner-operated operations interface for the Debian Forge server. It shows existing Forge state and exposes a small set of controlled actions. It is not a chat UI, a public admin panel, or a multi-user application.
 
@@ -9,7 +9,7 @@ The Forge LAN dashboard is the owner-operated operations interface for the Debia
 
 Forge has two browser interfaces:
 
-- Forge Dashboard: operations, health, schedules, task history, Night Owl, notifications, agents, providers, and approved dispatch.
+- Forge Dashboard: operations, health, schedules, task history, Night Owl, notifications, agents, providers, approved dispatch, and approved local image generation.
 - Open WebUI: direct model conversation, model selection, and file-assisted chat where Open WebUI already supports it.
 
 Deployed URLs:
@@ -72,6 +72,7 @@ Login creates an HTTP-only same-site session cookie with expiration. All write a
 - Agents: read-only logical agent registry.
 - Providers: provider health, inventory revisions, model capability metadata, quarantine/availability state.
 - Dispatch: approved manual Forge task dispatch.
+- Image Generation: fixed FLUX Schnell 768 Daily form, ComfyUI connection state, recent image tasks, and indexed artifact gallery.
 
 ## Controlled actions
 
@@ -86,6 +87,8 @@ Writes are deliberately narrow:
 Every write requires login, CSRF, and an exact confirmation string. Schedule writes use `ScheduleStore`/`Scheduler`; task dispatch uses the personal-task API path. The dashboard does not invoke shell runners directly.
 
 The dispatch allowlist currently supports only Night Owl. Payloads are structured and validated by the existing Night Owl validator. Arbitrary shell commands, executable paths, URLs, and secret fields are rejected.
+
+Image generation uses its own fixed allowlist. The dashboard submits `image_generate` tasks through the personal backend; it never posts raw ComfyUI workflows or filesystem paths.
 
 ## Night Owl controls
 
@@ -159,9 +162,16 @@ This does not affect:
 - Night Owl schedule state;
 - Discord notification delivery records.
 
+## Image Generation
+
+Implemented in the local image-generation MVP as the `Image Generation` page.
+It submits only the approved `flux-schnell-768-daily` Forge task type through
+the personal backend and serves only indexed artifacts.
+
+The production dashboard validation generated `FT-20260728-000008`, displayed it in the gallery, opened its authenticated full-resolution artifact, and rejected unauthenticated artifact access.
+
 ## Deferred
 
-- image-generation panel;
 - Codex delegation panel;
 - inbound Discord control;
 - public internet access;

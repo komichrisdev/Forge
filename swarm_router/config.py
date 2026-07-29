@@ -90,6 +90,17 @@ class SchedulerConfig:
 
 
 @dataclass(frozen=True)
+class ImageGenerationConfig:
+    comfyui_base_url: str
+    artifact_directory: str
+    connect_timeout_seconds: int
+    request_timeout_seconds: int
+    generation_timeout_seconds: int
+    max_image_bytes: int
+    poll_interval_seconds: float
+
+
+@dataclass(frozen=True)
 class AuthorityConfig:
     supervisor_name: str
     worker_trust: str
@@ -114,6 +125,7 @@ class AppConfig:
     dashboard: DashboardConfig
     personal: PersonalConfig
     scheduler: SchedulerConfig
+    image_generation: ImageGenerationConfig
     authority: AuthorityConfig
     judge: AgentConfig
     workers: tuple[AgentConfig, ...]
@@ -135,6 +147,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
     dash = raw.get("dashboard", {})
     personal_raw = raw.get("personal", {})
     scheduler_raw = raw.get("scheduler", {})
+    image_raw = raw.get("image_generation", {})
     probe_raw = raw.get("probe", {})
     reliability_raw = raw.get("reliability", {})
     authority_raw = raw.get("authority", {})
@@ -213,6 +226,17 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
         lease_seconds=max(5, int(scheduler_raw.get("lease_seconds", 60))),
         timezone=str(scheduler_raw.get("timezone", "UTC")),
     )
+    image_generation = ImageGenerationConfig(
+        comfyui_base_url=str(image_raw.get("comfyui_base_url", "http://127.0.0.1:18188")).rstrip("/"),
+        artifact_directory=str(
+            image_raw.get("artifact_directory", "~/.local/share/owui-swarm/artifacts/images")
+        ),
+        connect_timeout_seconds=max(1, int(image_raw.get("connect_timeout_seconds", 3))),
+        request_timeout_seconds=max(1, int(image_raw.get("request_timeout_seconds", 15))),
+        generation_timeout_seconds=max(10, int(image_raw.get("generation_timeout_seconds", 900))),
+        max_image_bytes=max(1024, int(image_raw.get("max_image_bytes", 25 * 1024 * 1024))),
+        poll_interval_seconds=max(0.1, float(image_raw.get("poll_interval_seconds", 2.0))),
+    )
     authority = AuthorityConfig(
         supervisor_name=str(authority_raw.get("supervisor_name", "Codex")),
         worker_trust=str(authority_raw.get("worker_trust", "low")),
@@ -264,6 +288,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
         dashboard=dashboard,
         personal=personal,
         scheduler=scheduler,
+        image_generation=image_generation,
         authority=authority,
         judge=judge,
         workers=tuple(workers),

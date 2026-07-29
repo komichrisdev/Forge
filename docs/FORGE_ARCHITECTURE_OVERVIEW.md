@@ -1,7 +1,7 @@
 # Forge Architecture Overview
 
-Forge Version: `0.11-dev`
-Architecture Revision: `R11`
+Forge Version: `0.12-dev`
+Architecture Revision: `R12`
 
 This is the starting point for developers new to Forge. It describes the platform shape and the intended boundaries between agents, providers, routing, execution, and future resilience work. It deliberately avoids implementation details.
 
@@ -47,6 +47,7 @@ Forge
 │   ├── Judge
 │   └── Future Agents
 ├── Dashboard
+├── Local Image Generation
 ├── CLI
 └── Open WebUI
 ```
@@ -63,6 +64,7 @@ Core contains the platform services that should remain stable as providers and a
 - Tool Runtime: will mediate access to external actions. It should enforce permissions, idempotency, auditability, and fail-safe behavior.
 - Notifications: sends outbound operational messages through Forge-owned delivery records and deduplication. Discord is the first notifier. See [FORGE_DISCORD_NOTIFICATIONS.md](FORGE_DISCORD_NOTIFICATIONS.md).
 - Dashboard: provides the owner-operated LAN operations surface for health, task history, schedules, Night Owl, notifications, agents, providers, and approved manual dispatch. See [FORGE_LAN_DASHBOARD.md](FORGE_LAN_DASHBOARD.md).
+- Local Image Generation: submits one approved Forge task type to a fixed Windows ComfyUI preset through a reverse SSH tunnel, stores image artifacts outside SQLite, and exposes only indexed artifacts. See [FORGE_LOCAL_IMAGE_GENERATION.md](FORGE_LOCAL_IMAGE_GENERATION.md).
 
 ### Providers
 

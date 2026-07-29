@@ -24,14 +24,22 @@ import base64
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_DASHBOARD_BODY_BYTES = 64 * 1024
 SESSION_SECONDS = 12 * 60 * 60
-FORGE_VERSION = "0.11-dev"
-ARCHITECTURE_REVISION = "R11"
+FORGE_VERSION = "0.12-dev"
+ARCHITECTURE_REVISION = "R12"
 
 from .agents import default_registry
 from .catalog import ModelCatalog
 from .client import OpenWebUIClient
 from .config import AppConfig
 from .discord_notifications import NotificationStore, load_config as load_discord_config
+from .image_generation import (
+    ComfyUIClient,
+    PRESET_ID,
+    artifact_file,
+    gallery as image_gallery,
+    preset_summary,
+    validate_image_payload,
+)
 from .journal import TaskJournal
 from .night_owl import default_state_dir, forge_script_root, validate_night_owl_payload
 from .orchestrator import SwarmOrchestrator
@@ -92,7 +100,7 @@ FORGE_HTML = r'''<!doctype html>
 </style></head><body>
 <header><div><h1>Forge LAN Operations</h1><div class="muted">Owner-operated dashboard for local Forge automation.</div></div><div class="row"><a id="openwebui" href="#" target="_blank" rel="noreferrer">Open WebUI</a><button id="refresh">Refresh</button><button id="logout">Logout</button></div></header>
 <section id="login" class="panel login"><h2>Owner login</h2><p class="muted">Use the dashboard secret from the local Forge configuration.</p><input id="secret" type="password" autocomplete="current-password" style="width:100%" placeholder="Dashboard secret"><div class="row" style="margin-top:10px"><button id="loginButton">Login</button><span id="loginStatus" class="muted"></span></div></section>
-<nav id="nav" class="hide" aria-label="Dashboard views"><button data-view="overview" aria-current="true">Overview</button><button data-view="tasks">Tasks</button><button data-view="schedules">Schedules</button><button data-view="nightowl">Night Owl</button><button data-view="notifications">Notifications</button><button data-view="agents">Agents</button><button data-view="providers">Providers</button><button data-view="dispatch">Dispatch</button></nav>
+<nav id="nav" class="hide" aria-label="Dashboard views"><button data-view="overview" aria-current="true">Overview</button><button data-view="images">Image Generation</button><button data-view="tasks">Tasks</button><button data-view="schedules">Schedules</button><button data-view="nightowl">Night Owl</button><button data-view="notifications">Notifications</button><button data-view="agents">Agents</button><button data-view="providers">Providers</button><button data-view="dispatch">Dispatch</button></nav>
 <main id="app" class="hide"><div id="content" class="panel">Loading…</div></main>
 <script>
 let csrf='',view='overview',cache={};
@@ -105,7 +113,7 @@ async function session(){try{const d=await api('/api/session');csrf=d.csrf_token
 function card(k,v,s=''){return `<section class="panel"><div class="muted">${esc(k)}</div><strong class="${cls(s||v)}">${esc(v)}</strong></section>`}
 function table(rows,cols){return `<table><thead><tr>${cols.map(c=>`<th>${esc(c[0])}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[1](r)}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${cols.length}" class="muted">No rows.</td></tr>`}</tbody></table>`}
 async function load(){try{cache[view]=await api('/api/'+view.replace('nightowl','night-owl'));render()}catch(e){$('content').innerHTML=`<p class="failed">${esc(e.message)}</p>`}}
-function render(){const d=cache[view]||{};if(view==='overview')return renderOverview(d);if(view==='tasks')return renderTasks(d);if(view==='schedules')return renderSchedules(d);if(view==='nightowl')return renderNightOwl(d);if(view==='notifications')return renderNotifications(d);if(view==='agents')return renderAgents(d);if(view==='providers')return renderProviders(d);renderDispatch(d)}
+function render(){const d=cache[view]||{};if(view==='overview')return renderOverview(d);if(view==='images')return renderImages(d);if(view==='tasks')return renderTasks(d);if(view==='schedules')return renderSchedules(d);if(view==='nightowl')return renderNightOwl(d);if(view==='notifications')return renderNotifications(d);if(view==='agents')return renderAgents(d);if(view==='providers')return renderProviders(d);renderDispatch(d)}
 function renderOverview(d){$('openwebui').href=d.openwebui?.url||'#';$('content').innerHTML=`<h2>Overview</h2><div class="grid">${card('Forge',`${d.forge_version} / ${d.architecture_revision}`)+card('Personal backend',d.personal_backend?.status||'unknown')+card('Scheduler service',d.scheduler_service?.status||'unknown')+card('Dashboard service',d.dashboard_service?.status||'unknown')+card('Open WebUI',d.openwebui?.status||'unknown')+card('Night Owl',`${d.night_owl?.enabled?'enabled':'disabled'} · ${d.night_owl?.next_run_at||'no next run'}`,d.night_owl?.enabled?'enabled':'disabled')+card('Discord',d.discord?.valid?'configured':'not configured',d.discord?.valid?'healthy':'failed')+card('Notifications',d.discord?.latest_delivery?.status||'none')+card('Providers',`${d.providers?.provider_count||0} providers / ${d.providers?.model_count||0} models`)+card('Quarantined models',d.providers?.quarantined_model_count||0,d.providers?.quarantined_model_count?'warning':'healthy')+card('Active tasks',d.tasks?.active_count||0,d.tasks?.active_count?'warning':'healthy')+card('Failed tasks',d.tasks?.failed_count||0,d.tasks?.failed_count?'failed':'healthy')+card('Suspected orphans',d.tasks?.suspected_orphan_count||0,d.tasks?.suspected_orphan_count?'warning':'healthy')}</div><pre>${esc(JSON.stringify(d,null,2))}</pre>`}
 function renderTasks(d){$('content').innerHTML=`<h2>Tasks</h2>${table(d.tasks||[],[['Forge task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Personal',r=>esc(r.personal_task_id||'')],['Type',r=>esc(r.task_type||'')],['Agent',r=>esc((r.agents||[]).join(', ')||r.agent_id||'')],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Created',r=>esc(r.created_at||'')],['Schedule',r=>esc(r.schedule_id||'')],['Recovery',r=>esc(r.recovery_status?.replay_safety||'')]])}<div id="detail"></div>`}
 async function taskDetail(id){const d=await api('/api/tasks/'+encodeURIComponent(id));$('detail').innerHTML=`<h3>${esc(id)}</h3><h4>Events</h4>${table(d.events||[],[['Time',r=>esc(r.timestamp)],['Event',r=>esc(r.event_type)],['Agent',r=>esc(r.agent_id)],['Stage',r=>esc(r.stage)],['Side effect',r=>esc(r.side_effect_state)],['Message',r=>esc(r.message)]])}<h4>Checkpoints</h4><pre>${esc(JSON.stringify(d.checkpoints||[],null,2))}</pre><h4>Task</h4><pre>${esc(JSON.stringify(d.personal_task||{},null,2))}</pre>`}
@@ -116,6 +124,8 @@ function renderNightOwl(d){$('content').innerHTML=`<h2>Night Owl</h2><div class=
 function renderNotifications(d){$('content').innerHTML=`<h2>Notifications</h2>${(d.unknown||[]).length?'<p class="warning">Unknown deliveries require manual review.</p>':''}${table(d.notifications||[],[['ID',r=>esc(r.notification_id)],['Event',r=>esc(r.event_type)],['Severity',r=>esc(r.severity)],['State',r=>`<span class="${cls(r.status)}">${esc(r.status)} / ${esc(r.side_effect_state)}</span>`],['Task',r=>esc(r.forge_task_id||r.task_id||'')],['Time',r=>esc(r.created_at)],['External',r=>esc(r.external_message_id||'')],['Error',r=>esc(r.error_summary||'')]])}`}
 function renderAgents(d){$('content').innerHTML=`<h2>Agents</h2>${table(d.agents||[],[['ID',r=>esc(r.agent_id)],['Name',r=>esc(r.display_name)],['Enabled',r=>esc(r.enabled)],['Task types',r=>esc((r.supported_task_types||[]).join(', '))],['Version',r=>esc(r.version)],['Description',r=>esc(r.description)]])}`}
 function renderProviders(d){$('content').innerHTML=`<h2>Providers</h2>${table(d.providers||[],[['Provider',r=>esc(r.provider_id)],['Health',r=>`<span class="${cls(r.health)}">${esc(r.health)}</span>`],['Revision',r=>esc(r.inventory_revision)],['Last refresh',r=>esc(r.last_refresh_attempt||'')],['Cooldown',r=>esc(r.cooldown_until||'')]])}<h3>Models</h3>${table(d.models||[],[['Provider',r=>esc(r.provider_id)],['Model',r=>esc(r.model_id)],['Health',r=>esc(r.health)],['Capabilities',r=>esc((r.capabilities||[]).join(', '))],['Flags',r=>esc(`${r.quarantined?'quarantined ':''}${r.available?'available':'disabled'}`)]])}`}
+async function imageSubmit(){const body={preset_id:'flux-schnell-768-daily',prompt:$('imagePrompt').value,negative_prompt:$('imageNegative').value,seed:$('imageSeed').value,notification_requested:$('imageDiscord').checked,confirm:$('imageConfirm').value};const d=await api('/api/images/generate',{method:'POST',body:JSON.stringify(body)});$('imageResult').textContent=JSON.stringify(d,null,2);await load()}
+function renderImages(d){$('content').innerHTML=`<h2>Image Generation</h2><div class="grid">${card('ComfyUI',d.connection?.state||'unknown')+card('Queue depth',d.connection?.queue_depth??0)+card('Worker',d.worker_state||'unknown')+card('Preset',d.preset?.name||'FLUX Schnell 768 Daily')}</div><section class="panel"><label>Preset</label><input value="FLUX Schnell 768 Daily" disabled style="width:100%"><label>Prompt</label><textarea id="imagePrompt" maxlength="1200" style="width:100%;min-height:100px"></textarea><label>Negative prompt</label><textarea id="imageNegative" maxlength="1200" style="width:100%;min-height:70px"></textarea><div class="row"><div><label>Seed</label><input id="imageSeed" inputmode="numeric" placeholder="random"></div><label><input id="imageDiscord" type="checkbox"> Discord notification</label></div><label>Confirmation</label><input id="imageConfirm" placeholder="generate image" style="width:100%"><div class="actions" style="margin-top:10px"><button onclick="imageSubmit()">Generate</button></div><pre id="imageResult"></pre></section><h3>Active and Recent</h3>${table(d.tasks||[],[['Task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Progress',r=>esc((r.progress??'')+'')],['Preset',r=>esc(r.preset_id||'')],['Seed',r=>esc(r.seed||'')],['Prompt ID',r=>esc(r.comfyui_prompt_id||'')]])}<div id="detail"></div><h3>Gallery</h3><div class="grid">${(d.gallery||[]).map(g=>`<section class="panel"><a href="${esc(g.image_url)}" target="_blank" rel="noreferrer"><img src="${esc(g.thumbnail_url)}" alt="" style="max-width:100%;height:auto"></a><div><b>${esc(g.forge_task_id)}</b></div><div class="muted">${esc(g.prompt_summary||'')}</div><div>${esc(g.preset_id)} · seed ${esc(g.seed)}</div><div class="actions"><a href="${esc(g.image_url)}" download>Download</a><button onclick="taskDetail('${esc(g.forge_task_id)}')">Journal</button></div></section>`).join('')||'<p class="muted">No generated images.</p>'}</div>`}
 async function dispatch(action){const body={task_type:$('taskType').value,mode:$('dispatchMode').value,confirm:$('dispatchConfirm').value};const d=await api('/api/dispatch',{method:'POST',body:JSON.stringify(body)});$('dispatchResult').textContent=JSON.stringify(d,null,2)}
 function renderDispatch(){ $('content').innerHTML=`<h2>Dispatch approved Forge task</h2><p class="muted">Only approved task types are available. No shell commands or arbitrary paths are accepted.</p><label>Task type</label><select id="taskType"><option value="night_owl">Night Owl</option></select><label>Mode</label><select id="dispatchMode"><option value="dry_run">dry-run</option><option value="live">live</option></select><label>Confirmation</label><input id="dispatchConfirm" style="width:100%" placeholder="dry-run: run night owl dry-run; live: RUN NIGHT OWL LIVE"><div class="actions" style="margin-top:10px"><button onclick="dispatch()">Submit task</button></div><pre id="dispatchResult"></pre>`}
 $('loginButton').onclick=login;$('secret').onkeydown=e=>{if(e.key==='Enter')login()};$('refresh').onclick=load;$('logout').onclick=async()=>{await api('/api/logout',{method:'POST',body:'{}'}).catch(()=>{});csrf='';session()};document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{view=b.dataset.view;document.querySelectorAll('nav button').forEach(x=>x.setAttribute('aria-current',x===b?'true':'false'));load()});session();
@@ -474,7 +484,46 @@ class DashboardApp:
                 "failed_count": sum(1 for item in tasks if item["status"] == "failed"),
                 "suspected_orphan_count": len(self.journal.orphan_candidates()),
             },
+            "image_generation": self.image_status(),
         }
+
+    def image_status(self) -> dict[str, Any]:
+        status = ComfyUIClient(
+            self.config.image_generation.comfyui_base_url,
+            connect_timeout=self.config.image_generation.connect_timeout_seconds,
+            request_timeout=self.config.image_generation.request_timeout_seconds,
+        ).status()
+        image_tasks = []
+        for item in self.task_rows():
+            personal = item.get("personal_task_id", "")
+            task = self._personal_index().get(str(personal), {})
+            if task.get("task_type") == "image_generate":
+                image_tasks.append({**item, **{k: task.get(k, "") for k in ("progress", "preset_id", "seed", "comfyui_prompt_id")}})
+        return _sanitize({
+            "connection": status.__dict__,
+            "worker_state": "configured" if self.config.image_generation.comfyui_base_url else "missing_config",
+            "preset": preset_summary(),
+            "gallery": image_gallery(self.config),
+            "tasks": image_tasks[:20],
+        })
+
+    def dispatch_image(self, body: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"preset_id", "prompt", "negative_prompt", "seed", "notification_requested", "confirm"}
+        if set(body) - allowed:
+            raise ValueError("Unknown image fields are not allowed.")
+        if str(body.get("confirm", "")) != "generate image":
+            raise ValueError("Confirmation must be exactly: generate image")
+        payload = validate_image_payload({k: body[k] for k in body if k != "confirm"})
+        task = self._submit_personal_task({
+            "model": self.config.personal.model_id,
+            "messages": [{"role": "user", "content": "Forge dashboard image generation request."}],
+            "task_type": "image_generate",
+            "agent_id": "image_generator",
+            "task_payload": payload.__dict__,
+            "metadata": {"dashboard_action": "image_generate", "manual": True, "task_type": "image_generate"},
+        })
+        self._audit("image_generate", "owner", True, str(task.get("task_id") or ""), str(task.get("forge_task_id") or ""))
+        return _sanitize(task)
 
     def task_rows(self) -> list[dict[str, Any]]:
         personal = self._personal_index()
@@ -756,6 +805,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"authenticated": bool(session), "csrf_token": str(session.get("csrf", "")) if session else ""}
         if path == "/api/overview":
             return self.app.overview()
+        if path == "/api/images":
+            return self.app.image_status()
         if path == "/api/tasks":
             return {"tasks": self.app.task_rows()}
         if path.startswith("/api/tasks/"):
@@ -793,6 +844,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.app.dispatch_night_owl(live=True, confirm=str(body.get("confirm", "")))
         if path == "/api/dispatch":
             return self.app.dispatch(body)
+        if path == "/api/images/generate":
+            return self.app.dispatch_image(body)
         if path == "/api/models/sync":
             return {"models": self.app.sync_models()}
         if path == "/api/models/probe":
@@ -819,6 +872,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._authorized():
             self._json(401, {"error": "Dashboard token required."})
+            return
+        if path.startswith("/api/images/artifacts/"):
+            try:
+                parts = path.removeprefix("/api/images/artifacts/").split("/")
+                file_path, content_type = artifact_file(self.app.config, parts[0], parts[1] if len(parts) > 1 else "original")
+                payload = file_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self._headers()
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception:
+                self._json(404, {"error": "Not found."})
             return
         try:
             self._json(200, self._route_get(path))
@@ -854,7 +921,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "CSRF token required."})
             return
         try:
-            status = 202 if path in {"/api/runs", "/api/night-owl/dry-run", "/api/night-owl/live", "/api/dispatch"} or path.endswith("/run-now") else 200
+            status = 202 if path in {"/api/runs", "/api/night-owl/dry-run", "/api/night-owl/live", "/api/dispatch", "/api/images/generate"} or path.endswith("/run-now") else 200
             self._json(status, self._route_post(path, self._body()))
         except FileNotFoundError:
             self._json(404, {"error": "Not found."})

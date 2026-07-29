@@ -1,7 +1,7 @@
 # Forge Agent Registry
 
-Forge Version: `0.11-dev`
-Architecture Revision: `R11`
+Forge Version: `0.12-dev`
+Architecture Revision: `R12`
 
 The Agent Registry is the first implementation of Forge's logical agent system. It defines permanent agent identities separately from providers and models.
 
@@ -17,6 +17,7 @@ A logical agent is a stable Forge identity with a purpose and authority boundary
 - `researcher`
 - `judge`
 - `manager`
+- `image_generator`
 
 Logical agents do not name models. A model is temporary execution capacity selected later by the Router.
 

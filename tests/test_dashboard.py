@@ -213,12 +213,15 @@ class DashboardTest(unittest.TestCase):
         with patch("swarm_router.dashboard.subprocess.run", return_value=type("R", (), {"stdout": "active\n", "stderr": "", "returncode": 0})()):
             status, overview, _ = self.call("/api/overview", cookie=cookie)
             self.assertEqual(status, 200)
-            self.assertEqual(overview["forge_version"], "0.11-dev")
+            self.assertEqual(overview["forge_version"], "0.12-dev")
             self.assertEqual(overview["night_owl"]["schedule_id"], "FS-20260728-000001")
         for path in ("/api/tasks", f"/api/tasks/{forge_task_id}", "/api/schedules", "/api/night-owl", "/api/notifications", "/api/agents", "/api/providers"):
             status, data, _ = self.call(path, cookie=cookie)
             self.assertEqual(status, 200, path)
             self.assertIsInstance(data, dict)
+        status, data, _ = self.call("/api/images", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["preset"]["preset_id"], "flux-schnell-768-daily")
         self.assertIn("viewport", request.urlopen(self.base + "/", timeout=3).read().decode("utf-8"))
 
     def test_schedule_actions_and_night_owl_dispatch_controls(self) -> None:
@@ -243,6 +246,22 @@ class DashboardTest(unittest.TestCase):
         status, dry_run, _ = self.call("/api/night-owl/dry-run", method="POST", cookie=cookie, csrf=csrf, body={"confirm": "run night owl dry-run"})
         self.assertEqual(status, 202)
         self.assertTrue(dry_run["task_payload"]["dry_run"])
+        status, image_task, _ = self.call(
+            "/api/images/generate",
+            method="POST",
+            cookie=cookie,
+            csrf=csrf,
+            body={
+                "preset_id": "flux-schnell-768-daily",
+                "prompt": "daily validation image",
+                "seed": "11",
+                "notification_requested": False,
+                "confirm": "generate image",
+            },
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(image_task["task_payload"]["seed"], 11)
+        self.assertEqual(self.call("/api/images/generate", method="POST", cookie=cookie, body={})[0], 403)
         self.assertEqual(self.call("/api/night-owl/live", method="POST", cookie=cookie, csrf=csrf, body={"confirm": "run night owl live"})[0], 400)
         self.assertEqual(self.call("/api/dispatch", method="POST", cookie=cookie, csrf=csrf, body={"task_type": "night_owl", "mode": "dry_run", "confirm": "run night owl dry-run", "command": "bad"})[0], 400)
 

@@ -68,6 +68,17 @@ poll_interval_seconds = 30
 lease_seconds = 60
 timezone = "UTC"
 
+[image_generation]
+# Preferred production path: Windows ComfyUI remains bound to 127.0.0.1:8188
+# and a Windows-initiated reverse SSH tunnel exposes it only on Debian loopback.
+comfyui_base_url = "http://127.0.0.1:18188"
+artifact_directory = "~/.local/share/owui-swarm/artifacts/images"
+connect_timeout_seconds = 3
+request_timeout_seconds = 15
+generation_timeout_seconds = 900
+max_image_bytes = 26214400
+poll_interval_seconds = 2.0
+
 [authority]
 supervisor_name = "Codex"
 worker_trust = "low"
