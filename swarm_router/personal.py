@@ -20,6 +20,7 @@ import uuid
 from .catalog import ModelCatalog, ModelRecord
 from .config import AppConfig
 from .dashboard import DashboardApp
+from .developer import DEVELOPER_MODEL_ID, DeveloperCoordinator, DeveloperError
 from .discord_notifications import DiscordError, notify_night_owl
 from .image_generation import (
     ComfyUIClient,
@@ -325,6 +326,7 @@ class PersonalTaskManager:
         self.catalog = ModelCatalog(config.swarm.catalog_path)
         self.journal = TaskJournal(config.swarm.catalog_path)
         self.dashboard = DashboardApp(config)
+        self.developer = getattr(self.dashboard, "developer", None) or DeveloperCoordinator(config)
         self.root = Path(config.personal.task_directory).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=TASK_DIR_MODE)
         self.root.chmod(TASK_DIR_MODE)
@@ -1414,6 +1416,51 @@ class PersonalHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             self.manager.cancel(task_id)
 
+    def _developer_response(self, body: dict[str, Any]) -> None:
+        response = self.manager.developer.complete(body)
+        if not body.get("stream", False):
+            self._json(200, response)
+            return
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        choice = response["choices"][0]
+        message = choice["message"]
+        base = {
+            "id": response["id"],
+            "object": "chat.completion.chunk",
+            "created": response.get("created", 0),
+            "model": DEVELOPER_MODEL_ID,
+        }
+        deltas = [{"role": "assistant"}]
+        finish = choice.get("finish_reason") or "stop"
+        if message.get("tool_calls"):
+            deltas.append({
+                "tool_calls": [
+                    {"index": index, **call}
+                    for index, call in enumerate(message["tool_calls"])
+                ]
+            })
+            finish = "tool_calls"
+        elif message.get("content") is not None:
+            deltas.append({"content": str(message["content"])})
+        try:
+            for delta in deltas:
+                chunk = {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+            final = {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}
+            self.wfile.write(f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self.manager.developer.cancel(
+                str(response.get("forge_task_id", "")),
+                "OpenAI streaming client disconnected.",
+            )
+
     def do_GET(self) -> None:
         path = unquote(urlparse(self.path).path)
         try:
@@ -1423,6 +1470,7 @@ class PersonalHandler(BaseHTTPRequestHandler):
                     {
                         "status": "ok",
                         "model_id": self.manager.config.personal.model_id,
+                        "model_ids": [self.manager.config.personal.model_id, DEVELOPER_MODEL_ID],
                         "port": self.manager.config.personal.port,
                     },
                 )
@@ -1441,7 +1489,13 @@ class PersonalHandler(BaseHTTPRequestHandler):
                                 "object": "model",
                                 "created": 0,
                                 "owned_by": "openwebui-codex-swarm",
-                            }
+                            },
+                            {
+                                "id": DEVELOPER_MODEL_ID,
+                                "object": "model",
+                                "created": 0,
+                                "owned_by": "openwebui-codex-swarm",
+                            },
                         ],
                     },
                 )
@@ -1468,7 +1522,11 @@ class PersonalHandler(BaseHTTPRequestHandler):
                 self._error(401, "Bearer token required.", "unauthorized")
                 return
             if path == "/v1/chat/completions":
-                body = {key: value for key, value in self._body().items() if key not in OPENAI_COMPAT_IGNORED_FIELDS}
+                raw_body = self._body()
+                if raw_body.get("model") == DEVELOPER_MODEL_ID:
+                    self._developer_response(raw_body)
+                    return
+                body = {key: value for key, value in raw_body.items() if key not in OPENAI_COMPAT_IGNORED_FIELDS}
                 task = self.manager.create_task(body)
                 request_id = f"chatcmpl-{task['task_id']}"
                 created = _epoch_seconds(str(task["created_at"]))
@@ -1525,6 +1583,8 @@ class PersonalHandler(BaseHTTPRequestHandler):
                 return
             self._error(404, "Not found.", "not_found")
         except PersonalError as exc:
+            self._error(exc.status, str(exc), exc.code)
+        except DeveloperError as exc:
             self._error(exc.status, str(exc), exc.code)
 
 

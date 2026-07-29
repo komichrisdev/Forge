@@ -122,10 +122,10 @@ system = "verifier"
 def seed_catalog(config: AppConfig) -> None:
     catalog = ModelCatalog(config.swarm.catalog_path)
     entries = [
-        {"id": "fake/qwen-planner-instruct", "provider": "fake"},
-        {"id": "fake/mistral-critic-instruct", "provider": "fake"},
-        {"id": "fake/qwen-verifier-reason", "provider": "fake"},
-        {"id": "fake/deepseek-judge-reason", "provider": "fake"},
+        {"id": "fake/qwen-planner-instruct", "provider": "fake", "supports_tools": True},
+        {"id": "fake/mistral-critic-instruct", "provider": "fake", "supports_tools": True},
+        {"id": "fake/qwen-verifier-reason", "provider": "fake", "supports_tools": True},
+        {"id": "fake/deepseek-judge-reason", "provider": "fake", "supports_tools": True},
     ]
     catalog.sync(entries)
     for item in entries:
@@ -222,6 +222,10 @@ class PersonalApiTest(unittest.TestCase):
         status, payload = self.api("GET", "/v1/models")
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"][0]["id"], "swarm-personal")
+        self.assertEqual(
+            [item["id"] for item in payload["data"]],
+            ["swarm-personal", "swarm-developer"],
+        )
 
     def test_non_stream_completion_and_task_endpoint(self) -> None:
         with patch("swarm_router.personal.SwarmOrchestrator.run", return_value=("Weekly plan", self.root, {"answer": "Weekly plan"})):

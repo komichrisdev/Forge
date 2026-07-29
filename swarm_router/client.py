@@ -23,6 +23,16 @@ class RequestFailure(RuntimeError):
 
 
 class OpenWebUIClient:
+    COMPLETION_FIELDS = {
+        "model",
+        "messages",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "temperature",
+        "max_tokens",
+    }
+
     def __init__(
         self,
         base_url: str,
@@ -110,6 +120,31 @@ class OpenWebUIClient:
 
     def list_models(self) -> list[str]:
         return sorted({str(item.get("id") or item.get("name")) for item in self.list_model_entries()})
+
+    def completion(
+        self,
+        payload: dict[str, Any],
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        request_payload = {
+            key: value for key, value in payload.items() if key in self.COMPLETION_FIELDS
+        }
+        request_payload["stream"] = False
+        data = self._json_request(
+            "POST", self.endpoint, request_payload, timeout_seconds=timeout_seconds
+        )
+        try:
+            message = data["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError
+        except (KeyError, IndexError, TypeError) as exc:
+            model = request_payload.get("model", "")
+            raise RequestFailure(
+                f"Unexpected completion response from model {model}: "
+                f"{self._redact(json.dumps(data)[:1000])}",
+                "protocol",
+            ) from exc
+        return data
 
     def chat(
         self,

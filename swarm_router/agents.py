@@ -190,6 +190,7 @@ DEFAULT_AGENTS = (
     AgentManifest("night_owl", "Night Owl", "Processes asynchronous project work and prepares handoffs.", supported_task_types=("automation", "triage", "night_owl"), preferred_capabilities=("reasoning.fast", "tool_use")),
     AgentManifest("planner", "Planner", "Breaks work into safe steps and identifies constraints.", supported_task_types=("planning",), preferred_capabilities=("reasoning.high",)),
     AgentManifest("researcher", "Researcher", "Collects and summarizes evidence with source boundaries.", supported_task_types=("research",), preferred_capabilities=("long_context", "reasoning.fast")),
+    AgentManifest("reviewer", "Reviewer", "Reviews repository changes for correctness, security, regressions, and scope.", supported_task_types=("review",), preferred_capabilities=("reasoning.high",)),
     AgentManifest("security_monitor", "Security Monitor", "Reviews system-security posture and reports risks.", supported_task_types=("security", "monitoring"), preferred_capabilities=("reasoning.high",)),
     AgentManifest("verifier", "Verifier", "Checks proposed outcomes against evidence and acceptance criteria.", supported_task_types=("verification",), preferred_capabilities=("reasoning.high",)),
 )
