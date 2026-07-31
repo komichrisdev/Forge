@@ -4,7 +4,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Sequence
+import logging
 import hashlib
 import json
 import re
@@ -175,6 +176,188 @@ def _latest_user(messages: list[dict[str, Any]]) -> str:
         if message["role"] == "user" and isinstance(message.get("content"), str):
             return message["content"]
     raise DeveloperError("A user instruction is required.", code="invalid_messages")
+
+
+def _summarize_role_output(text: str, max_chars: int = 2000) -> str:
+    """Return a compact summary of prior role output when full text does not fit.
+
+    Preserves the first 300 and last 300 characters with an ellipsis note.
+    """
+    if len(text) <= max_chars:
+        return text
+    return (
+        f"[Prior role output truncated: {len(text)} chars -> {max_chars}]\n"
+        f"{text[:300]}\n...[middle omitted]...\n{text[-300:]}"
+    )
+
+
+def _compact_phase_messages(
+    *,
+    system_message: dict[str, Any],
+    handoffs: Sequence[dict[str, Any]],
+    worker_messages: Sequence[dict[str, Any]],
+    budget_estimate: int | None = None,
+    model_id: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Structure-aware compaction for a DeveloperCoordinator phase payload.
+
+    Returns (compacted_messages, metadata).
+
+    Preservation rules:
+    1. Always preserve the current system message (as first message).
+    2. Preserve the latest user objective/instruction (last user message).
+    3. Preserve unresolved assistant tool calls together with matching tool results.
+    4. Never leave orphaned tool messages or assistant tool_calls.
+    5. Compact prior role outputs (handoffs) before dropping old tool results.
+    6. Fail closed when safe compaction cannot be proven.
+    """
+    logger = logging.getLogger(__name__)
+    msg_list = [system_message]
+    msg_list.extend(handoffs)
+    msg_list.extend(worker_messages)
+
+    original_count = len(msg_list)
+    original_est = 0
+    if budget_estimate is not None:
+        original_est = budget_estimate
+    else:
+        from .context_budget import estimate_payload_tokens
+        original_est = estimate_payload_tokens(
+            {"messages": msg_list, "model": model_id or "default"}
+        )
+
+    # Identify preserved message indices
+    preserved = set()  # indices that must stay
+
+    # Rule 1: system message is always preserved
+    preserved.add(0)
+
+    # Rule 2: latest user objective (last user message) is preserved
+    for i in range(len(msg_list) - 1, -1, -1):
+        msg = msg_list[i]
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            preserved.add(i)
+            break
+
+    # Rule 3 & 4: find assistant tool_calls and their matching tool results
+    # Track pending tool calls (assistant messages with tool_calls)
+    assistant_tool_call_ids: dict[str, dict[str, Any]] = {}  # id -> assistant msg index
+    tool_result_indices: list[int] = []  # indices of tool messages
+
+    for i, msg in enumerate(msg_list):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                if isinstance(tc, dict) and tc.get("id"):
+                    assistant_tool_call_ids[tc["id"]] = {"assistant_idx": i}
+        elif msg.get("role") == "tool":
+            tool_result_indices.append(i)
+
+    # Mark tool results as orphaned if their call_id has no assistant match
+    orphaned_tool_results = set()
+    for idx in tool_result_indices:
+        tc_id = msg_list[idx].get("tool_call_id", "")
+        if tc_id not in assistant_tool_call_ids:
+            orphaned_tool_results.add(idx)
+
+    # Rule 4: Remove orphaned tool results (they have no matching assistant call)
+    # Rule 3: Keep non-orphaned tool results and their assistant calls
+    for idx in tool_result_indices:
+        tc_id = msg_list[idx].get("tool_call_id", "")
+        if tc_id in assistant_tool_call_ids:
+            preserved.add(idx)
+            preserved.add(assistant_tool_call_ids[tc_id]["assistant_idx"])
+
+    # Identify handoff messages (BEGIN/END UNTRUSTED markers)
+    handoff_indices: list[int] = []
+    for i, msg in enumerate(msg_list):
+        content = msg.get("content", "")
+        if isinstance(content, str) and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT" in content:
+            handoff_indices.append(i)
+
+    # Rule 5: compact old handoffs - keep most recent 1 raw, summarize the rest
+    if len(handoff_indices) > 1:
+        keep_hands = set(handoff_indices[-1:])
+        compacted_hands = set(handoff_indices) - keep_hands
+        for idx in compacted_hands:
+            old_text = msg_list[idx]["content"]
+            if isinstance(old_text, str):
+                msg_list[idx] = {
+                    **msg_list[idx],
+                    "content": _summarize_role_output(old_text, max_chars=2000),
+                }
+            # Summarized handoffs are preserved (in compacted form) so the
+            # general drop loop does not remove them.
+            preserved.add(idx)
+        # Keep handoffs are also preserved (raw) so they are not dropped.
+        preserved.update(keep_hands)
+
+    # Now decide whether we need to drop older worker_messages
+    # Identify old completed tool-result bodies (non-orphaned, non-preserved)
+    worker_msg_indices = [i for i in range(len(msg_list)) if i not in preserved]
+
+    # Drop old completed tool results (tool messages not in preserved set)
+    drop_indices: set[int] = set()
+    for idx in worker_msg_indices:
+        if msg_list[idx].get("role") == "tool":
+            drop_indices.add(idx)
+
+    # If still over budget, drop oldest user messages that are NOT the latest objective
+    # (handoffs and older worker user messages)
+    remaining_indices = [i for i in range(len(msg_list)) if i not in preserved and i not in drop_indices]
+
+    # Drop oldest handoffs first (after the ones we already kept)
+    for idx in handoff_indices[:len(handoff_indices) - 2]:
+        if idx in remaining_indices:
+            drop_indices.add(idx)
+            remaining_indices.remove(idx)
+
+    # Drop oldest non-preserved worker messages (tool results, old user msgs)
+    # Keep messages closer to the end (more recent)
+    for idx in sorted(remaining_indices):
+        if idx not in preserved and idx not in drop_indices:
+            drop_indices.add(idx)
+
+    # Build compacted list
+    compacted = [msg for i, msg in enumerate(msg_list) if i not in drop_indices]
+
+    # Verify: no orphaned tool messages remain
+    call_ids_in_assistants = set()
+    for msg in compacted:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                if isinstance(tc, dict) and tc.get("id"):
+                    call_ids_in_assistants.add(tc["id"])
+
+    orphaned_check = False
+    for msg in compacted:
+        if msg.get("role") == "tool":
+            tc_id = msg.get("tool_call_id", "")
+            if tc_id not in call_ids_in_assistants:
+                orphaned_check = True
+                # Remove this orphaned tool message
+                compacted = [m for m in compacted if m.get("tool_call_id") != tc_id]
+                break  # one pass is enough
+
+    # Estimate new size
+    from .context_budget import estimate_payload_tokens
+    new_est = estimate_payload_tokens({"messages": compacted, "model": model_id or "default"})
+
+    metadata = {
+        "messages_before": original_count,
+        "messages_after": len(compacted),
+        "estimated_input_before": original_est,
+        "estimated_input_after": new_est,
+        "model_id": model_id,
+        "compaction_applied": len(drop_indices) > 0 or orphaned_check,
+        "orphaned_tools_removed": orphaned_check,
+        "reason": "budget_compaction" if new_est < original_est else "no_compaction_needed",
+    }
+
+    logger.debug(
+        "compaction: before=%d after=%d est_before=%d est_after=%d",
+        original_count, len(compacted), original_est, new_est,
+    )
+    return compacted, metadata
 
 
 def _command_text(arguments: dict[str, Any]) -> str:

@@ -4,8 +4,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib import error, request
 import json
+import logging
 import os
 import socket
+
+from .context_budget import ContextBudgetExceeded, preflight_check
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,9 @@ class OpenWebUIClient:
         timeout_seconds: int,
         health_endpoint: str = "/health",
         models_endpoint: str = "/api/models",
+        model_id: str | None = None,
+        catalog_context: int | None = None,
+        budget_enabled: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.endpoint = endpoint
@@ -48,6 +56,9 @@ class OpenWebUIClient:
         self.timeout_seconds = timeout_seconds
         self.health_endpoint = health_endpoint
         self.models_endpoint = models_endpoint
+        self._budget_enabled = budget_enabled
+        self._model_id = model_id
+        self._catalog_context = catalog_context
 
     def _redact(self, value: str) -> str:
         return value.replace(self.api_key, "[REDACTED]") if self.api_key else value
@@ -77,8 +88,16 @@ class OpenWebUIClient:
             lower = detail.lower()
             if exc.code in {401, 403}:
                 category = "authentication"
-            elif any(token in lower for token in ("resourceexhausted", "resource exhausted", "quota", "capacity", "rate limit", "ratelimit")):
+            elif any(token in lower for token in (
+                "resourceexhausted", "resource exhausted", "quota",
+                "capacity", "rate limit", "ratelimit",
+            )):
                 category = "capacity"
+            elif any(token in lower for token in (
+                "context size", "context window", "maximum context",
+                "prompt is too long", "too many tokens", "context length",
+            )):
+                category = "context_overflow"
             else:
                 category = "http"
             raise RequestFailure(
@@ -130,6 +149,12 @@ class OpenWebUIClient:
             key: value for key, value in payload.items() if key in self.COMPLETION_FIELDS
         }
         request_payload["stream"] = False
+        if self._budget_enabled:
+            preflight_check(
+                request_payload,
+                model_id=self._model_id or payload.get("model"),
+                catalog_context=self._catalog_context,
+            )
         data = self._json_request(
             "POST", self.endpoint, request_payload, timeout_seconds=timeout_seconds
         )
@@ -165,6 +190,12 @@ class OpenWebUIClient:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if self._budget_enabled:
+            preflight_check(
+                payload,
+                model_id=self._model_id or model,
+                catalog_context=self._catalog_context,
+            )
         data = self._json_request(
             "POST", self.endpoint, payload, timeout_seconds=timeout_seconds
         )
