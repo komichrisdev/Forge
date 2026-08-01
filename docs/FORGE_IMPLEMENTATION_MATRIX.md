@@ -123,7 +123,7 @@ matrix above. All dashboard work also inherits the global browser gates below.
 | Task | Owner | State | Evidence / next gate |
 | --- | --- | --- | --- |
 | FG-000 architecture baseline | SOL; Qwen Mini advisory rejected | COMPLETE | 171 focused, 332 full, frontend/build/parity; both Luna re-reviews PASS |
-| `1bbad6a` context/compaction recovery | SOL | IN_PROGRESS | compaction/normalization slice committed as `19dfb0c`: 186 focused and 348 full tests pass; both Luna High reviews PASS; overflow classification and catalog-context propagation remain open |
+| `1bbad6a` context/compaction recovery | SOL | COMPLETE | `19dfb0c` plus `9592d46`: 234 focused and 359 full tests pass; frontend test/check/build/MCP parity, compileall, and diff checks pass; both independent Luna High reviews PASS on each final slice |
 | Qwen Autopilot reliability | SOL | IN_PROGRESS | paused; 20 tests pass, checksums stale, completion/backoff/lease/signal/polling defects open |
 | Terminal evidence/session polling | SOL | MAPPED | recovered diagnostics contain no repair commit; inspect Developer pending-call lifecycle |
 | Model Monitor | Qwen Code after FG-020 | MAPPED | recovered handoff is design input to FG-060, not a separate screen |
@@ -186,6 +186,25 @@ context auditor.
 | converted client-system messages could replace the objective or stringify parts | fixed by positional provenance and structure-preserving untrusted wrappers |
 | structured status evidence was alleged to become `unknown` | not reproduced; existing status fallback classified nested/list exit codes and now has an explicit regression assertion |
 
+## Independent context-metadata repair findings
+
+Architecture and Product reviewed the same final uncommitted snapshot independently.
+Its SHA-256 was
+`463c638adda8925b339aee5ce0b5d2b7ef68f4dab10bc948edb9652761d10fd3` before
+staging and after each review. Both reviewers returned PASS; the accepted snapshot is
+commit `9592d46`.
+
+| Finding | Disposition |
+| --- | --- |
+| malformed, fractional, infinite, Boolean, or oversized context values could be truncated or crash SQLite | fixed with signed-64-bit integer-only validation at metadata and explicit-input boundaries |
+| conflicting metadata could select an unsafe larger context | fixed by consuming all supported metadata locations and choosing the smallest valid positive value |
+| a fallback context was stored as authoritative and prevented later runtime expansion | fixed by persisting unknown metadata as NULL while preserving runtime fallback resolution |
+| catalog refresh could silently expand an established model limit | fixed so refreshes tighten known limits but never expand them; explicit operator updates remain available |
+| HTTP status-only 413/429 failures lost their distinct meanings | fixed so 413 is `context_overflow`, 429/503 is `capacity`, and authentication remains higher priority |
+| orchestration and Personal API wrappers erased uniform upstream failure categories | fixed by preserving a common category and keeping mixed failures generic |
+| context-overflow probes and attempts falsely degraded health, reliability, and cooldown | fixed by retaining audit history while excluding context-fit failures from provider health signals |
+| CLI, dashboard, orchestrator, benchmark, judge, and Personal calls omitted catalog context | fixed at every completion call site with focused propagation tests |
+
 ## Significant decisions and corrections
 
 1. The live Planning tab, not the Autopilot manifest status, defines the 24 product
@@ -198,10 +217,10 @@ context auditor.
    and SOL holds its process lock until the write phase ends.
 4. The current Autopilot repairs are useful but incomplete: five checksum entries are
    stale and the new non-thinking/block validation behavior lacks focused tests.
-5. `1bbad6a` is retained, not reverted. Commit `19dfb0c` completes and independently
-   accepts its compaction/normalization repair slice. Context-overflow classification,
-   conservative metadata resolution, and catalog-context caller propagation remain
-   separate open repairs.
+5. `1bbad6a` is retained, not reverted. Commit `19dfb0c` completes its
+   compaction/normalization repair slice; `9592d46` completes conservative context
+   metadata, caller propagation, and neutral context-overflow handling. Both slices
+   passed separate independent Architecture and Product reviews.
 6. The five previously unreachable Qwen context commits are preserved by local
    `refs/archive/qwen-context/*`; no recovered material was deleted.
 7. Model Monitor research will extend Agents & Models. It will not create another
@@ -220,14 +239,19 @@ context auditor.
 
 ## Current rollover checkpoint
 
-- Branch: `feature/swarm-developer`; accepted code checkpoint `19dfb0c`.
-- Active task: finish the remaining `1bbad6a` context-metadata/caller repairs, then
-  repair Autopilot reliability.
-- Exact next action: add failing tests for overflow error classification and every
-  catalog-context caller before changing shared resolution code.
-- Open findings: catalog-context propagation; overflow classification; conservative
-  metadata conflict handling; Autopilot retries/backoff, polling, signal cleanup,
-  checksums, and tests.
-- Verified repair: Python 186 focused and 348 full; frontend check/test/build/MCP
-  parity; compileall and `git diff --check` all passed.
-- Pending code commits: none; this matrix update records `19dfb0c`.
+- Branch: `feature/swarm-developer`; accepted code checkpoint `9592d46`.
+- Active task: repair Qwen Autopilot reliability, then R-002 terminal evidence,
+  writer fencing, and pending-session cleanup.
+- Exact next action: preserve the installed package, build the Autopilot repair in a
+  temporary reviewed copy, and begin with failing tests for action validation,
+  non-thinking defaults, completion probing, retry accounting/backoff, and long-call
+  lease/logging behavior.
+- Open findings: Autopilot completion probes, retry/backoff, hard deadlines, lease
+  renewal, interruption cleanup, checksums, and shared writer fencing; R-002 terminal
+  polling and lease-token invariants; provider-qualified model identity remains a
+  later Agents & Models migration concern.
+- Verified context recovery: 234 focused and 359 full Python tests; frontend
+  test/check/build/MCP parity; compileall and `git diff --check` all passed. The bare
+  `python -m unittest` command discovers zero repository tests, so the recorded full
+  command is `python -m unittest discover -s tests`.
+- Pending code commits: none; this matrix update records `9592d46`.
