@@ -48,7 +48,7 @@ class OpenWebUIClient:
         models_endpoint: str = "/api/models",
         model_id: str | None = None,
         catalog_context: int | None = None,
-        budget_enabled: bool = False,
+        budget_enabled: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.endpoint = endpoint
@@ -144,17 +144,25 @@ class OpenWebUIClient:
         self,
         payload: dict[str, Any],
         timeout_seconds: int | None = None,
+        catalog_context: int | None = None,
     ) -> dict[str, Any]:
         request_payload = {
             key: value for key, value in payload.items() if key in self.COMPLETION_FIELDS
         }
         request_payload["stream"] = False
         if self._budget_enabled:
-            preflight_check(
-                request_payload,
-                model_id=self._model_id or payload.get("model"),
-                catalog_context=self._catalog_context,
-            )
+            try:
+                preflight_check(
+                    request_payload,
+                    model_id=str(request_payload.get("model") or self._model_id or ""),
+                    catalog_context=(
+                        catalog_context
+                        if catalog_context is not None
+                        else self._catalog_context
+                    ),
+                )
+            except ContextBudgetExceeded as exc:
+                raise RequestFailure(str(exc), "context_overflow", 413) from exc
         data = self._json_request(
             "POST", self.endpoint, request_payload, timeout_seconds=timeout_seconds
         )
@@ -179,6 +187,7 @@ class OpenWebUIClient:
         max_tokens: int,
         temperature: float,
         timeout_seconds: int | None = None,
+        catalog_context: int | None = None,
     ) -> ChatResult:
         payload = {
             "model": model,
@@ -191,11 +200,18 @@ class OpenWebUIClient:
             "stream": False,
         }
         if self._budget_enabled:
-            preflight_check(
-                payload,
-                model_id=self._model_id or model,
-                catalog_context=self._catalog_context,
-            )
+            try:
+                preflight_check(
+                    payload,
+                    model_id=model or self._model_id,
+                    catalog_context=(
+                        catalog_context
+                        if catalog_context is not None
+                        else self._catalog_context
+                    ),
+                )
+            except ContextBudgetExceeded as exc:
+                raise RequestFailure(str(exc), "context_overflow", 413) from exc
         data = self._json_request(
             "POST", self.endpoint, payload, timeout_seconds=timeout_seconds
         )

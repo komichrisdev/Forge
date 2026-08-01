@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Sequence
-import logging
 import hashlib
 import json
 import re
@@ -15,8 +15,28 @@ import uuid
 
 from .catalog import ModelCatalog, ModelRecord
 from .client import OpenWebUIClient, RequestFailure
+from .context_budget import (
+    ContextBudgetExceeded,
+    DEFAULT_PROTOCOL_RESERVE,
+    DEFAULT_SAFETY_MARGIN,
+    MIN_SAFETY_MARGIN_TOKENS,
+    estimate_payload_tokens,
+    preflight_check,
+    resolve_context_limit,
+)
 from .config import AppConfig
 from .journal import JournalEventType, TaskJournal
+
+
+# Strict tool-call ID normalisation policy:
+#   - Only native strings are accepted; int/float/list/dict/None are invalid.
+#   - Whitespace-only strings are invalid after stripping.
+#   - The canonical output is the stripped value, never the raw input.
+def _normalize_tool_call_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 DEVELOPER_MODEL_ID = "swarm-developer"
@@ -145,12 +165,24 @@ def _normalize_messages(value: Any) -> list[dict[str, Any]]:
         if role == "assistant" and "tool_calls" in item:
             if not isinstance(item["tool_calls"], list):
                 raise DeveloperError("assistant tool_calls must be an array.", code="invalid_messages")
-            message["tool_calls"] = item["tool_calls"]
+            message["tool_calls"] = []
+            for tc in item["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                call_id = tc.get("id")
+                normalized_id = _normalize_tool_call_id(call_id)
+                if normalized_id is not None:
+                    tc_copy = {k: v for k, v in tc.items() if k != "id"}
+                    tc_copy["id"] = normalized_id
+                    message["tool_calls"].append(tc_copy)
         if role == "tool":
             call_id = item.get("tool_call_id")
-            if not isinstance(call_id, str) or not call_id:
+            if not isinstance(call_id, str):
                 raise DeveloperError("tool messages require tool_call_id.", code="invalid_messages")
-            message["tool_call_id"] = call_id
+            stripped = call_id.strip()
+            if not stripped:
+                raise DeveloperError("tool messages require tool_call_id.", code="invalid_messages")
+            message["tool_call_id"] = stripped
             if isinstance(item.get("name"), str):
                 message["name"] = item["name"]
         normalized.append(message)
@@ -179,16 +211,20 @@ def _latest_user(messages: list[dict[str, Any]]) -> str:
 
 
 def _summarize_role_output(text: str, max_chars: int = 2000) -> str:
-    """Return a compact summary of prior role output when full text does not fit.
+    """Return a bounded head/tail summary of prior role output."""
 
-    Preserves the first 300 and last 300 characters with an ellipsis note.
-    """
+    if max_chars < 200:
+        raise ValueError("max_chars must be at least 200")
     if len(text) <= max_chars:
         return text
-    return (
-        f"[Prior role output truncated: {len(text)} chars -> {max_chars}]\n"
-        f"{text[:300]}\n...[middle omitted]...\n{text[-300:]}"
-    )
+
+    marker = "\n...[middle omitted]...\n"
+    header = f"[Prior role output truncated: {len(text)} chars]\n"
+    available = max_chars - len(header) - len(marker)
+    head_chars = max(1, available // 2)
+    tail_chars = max(1, available - head_chars)
+    summary = f"{header}{text[:head_chars]}{marker}{text[-tail_chars:]}"
+    return summary[:max_chars]
 
 
 def _compact_phase_messages(
@@ -196,168 +232,250 @@ def _compact_phase_messages(
     system_message: dict[str, Any],
     handoffs: Sequence[dict[str, Any]],
     worker_messages: Sequence[dict[str, Any]],
-    budget_estimate: int | None = None,
+    input_limit: int,
     model_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Structure-aware compaction for a DeveloperCoordinator phase payload.
+    """Compact one phase request while preserving required protocol structure.
 
-    Returns (compacted_messages, metadata).
-
-    Preservation rules:
-    1. Always preserve the current system message (as first message).
-    2. Preserve the latest user objective/instruction (last user message).
-    3. Preserve unresolved assistant tool calls together with matching tool results.
-    4. Never leave orphaned tool messages or assistant tool_calls.
-    5. Compact prior role outputs (handoffs) before dropping old tool results.
-    6. Fail closed when safe compaction cannot be proven.
+    The system message and latest user objective are retained. Assistant tool
+    calls and matching tool results are removed only as complete atomic groups.
+    Orphaned, incomplete, duplicated, or misordered tool-call groups are excluded
+    because forwarding them would produce an invalid chat transcript. Inputs are
+    deep-copied and never mutated.
     """
-    logger = logging.getLogger(__name__)
-    msg_list = [system_message]
-    msg_list.extend(handoffs)
-    msg_list.extend(worker_messages)
 
-    original_count = len(msg_list)
-    original_est = 0
-    if budget_estimate is not None:
-        original_est = budget_estimate
-    else:
-        from .context_budget import estimate_payload_tokens
-        original_est = estimate_payload_tokens(
-            {"messages": msg_list, "model": model_id or "default"}
+    if input_limit <= 0:
+        raise DeveloperError(
+            f"Model input limit is not usable: {input_limit}.",
+            status=413,
+            code="context_budget_exceeded",
         )
 
-    # Identify preserved message indices
-    preserved = set()  # indices that must stay
+    original_messages = [
+        deepcopy(system_message),
+        *[deepcopy(message) for message in handoffs],
+        *[deepcopy(message) for message in worker_messages],
+    ]
 
-    # Rule 1: system message is always preserved
-    preserved.add(0)
+    def estimate(current: Sequence[dict[str, Any]]) -> int:
+        # Only the messages field is estimated here. The caller separately
+        # accounts for model, tools, and other request fields exactly once.
+        return estimate_payload_tokens({"messages": list(current)})
 
-    # Rule 2: latest user objective (last user message) is preserved
-    for i in range(len(msg_list) - 1, -1, -1):
-        msg = msg_list[i]
-        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
-            preserved.add(i)
-            break
+    original_estimate = estimate(original_messages)
+    original_count = len(original_messages)
 
-    # Rule 3 & 4: find assistant tool_calls and their matching tool results
-    # Track pending tool calls (assistant messages with tool_calls)
-    assistant_tool_call_ids: dict[str, dict[str, Any]] = {}  # id -> assistant msg index
-    tool_result_indices: list[int] = []  # indices of tool messages
+    assistant_groups: list[tuple[int, tuple[str, ...]]] = []
+    call_owner_index: dict[str, int] = {}
+    malformed_group_indices: set[int] = set()
+    for index, message in enumerate(original_messages):
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            continue
+        call_ids: list[str] = []
+        malformed = False
+        for tool_call in tool_calls:
+            call_id_raw = tool_call.get("id")
+            if not isinstance(call_id_raw, str):
+                malformed = True
+                continue
+            call_id = _normalize_tool_call_id(call_id_raw)
+            if call_id is None:
+                malformed = True
+                continue
+            if call_id in call_ids:
+                malformed = True
+                continue
+            call_ids.append(call_id)
+            call_owner_index[call_id] = index
+        if malformed or not call_ids:
+            malformed_group_indices.add(index)
+        else:
+            assistant_groups.append((index, tuple(call_ids)))
 
-    for i, msg in enumerate(msg_list):
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                if isinstance(tc, dict) and tc.get("id"):
-                    assistant_tool_call_ids[tc["id"]] = {"assistant_idx": i}
-        elif msg.get("role") == "tool":
-            tool_result_indices.append(i)
+    result_indices_by_call: dict[str, list[int]] = {}
+    orphan_indices: set[int] = set()
+    for index, message in enumerate(original_messages):
+        if message.get("role") != "tool":
+            continue
+        call_id = _normalize_tool_call_id(message.get("tool_call_id"))
+        owner_index = call_owner_index.get(call_id)
+        if owner_index is None or index <= owner_index:
+            orphan_indices.add(index)
+            continue
+        result_indices_by_call.setdefault(call_id, []).append(index)
+    invalid_group_indices = set(malformed_group_indices)
+    invalid_group_call_ids: set[str] = set()
+    for assistant_index, call_ids in assistant_groups:
+        result_indices = [
+            result_indices_by_call.get(call_id, [])
+            for call_id in call_ids
+        ]
+        flat_results = [index for indices in result_indices for index in indices]
+        expected = set(
+            range(assistant_index + 1, assistant_index + 1 + len(call_ids))
+        )
+        complete = all(len(indices) == 1 for indices in result_indices)
+        contiguous = complete and set(flat_results) == expected
+        if complete and contiguous:
+            continue
+        invalid_group_indices.add(assistant_index)
+        invalid_group_call_ids.update(call_ids)
 
-    # Mark tool results as orphaned if their call_id has no assistant match
-    orphaned_tool_results = set()
-    for idx in tool_result_indices:
-        tc_id = msg_list[idx].get("tool_call_id", "")
-        if tc_id not in assistant_tool_call_ids:
-            orphaned_tool_results.add(idx)
+    for call_id in invalid_group_call_ids:
+        invalid_group_indices.update(result_indices_by_call.get(call_id, []))
 
-    # Rule 4: Remove orphaned tool results (they have no matching assistant call)
-    # Rule 3: Keep non-orphaned tool results and their assistant calls
-    for idx in tool_result_indices:
-        tc_id = msg_list[idx].get("tool_call_id", "")
-        if tc_id in assistant_tool_call_ids:
-            preserved.add(idx)
-            preserved.add(assistant_tool_call_ids[tc_id]["assistant_idx"])
+    protocol_cleanup_indices = orphan_indices | invalid_group_indices
+    messages = [
+        message
+        for index, message in enumerate(original_messages)
+        if index not in protocol_cleanup_indices
+    ]
 
-    # Identify handoff messages (BEGIN/END UNTRUSTED markers)
-    handoff_indices: list[int] = []
-    for i, msg in enumerate(msg_list):
-        content = msg.get("content", "")
-        if isinstance(content, str) and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT" in content:
-            handoff_indices.append(i)
+    # Canonicalize all tool-call IDs in the filtered messages so that every
+    # stored ID matches the normalized key used in lookups.
+    for message in messages:
+        if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
+            for tc in message["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                call_id_raw = tc.get("id")
+                if not isinstance(call_id_raw, str):
+                    continue
+                call_id = _normalize_tool_call_id(call_id_raw)
+                if call_id is not None:
+                    tc["id"] = call_id
+        if message.get("role") == "tool":
+            call_id_raw = message.get("tool_call_id")
+            if not isinstance(call_id_raw, str):
+                continue
+            call_id = _normalize_tool_call_id(call_id_raw)
+            if call_id is not None:
+                message["tool_call_id"] = call_id
 
-    # Rule 5: compact old handoffs - keep most recent 1 raw, summarize the rest
-    if len(handoff_indices) > 1:
-        keep_hands = set(handoff_indices[-1:])
-        compacted_hands = set(handoff_indices) - keep_hands
-        for idx in compacted_hands:
-            old_text = msg_list[idx]["content"]
-            if isinstance(old_text, str):
-                msg_list[idx] = {
-                    **msg_list[idx],
-                    "content": _summarize_role_output(old_text, max_chars=2000),
-                }
-            # Summarized handoffs are preserved (in compacted form) so the
-            # general drop loop does not remove them.
-            preserved.add(idx)
-        # Keep handoffs are also preserved (raw) so they are not dropped.
-        preserved.update(keep_hands)
+    call_owner: dict[str, int] = {}
+    groups: list[set[int]] = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        call_ids: set[str] = set()
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            call_id_raw = tool_call.get("id")
+            if not isinstance(call_id_raw, str):
+                continue
+            call_id = _normalize_tool_call_id(call_id_raw)
+            if call_id is not None:
+                call_ids.add(call_id)
+        if not call_ids:
+            continue
+        group_index = len(groups)
+        groups.append({index})
+        for call_id in call_ids:
+            call_owner[call_id] = group_index
 
-    # Now decide whether we need to drop older worker_messages
-    # Identify old completed tool-result bodies (non-orphaned, non-preserved)
-    worker_msg_indices = [i for i in range(len(msg_list)) if i not in preserved]
+    for index, message in enumerate(messages):
+        if message.get("role") != "tool":
+            continue
+        group_index = call_owner.get(_normalize_tool_call_id(message.get("tool_call_id")))
+        if group_index is not None:
+            groups[group_index].add(index)
 
-    # Drop old completed tool results (tool messages not in preserved set)
-    drop_indices: set[int] = set()
-    for idx in worker_msg_indices:
-        if msg_list[idx].get("role") == "tool":
-            drop_indices.add(idx)
+    current_estimate = estimate(messages)
+    if current_estimate <= input_limit:
+        return messages, {
+            "messages_before": original_count,
+            "messages_after": len(messages),
+            "estimated_input_before": original_estimate,
+            "estimated_input_after": current_estimate,
+            "model_id": model_id,
+            "compaction_applied": bool(protocol_cleanup_indices),
+            "orphaned_tools_removed": bool(orphan_indices),
+            "invalid_tool_groups_removed": bool(invalid_group_indices),
+            "reason": (
+                "protocol_cleanup"
+                if protocol_cleanup_indices
+                else "within_budget"
+            ),
+        }
 
-    # If still over budget, drop oldest user messages that are NOT the latest objective
-    # (handoffs and older worker user messages)
-    remaining_indices = [i for i in range(len(msg_list)) if i not in preserved and i not in drop_indices]
-
-    # Drop oldest handoffs first (after the ones we already kept)
-    for idx in handoff_indices[:len(handoff_indices) - 2]:
-        if idx in remaining_indices:
-            drop_indices.add(idx)
-            remaining_indices.remove(idx)
-
-    # Drop oldest non-preserved worker messages (tool results, old user msgs)
-    # Keep messages closer to the end (more recent)
-    for idx in sorted(remaining_indices):
-        if idx not in preserved and idx not in drop_indices:
-            drop_indices.add(idx)
-
-    # Build compacted list
-    compacted = [msg for i, msg in enumerate(msg_list) if i not in drop_indices]
-
-    # Verify: no orphaned tool messages remain
-    call_ids_in_assistants = set()
-    for msg in compacted:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                if isinstance(tc, dict) and tc.get("id"):
-                    call_ids_in_assistants.add(tc["id"])
-
-    orphaned_check = False
-    for msg in compacted:
-        if msg.get("role") == "tool":
-            tc_id = msg.get("tool_call_id", "")
-            if tc_id not in call_ids_in_assistants:
-                orphaned_check = True
-                # Remove this orphaned tool message
-                compacted = [m for m in compacted if m.get("tool_call_id") != tc_id]
-                break  # one pass is enough
-
-    # Estimate new size
-    from .context_budget import estimate_payload_tokens
-    new_est = estimate_payload_tokens({"messages": compacted, "model": model_id or "default"})
-
-    metadata = {
-        "messages_before": original_count,
-        "messages_after": len(compacted),
-        "estimated_input_before": original_est,
-        "estimated_input_after": new_est,
-        "model_id": model_id,
-        "compaction_applied": len(drop_indices) > 0 or orphaned_check,
-        "orphaned_tools_removed": orphaned_check,
-        "reason": "budget_compaction" if new_est < original_est else "no_compaction_needed",
-    }
-
-    logger.debug(
-        "compaction: before=%d after=%d est_before=%d est_after=%d",
-        original_count, len(compacted), original_est, new_est,
+    latest_user = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        None,
     )
-    return compacted, metadata
+    required = {0}
+    if latest_user is not None:
+        required.add(latest_user)
+
+    handoff_indices = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message.get("content"), str)
+        and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT" in str(message["content"])
+    ]
+    summarized = False
+    for index in handoff_indices[:-1]:
+        content = str(messages[index]["content"])
+        replacement = _summarize_role_output(content, 1200)
+        if replacement != content:
+            messages[index]["content"] = replacement
+            summarized = True
+
+    grouped_indices = set().union(*groups) if groups else set()
+    removable_units: list[set[int]] = [
+        group for group in groups if not (group & required)
+    ]
+    removable_units.extend(
+        {index}
+        for index in range(1, len(messages))
+        if index not in required and index not in grouped_indices
+    )
+    removable_units.sort(key=min)
+
+    removed: set[int] = set()
+    current = list(messages)
+    for unit in removable_units:
+        if estimate(current) <= input_limit:
+            break
+        removed.update(unit)
+        current = [
+            message
+            for index, message in enumerate(messages)
+            if index not in removed
+        ]
+
+    final_estimate = estimate(current)
+    if final_estimate > input_limit:
+        raise DeveloperError(
+            "Required developer context cannot fit model input limit: "
+            f"{final_estimate} > {input_limit}.",
+            status=413,
+            code="context_budget_exceeded",
+        )
+
+    return current, {
+        "messages_before": original_count,
+        "messages_after": len(current),
+        "estimated_input_before": original_estimate,
+        "estimated_input_after": final_estimate,
+        "model_id": model_id,
+        "compaction_applied": (
+            bool(protocol_cleanup_indices) or summarized or bool(removed)
+        ),
+        "orphaned_tools_removed": bool(orphan_indices),
+        "invalid_tool_groups_removed": bool(invalid_group_indices),
+        "reason": "budget_compaction",
+    }
 
 
 def _command_text(arguments: dict[str, Any]) -> str:
@@ -665,7 +783,7 @@ class DeveloperCoordinator:
                     "type": type(message.get("content")).__name__,
                     "chars": len(message.get("content") or "") if isinstance(message.get("content"), str) else 0,
                     "digest": _digest(message["content"]) if isinstance(message.get("content"), str) else "",
-                    "tool_call_id": str(message.get("tool_call_id", ""))[:200],
+                    "tool_call_id": str(_normalize_tool_call_id(message.get("tool_call_id")) or "")[:200],
                 }
                 for message in messages
             ],
@@ -872,7 +990,7 @@ class DeveloperCoordinator:
             function = tool_choice.get("function")
             required_name = str(function.get("name", "")) if isinstance(function, dict) else ""
         result = []
-        seen = set()
+        seen: set[str] = set()
         for call in calls:
             function = call.get("function") if isinstance(call, dict) else None
             call_id = call.get("id") if isinstance(call, dict) else None
@@ -883,9 +1001,18 @@ class DeveloperCoordinator:
                 or not all(isinstance(item, str) and item for item in (call_id, name, arguments))
             ):
                 raise DeveloperError("Malformed tool call.", status=502, code="malformed_tool_call")
-            if call_id in seen:
+            # Normalize the ID to canonical stripped form so downstream
+            # look-ups use the same key regardless of leading/trailing
+            # whitespace in the model response.
+            normalized_id = _normalize_tool_call_id(call_id)
+            if normalized_id is None:
+                raise DeveloperError("Malformed tool call.", status=502, code="malformed_tool_call")
+            if normalized_id in seen:
                 raise DeveloperError("Duplicate tool_call_id.", status=502, code="malformed_tool_call")
-            seen.add(call_id)
+            seen.add(normalized_id)
+            # Persist the canonical ID back into the call dict so
+            # pending-call storage and compaction all use it.
+            call["id"] = normalized_id
             if name not in tool_schemas or (required_name and name != required_name):
                 raise DeveloperError("Model requested an unavailable tool.", status=502, code="unknown_tool")
             try:
@@ -1370,7 +1497,7 @@ class DeveloperCoordinator:
                 "SELECT * FROM forge_developer_pending_calls WHERE task_id=? ORDER BY created_at",
                 (run["task_id"],),
             ).fetchall()
-        pending = {str(row["tool_call_id"]): dict(row) for row in rows}
+        pending: dict[str, dict[str, Any]] = {str(row["tool_call_id"]): dict(row) for row in rows}
         if not pending:
             raise DeveloperError("Developer run has no pending tool calls.", status=409, code="tool_call_mismatch")
         implementer_calls = [item for item in pending.values() if item["role"] == "implementer"]
@@ -1393,12 +1520,12 @@ class DeveloperCoordinator:
                 if isinstance(call, dict) and call.get("id") in pending:
                     if call["id"] in assistant_calls:
                         raise DeveloperError("Duplicate assistant tool-call history.", status=409, code="tool_call_mismatch")
-                    assistant_calls[str(call["id"])] = call
+                    assistant_calls[_normalize_tool_call_id(call["id"]) or ""] = call
         results = [
             item for item in messages
             if item["role"] == "tool" and item.get("tool_call_id") in pending
         ]
-        result_ids = [str(item["tool_call_id"]) for item in results]
+        result_ids = [_normalize_tool_call_id(item["tool_call_id"]) or "" for item in results]
         if set(assistant_calls) != set(pending) or set(result_ids) != set(pending) or len(result_ids) != len(set(result_ids)):
             raise DeveloperError(
                 "The callback must contain the exact pending tool calls and results.",
@@ -1426,7 +1553,7 @@ class DeveloperCoordinator:
         }
         test_statuses = []
         for message in results:
-            call_id = str(message["tool_call_id"])
+            call_id = _normalize_tool_call_id(message["tool_call_id"]) or ""
             content = message.get("content")
             text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
             item = pending[call_id]
@@ -1711,7 +1838,7 @@ class DeveloperCoordinator:
                 raise DeveloperError("tool_choice selects an unavailable tool.", code="invalid_tools")
         request_shape = self._request_shape(body, messages, tools)
         callback_ids = [
-            str(message["tool_call_id"])
+            _normalize_tool_call_id(message["tool_call_id"]) or ""
             for message in messages
             if message["role"] == "tool"
         ]
@@ -1765,8 +1892,16 @@ class DeveloperCoordinator:
             failures = []
             candidates = list(self._candidates(run, role))
             planner_policy_rejections = 0
+            context_budget_failures = 0
             for attempt, record in enumerate(candidates, start=1):
-                payload["model"] = record.model_id
+                # Build each candidate request from the un-compacted logical
+                # transcript. A smaller failed model must not permanently drop
+                # context before a larger fallback model is attempted.
+                attempt_payload = {
+                    **payload,
+                    "model": record.model_id,
+                    "messages": [deepcopy(message) for message in payload["messages"]],
+                }
                 reason = (
                     run["role_models"].get(role, {}).get("reason")
                     or self.catalog.recommendation_reason(
@@ -1797,9 +1932,81 @@ class DeveloperCoordinator:
                     },
                 )
                 try:
+                    context_limit = resolve_context_limit(
+                        record.model_id, record.context_length
+                    )
+                    # Estimate all non-message fields exactly once. An empty
+                    # messages list retains the real JSON field overhead.
+                    non_message_payload = {**attempt_payload, "messages": []}
+                    non_message_tokens = estimate_payload_tokens(non_message_payload)
+                    safety_tokens = max(
+                        int(context_limit * DEFAULT_SAFETY_MARGIN),
+                        MIN_SAFETY_MARGIN_TOKENS,
+                    )
+                    message_input_limit = (
+                        context_limit
+                        - max_tokens
+                        - DEFAULT_PROTOCOL_RESERVE
+                        - safety_tokens
+                        - non_message_tokens
+                    )
+                    if message_input_limit <= 0:
+                        raise DeveloperError(
+                            "Request metadata and output reserves leave no model input budget.",
+                            status=413,
+                            code="context_budget_exceeded",
+                        )
+                    compacted_messages, compaction = _compact_phase_messages(
+                        system_message=attempt_payload["messages"][0],
+                        handoffs=[
+                            message
+                            for message in attempt_payload["messages"][1:]
+                            if isinstance(message.get("content"), str)
+                            and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT"
+                            in str(message["content"])
+                        ],
+                        worker_messages=[
+                            message
+                            for message in attempt_payload["messages"][1:]
+                            if not (
+                                isinstance(message.get("content"), str)
+                                and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT"
+                                in str(message["content"])
+                            )
+                        ],
+                        input_limit=message_input_limit,
+                        model_id=record.model_id,
+                    )
+                    attempt_payload["messages"] = compacted_messages
+                    budget = preflight_check(
+                        attempt_payload,
+                        model_id=record.model_id,
+                        catalog_context=record.context_length,
+                    )
+                    self.journal.append_event(
+                        run["task_id"],
+                        JournalEventType.STAGE_STARTED,
+                        agent_id=role,
+                        run_id=run["task_id"],
+                        stage="context_preflight",
+                        message="Developer request context preflight completed.",
+                        metadata={
+                            "task_type": "swarm_developer",
+                            "phase": role,
+                            "model_id": record.model_id,
+                            "context_limit": budget.context_limit,
+                            "estimated_input": budget.estimated_input,
+                            "input_limit": budget.input_limit,
+                            "headroom": budget.headroom,
+                            "messages_before": compaction["messages_before"],
+                            "messages_after": compaction["messages_after"],
+                            "compaction_applied": compaction["compaction_applied"],
+                        },
+                    )
                     response = self.client.completion(
-                        payload,
+                        attempt_payload,
                         timeout_seconds=self.config.personal.worker_timeout_seconds,
+                        catalog_context=record.context_length,
                     )
                     message = response["choices"][0]["message"]
                     calls = message.get("tool_calls")
@@ -1974,8 +2181,24 @@ class DeveloperCoordinator:
                         return self._response(completed, final, "stop", record)
                     run = next_run
                     break
-                except (RequestFailure, DeveloperError, KeyError, IndexError, TypeError) as exc:
-                    if isinstance(exc, RequestFailure) or (
+                except (RequestFailure, DeveloperError, ContextBudgetExceeded, KeyError, IndexError, TypeError) as exc:
+                    is_context_failure = (
+                        isinstance(exc, ContextBudgetExceeded)
+                        or (
+                            isinstance(exc, DeveloperError)
+                            and exc.code == "context_budget_exceeded"
+                        )
+                        or (
+                            isinstance(exc, RequestFailure)
+                            and exc.category == "context_overflow"
+                        )
+                    )
+                    if is_context_failure:
+                        context_budget_failures += 1
+                    if (
+                        isinstance(exc, RequestFailure)
+                        and exc.category != "context_overflow"
+                    ) or (
                         isinstance(exc, DeveloperError)
                         and exc.code in {"malformed_tool_call", "unknown_tool", "malformed_response"}
                     ):
@@ -2051,6 +2274,12 @@ class DeveloperCoordinator:
                         )
             else:
                 self._fail_run(run, role, failures)
+                if failures and context_budget_failures == len(failures):
+                    raise DeveloperError(
+                        f"Developer context does not fit any eligible model for {role}.",
+                        status=413,
+                        code="context_budget_exceeded",
+                    )
                 raise DeveloperError(
                     f"All eligible developer models failed for {role}.",
                     status=502,

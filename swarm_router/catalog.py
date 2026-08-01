@@ -91,10 +91,22 @@ def infer_provider_family(model_id: str, provider_hint: str = "") -> tuple[str, 
 
 
 def _context_length(item: dict[str, Any]) -> int | None:
-    candidates = [item.get("context_length")]
+    candidates = [item.get("context_length"), item.get("n_ctx")]
+    # Top-level meta.*  (may be returned by some llama.cpp endpoints)
+    top_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    candidates.extend((
+        top_meta.get("context_length"),
+        top_meta.get("n_ctx"),
+    ))
+    # info.* and info.meta.*
     info = item.get("info") if isinstance(item.get("info"), dict) else {}
-    meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
-    candidates.extend((info.get("context_length"), meta.get("context_length")))
+    info_meta = info.get("meta") if isinstance(info.get("meta"), dict) else {}
+    candidates.extend((
+        info.get("context_length"),
+        info.get("n_ctx"),
+        info_meta.get("context_length"),
+        info_meta.get("n_ctx"),
+    ))
     for value in candidates:
         try:
             parsed = int(value)
