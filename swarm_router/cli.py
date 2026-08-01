@@ -15,7 +15,7 @@ from urllib import error, request
 
 from .agents import AgentManifest, HandoffEnvelope, default_registry, load_json_object
 from .catalog import ModelCatalog
-from .client import OpenWebUIClient
+from .client import OpenWebUIClient, RequestFailure
 from .config import load_config
 from .dashboard import serve
 from .discord_notifications import NotificationStore, deliver, load_config as load_discord_config, notification_from_store
@@ -808,18 +808,25 @@ def _probe_ids(
 
 def _probe_model(catalog: ModelCatalog, client: OpenWebUIClient, config, model_id: str) -> tuple[str, str, int, str]:
     started = monotonic()
+    record = catalog.get(model_id)
     try:
         result = client.chat(
             model_id, "Return only the requested token.",
             "Return exactly: HEALTHY", 20, 0.0,
             timeout_seconds=config.probe.timeout_seconds,
+            catalog_context=record.context_length if record else None,
         )
         elapsed = int((monotonic() - started) * 1000)
         status = "healthy" if result.content.strip() == "HEALTHY" else "failed"
         detail = "" if status == "healthy" else f"Unexpected response: {result.content[:200]}"
     except Exception as exc:
         elapsed = int((monotonic() - started) * 1000)
-        status, detail = "failed", str(exc)
+        status = (
+            "context_overflow"
+            if isinstance(exc, RequestFailure) and exc.category == "context_overflow"
+            else "failed"
+        )
+        detail = str(exc)
     catalog.record_probe(model_id, status, elapsed, detail)
     return model_id, status, elapsed, detail
 
@@ -876,6 +883,7 @@ def main(argv: list[str] | None = None) -> int:
             result = client.chat(
                 args.model, system, user, max(64, min(args.max_tokens, 800)), 0.0,
                 timeout_seconds=timeout,
+                catalog_context=record.context_length,
             )
             stamp = datetime.now(timezone.utc).strftime("bench-%Y%m%dT%H%M%S%fZ")
             safe_model = re.sub(r"[^A-Za-z0-9._-]+", "-", args.model)

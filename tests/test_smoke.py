@@ -95,9 +95,16 @@ class ScriptedClient:
         self.calls: list[dict[str, object]] = []
 
     def chat(self, model: str, system: str, user: str, max_tokens: int,
-             temperature: float, timeout_seconds: int | None = None) -> ChatResult:
+             temperature: float, timeout_seconds: int | None = None,
+             catalog_context: int | None = None) -> ChatResult:
         is_judge = "integration clerk" in system
-        self.calls.append({"model": model, "judge": is_judge, "timeout": timeout_seconds, "user": user})
+        self.calls.append({
+            "model": model,
+            "judge": is_judge,
+            "timeout": timeout_seconds,
+            "user": user,
+            "catalog_context": catalog_context,
+        })
         category = self.judge_failure if is_judge else self.worker_failures.get(model, "")
         if category:
             raise RequestFailure(f"controlled {category}", category)
@@ -124,6 +131,23 @@ class FakeResponse:
 
 
 class SwarmSmokeTest(unittest.TestCase):
+    def test_orchestrator_forwards_worker_and_judge_catalog_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = test_config(Path(temp))
+            orchestrator = SwarmOrchestrator(config)
+            orchestrator.catalog.sync([
+                {"id": "worker/planner", "context_length": 24576},
+                {"id": "judge/model", "context_length": 32768},
+            ])
+            scripted = ScriptedClient()
+            orchestrator.client = scripted  # type: ignore[assignment]
+            orchestrator.run("Task", "code", "", [], requested_workers=["planner"])
+
+        self.assertEqual(
+            [(call["model"], call["catalog_context"]) for call in scripted.calls],
+            [("worker/planner", 24576), ("judge/model", 32768)],
+        )
+
     def test_model_override_dashboard_and_authority(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenWebUI)
         Thread(target=server.serve_forever, daemon=True).start()
@@ -288,6 +312,20 @@ class SwarmSmokeTest(unittest.TestCase):
             judge_failed = next(event for event in events if event["event"] == "judge_failed")
             self.assertEqual(judge_failed["timeout_seconds"], 2)
 
+    def test_uniform_worker_failure_preserves_request_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = test_config(Path(temp))
+            orchestrator = SwarmOrchestrator(config)
+            orchestrator.client = ScriptedClient({
+                "worker/planner": "context_overflow",
+                "worker/critic": "context_overflow",
+            })  # type: ignore[assignment]
+            with self.assertRaises(RequestFailure) as raised:
+                orchestrator.run(
+                    "Task", "code", "", [], requested_workers=["planner", "critic"]
+                )
+            self.assertEqual(raised.exception.category, "context_overflow")
+
     def test_reliability_penalty_cooldown_recovery_and_explicit_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -329,6 +367,30 @@ class SwarmSmokeTest(unittest.TestCase):
                 {item.model_id for item in catalog.recommend("code", 4, config.reliability, "planner")},
             )
 
+    def test_context_overflow_is_audited_without_penalizing_model_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = test_config(Path(temp))
+            catalog = ModelCatalog(config.swarm.catalog_path)
+            model_id = "vendor/qwen-code-instruct"
+            catalog.sync([{"id": model_id}])
+            catalog.record_probe(model_id, "healthy", 10)
+            for index in range(4):
+                catalog.record_task_attempt(
+                    f"context-{index}", model_id, "planner", "code", "context_overflow", 1
+                )
+
+            record = catalog.get(model_id)
+            assert record is not None
+            evidence = catalog.reliability_summary(model_id, config.reliability)
+            self.assertEqual(record.health, "healthy")
+            self.assertEqual(evidence["recent_attempts"], 0)
+            self.assertEqual(evidence["consecutive_failures"], 0)
+            self.assertFalse(evidence["cooldown"])
+            self.assertEqual(
+                [item.model_id for item in catalog.recommend("code", 1, config.reliability)],
+                [model_id],
+            )
+
     def test_recent_success_latency_is_only_a_tie_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -362,17 +424,39 @@ class SwarmSmokeTest(unittest.TestCase):
     def test_client_resource_exhausted_is_capacity(self) -> None:
         os.environ["TEST_SWARM_KEY"] = "test-only"
         client = OpenWebUIClient("http://127.0.0.1:9", "/chat", "TEST_SWARM_KEY", 1)
-        http_error = error.HTTPError(
-            "http://127.0.0.1:9/chat",
-            400,
-            "Bad Request",
-            {},
-            BytesIO(b'{"detail":"ResourceExhausted: Worker local total request limit reached (48/48)"}'),
+        cases = (
+            (400, b'{"detail":"ResourceExhausted: Worker local total request limit reached (48/48)"}'),
+            (429, b""),
+            (503, b""),
         )
-        with patch("swarm_router.client.request.urlopen", side_effect=http_error):
-            with self.assertRaises(RequestFailure) as raised:
-                client.chat("model", "system", "user", 10, 0.0)
-        self.assertEqual(raised.exception.category, "capacity")
+        for status, body in cases:
+            with self.subTest(status=status):
+                http_error = error.HTTPError(
+                    "http://127.0.0.1:9/chat", status, "upstream", {}, BytesIO(body)
+                )
+                with patch("swarm_router.client.request.urlopen", side_effect=http_error):
+                    with self.assertRaises(RequestFailure) as raised:
+                        client.chat("model", "system", "user", 10, 0.0)
+                self.assertEqual(raised.exception.category, "capacity")
+
+    def test_client_context_length_code_outranks_capacity_markers(self) -> None:
+        os.environ["TEST_SWARM_KEY"] = "test-only"
+        client = OpenWebUIClient("http://127.0.0.1:9", "/chat", "TEST_SWARM_KEY", 1)
+        bodies = (
+            b"",
+            b'{"error":{"code":"context_length_exceeded"}}',
+            b'{"error":{"code":"context_length_exceeded","message":"ResourceExhausted: model capacity exceeded"}}',
+            b'{"error":{"message":"ResourceExhausted: maximum context length exceeded"}}',
+        )
+        for index, body in enumerate(bodies):
+            with self.subTest(body=body):
+                http_error = error.HTTPError(
+                    "http://127.0.0.1:9/chat", 413 if index == 0 else 400, "Bad Request", {}, BytesIO(body)
+                )
+                with patch("swarm_router.client.request.urlopen", side_effect=http_error):
+                    with self.assertRaises(RequestFailure) as raised:
+                        client.chat("model", "system", "user", 10, 0.0)
+                self.assertEqual(raised.exception.category, "context_overflow")
 
 
 if __name__ == "__main__":

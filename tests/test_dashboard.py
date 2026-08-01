@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 from swarm_router.catalog import ModelCatalog
+from swarm_router.client import ChatResult, OpenWebUIClient, RequestFailure
 from swarm_router.config import load_config
 from swarm_router.dashboard import FORGE_HTML, DashboardApp, Handler, _toronto_time
 from swarm_router.discord_notifications import NotificationStore, notification_from_store
@@ -231,6 +232,64 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("confirm:'generate image'", FORGE_HTML)
         self.assertIn("/api/tasks/", FORGE_HTML)
         self.assertIn("Developer Runs", FORGE_HTML)
+
+    def test_probe_forwards_catalog_context(self) -> None:
+        self.app.catalog.sync([{"id": "worker/model", "context_length": 28672}])
+        with patch.object(
+            self.app.client,
+            "chat",
+            return_value=ChatResult("worker/model", "HEALTHY", {}),
+        ) as chat:
+            self.app.probe_models(["worker/model"])
+        self.assertEqual(chat.call_args.kwargs["catalog_context"], 28672)
+
+        with patch.object(
+            self.app.client,
+            "chat",
+            side_effect=RequestFailure("prompt exceeds context", "context_overflow", 413),
+        ):
+            self.app.probe_models(["worker/model"])
+        self.assertEqual(self.app.catalog.get("worker/model").probe_status, "healthy")  # type: ignore[union-attr]
+        self.assertEqual(self.app.catalog.probe_history(1)[0]["status"], "context_overflow")
+
+    def test_dispatch_run_uses_catalog_context(self) -> None:
+        contexts: list[int | None] = []
+        self.app.catalog.sync([
+            {"id": "worker/model", "context_length": 24576},
+            {"id": "judge/model", "context_length": 32768},
+        ])
+
+        def chat(_client, model, system, *args, **kwargs):
+            contexts.append(kwargs.get("catalog_context"))
+            content = (
+                json.dumps({
+                    "answer": "Integrated proposal",
+                    "confidence": 0.8,
+                    "agreements": [],
+                    "disagreements": [],
+                    "verification": [],
+                    "selected_candidates": ["planner"],
+                    "stale_or_uncertain_claims": [],
+                    "confidence_reasons": ["test"],
+                })
+                if "integration clerk" in system
+                else "Candidate"
+            )
+            return ChatResult(model, content, {})
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self) -> None:
+                self.target()
+
+        with (
+            patch.object(OpenWebUIClient, "chat", chat),
+            patch("swarm_router.dashboard.Thread", ImmediateThread),
+        ):
+            self.app.start_run({"objective": "Task", "mode": "auto"})
+        self.assertEqual(contexts, [24576, 32768])
 
     def test_developer_runs_requires_auth_and_redacts_secrets(self) -> None:
         with self.app.developer._connect() as db:

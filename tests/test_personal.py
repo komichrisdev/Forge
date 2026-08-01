@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from http.server import ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
@@ -13,6 +14,7 @@ import os
 import unittest
 
 from swarm_router.catalog import ModelCatalog
+from swarm_router.client import ChatResult, OpenWebUIClient
 from swarm_router.config import AppConfig, load_config
 from swarm_router.journal import TaskJournal
 from swarm_router.personal import PersonalError, PersonalHandler, PersonalTaskManager
@@ -255,6 +257,43 @@ class PersonalApiTest(unittest.TestCase):
         self.assertIn("TASK_ASSIGNED", [event.event_type for event in journal.events(forge_task_id)])
         self.assertEqual(journal.checkpoints(forge_task_id)[0].checkpoint_reference, f"personal/{task_id}/task.json")
 
+    def test_personal_task_uses_catalog_context(self) -> None:
+        contexts: list[int | None] = []
+        judge_id = "fake/deepseek-judge-reason"
+        for worker in self.config.workers:
+            self.manager.catalog.update(worker.model, context_length=24576)
+        self.manager.catalog.update(judge_id, context_length=32768)
+
+        def chat(_client, model, system, *args, **kwargs):
+            contexts.append(kwargs.get("catalog_context"))
+            content = (
+                json.dumps({
+                    "answer": "Weekly plan",
+                    "confidence": 0.8,
+                    "agreements": [],
+                    "disagreements": [],
+                    "verification": [],
+                    "selected_candidates": ["planner"],
+                    "stale_or_uncertain_claims": [],
+                    "confidence_reasons": ["test"],
+                })
+                if "integration clerk" in system
+                else "Candidate"
+            )
+            return ChatResult(model, content, {})
+
+        with patch.object(OpenWebUIClient, "chat", chat):
+            status, _payload = self.api(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "swarm-personal",
+                    "messages": [{"role": "user", "content": "Plan my week"}],
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(contexts, [24576, 32768])
+
     def test_openai_tool_fields_are_ignored_for_compatibility(self) -> None:
         with patch("swarm_router.personal.SwarmOrchestrator.run", return_value=("Hello", self.root, {"answer": "Hello"})):
             status, payload = self.api(
@@ -306,6 +345,48 @@ class PersonalApiTest(unittest.TestCase):
         self.assertEqual(payload["choices"][0]["message"]["content"], "Recovered")
         task = self.manager.task_view(str(payload["task_id"]))
         self.assertEqual(task["retry_count"], 1)
+
+    def test_context_overflow_fails_without_retry_and_capacity_keeps_its_category(self) -> None:
+        real_urlopen = request.urlopen
+
+        def status_only_upstream(status_code: int):
+            calls: list[str] = []
+
+            def urlopen(req, *args, **kwargs):
+                if req.full_url.startswith(self.base_url):
+                    return real_urlopen(req, *args, **kwargs)
+                calls.append(req.full_url)
+                raise error.HTTPError(req.full_url, status_code, "upstream", {}, BytesIO())
+
+            return calls, urlopen
+
+        calls, urlopen = status_only_upstream(413)
+        with patch("swarm_router.client.request.urlopen", side_effect=urlopen):
+            status, payload = self.api(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "swarm-personal",
+                    "messages": [{"role": "user", "content": "Plan my week"}],
+                },
+            )
+        self.assertEqual(status, 413)
+        self.assertEqual(payload["error"]["code"], "context_overflow")
+        self.assertEqual(len(calls), 1)
+
+        calls, urlopen = status_only_upstream(429)
+        with patch("swarm_router.client.request.urlopen", side_effect=urlopen):
+            status, payload = self.api(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "swarm-personal",
+                    "messages": [{"role": "user", "content": "Plan tomorrow"}],
+                },
+            )
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"]["code"], "capacity")
+        self.assertEqual(len(calls), 2)
 
     def test_streaming_completion_emits_status_and_final_text(self) -> None:
         with patch("swarm_router.personal.SwarmOrchestrator.run", return_value=("Orbit answer", self.root, {"answer": "Orbit answer"})):

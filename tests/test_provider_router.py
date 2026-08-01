@@ -9,6 +9,32 @@ from swarm_router.providers import ProviderModel, provider_items
 
 
 class ProviderRouterTest(unittest.TestCase):
+    def test_context_metadata_defaults_safely_and_only_auto_tightens(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            catalog = ModelCatalog(Path(temp) / "catalog.db")
+            model_id = "provider/runtime-model"
+            catalog.sync([{"id": model_id, "context_length": 65536}])
+            self.assertEqual(catalog.get(model_id).context_length, 65536)  # type: ignore[union-attr]
+
+            catalog.sync([{"id": model_id, "n_ctx": 8192}])
+            self.assertEqual(catalog.get(model_id).context_length, 8192)  # type: ignore[union-attr]
+            catalog.sync([{"id": model_id, "context_length": 131072}])
+            self.assertEqual(catalog.get(model_id).context_length, 8192)  # type: ignore[union-attr]
+            catalog.sync([{"id": model_id}])
+            self.assertEqual(catalog.get(model_id).context_length, 8192)  # type: ignore[union-attr]
+
+            unknown_id = "provider/no-runtime-metadata"
+            catalog.sync([{"id": model_id}, {"id": unknown_id}])
+            self.assertIsNone(catalog.get(unknown_id).context_length)  # type: ignore[union-attr]
+            catalog.sync([{"id": model_id}, {"id": unknown_id, "context_length": 65536}])
+            self.assertEqual(catalog.get(unknown_id).context_length, 65536)  # type: ignore[union-attr]
+            self.assertEqual(catalog.update(model_id, context_length=32768).context_length, 32768)
+            catalog.sync([{"id": model_id}, {"id": unknown_id}])
+            self.assertEqual(catalog.get(model_id).context_length, 32768)  # type: ignore[union-attr]
+            for invalid in (True, 0, -1, 2**63, "invalid"):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    catalog.update(model_id, context_length=invalid)
+
     def test_inventory_reconcile_quarantine_misses_and_last_known_good(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             catalog = ModelCatalog(Path(temp) / "catalog.db")

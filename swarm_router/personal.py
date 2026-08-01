@@ -18,6 +18,7 @@ import subprocess
 import uuid
 
 from .catalog import ModelCatalog, ModelRecord
+from .client import RequestFailure
 from .config import AppConfig
 from .dashboard import DashboardApp
 from .developer import DEVELOPER_MODEL_ID, DeveloperCoordinator, DeveloperError
@@ -437,7 +438,9 @@ class PersonalTaskManager:
             "message_limit": (400, "message_limit"),
             "conversation_limit": (400, "conversation_limit"),
             "unsupported_fields": (400, "unsupported_fields"),
+            "context_overflow": (413, "context_overflow"),
             "no_healthy_model": (503, "no_healthy_model"),
+            "capacity": (503, "capacity"),
             "timeout": (504, "timeout"),
             "interrupted": (500, "interrupted"),
             "internal": (500, "internal"),
@@ -735,20 +738,29 @@ class PersonalTaskManager:
             self._fail(task_id, str(exc), exc.code, started)
         except Exception as exc:
             current = self._load_task(task_id)
-            if current["retry_count"] < self.config.personal.max_retries and not self._cancelled(task_id):
+            failure_category = exc.category if isinstance(exc, RequestFailure) else "task_failed"
+            if (
+                failure_category != "context_overflow"
+                and current["retry_count"] < self.config.personal.max_retries
+                and not self._cancelled(task_id)
+            ):
                 self._update(task_id, retry_count=int(current["retry_count"]) + 1)
-                self._emit(task_id, "retrying", category="task_failed")
+                self._emit(task_id, "retrying", category=failure_category)
                 self.journal.append_event(
                     self._forge_task_id(task_id),
                     JournalEventType.RECOVERY_PROPOSED,
                     agent_id="manager",
                     message="Existing personal-task retry path proposed one retry.",
-                    metadata={"personal_task_id": task_id, "category": "task_failed"},
+                    metadata={"personal_task_id": task_id, "category": failure_category},
                     transition_key=f"personal:{task_id}:recovery-proposed:r{int(current['retry_count'])}",
                 )
                 self._queue.put(task_id)
                 return
-            category = "cancelled" if self._cancelled(task_id) else "internal"
+            category = (
+                "cancelled"
+                if self._cancelled(task_id)
+                else exc.category if isinstance(exc, RequestFailure) else "internal"
+            )
             self._fail(task_id, str(exc), category, started)
         finally:
             self._prune_completed()

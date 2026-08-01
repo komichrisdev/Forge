@@ -30,7 +30,7 @@ ARCHITECTURE_REVISION = "R12"
 
 from .agents import default_registry
 from .catalog import ModelCatalog
-from .client import OpenWebUIClient
+from .client import OpenWebUIClient, RequestFailure
 from .config import AppConfig
 from .developer import DeveloperCoordinator, _redact_text
 from .discord_notifications import NotificationStore, load_config as load_discord_config
@@ -311,6 +311,7 @@ class DashboardApp:
 
         def probe_one(model_id: str) -> None:
             started = monotonic()
+            record = self.catalog.get(model_id)
             try:
                 result = self.client.chat(
                     model=model_id,
@@ -319,6 +320,7 @@ class DashboardApp:
                     max_tokens=20,
                     temperature=0.0,
                     timeout_seconds=self.config.probe.timeout_seconds,
+                    catalog_context=record.context_length if record else None,
                 )
                 elapsed = int((monotonic() - started) * 1000)
                 status = "healthy" if result.content.strip() == "HEALTHY" else "failed"
@@ -328,7 +330,12 @@ class DashboardApp:
                 )
             except Exception as exc:
                 elapsed = int((monotonic() - started) * 1000)
-                self.catalog.record_probe(model_id, "failed", elapsed, str(exc))
+                status = (
+                    "context_overflow"
+                    if isinstance(exc, RequestFailure) and exc.category == "context_overflow"
+                    else "failed"
+                )
+                self.catalog.record_probe(model_id, status, elapsed, str(exc))
 
         with ThreadPoolExecutor(max_workers=min(self.config.probe.max_parallel, max(1, len(unique_ids)))) as executor:
             futures = [executor.submit(probe_one, model_id) for model_id in unique_ids]

@@ -88,16 +88,17 @@ class OpenWebUIClient:
             lower = detail.lower()
             if exc.code in {401, 403}:
                 category = "authentication"
-            elif any(token in lower for token in (
-                "resourceexhausted", "resource exhausted", "quota",
-                "capacity", "rate limit", "ratelimit",
-            )):
-                category = "capacity"
-            elif any(token in lower for token in (
+            elif exc.code == 413 or any(token in lower for token in (
+                "context_length_exceeded", "context length exceeded",
                 "context size", "context window", "maximum context",
                 "prompt is too long", "too many tokens", "context length",
             )):
                 category = "context_overflow"
+            elif exc.code in {429, 503} or any(token in lower for token in (
+                "resourceexhausted", "resource exhausted", "quota",
+                "capacity", "rate limit", "ratelimit",
+            )):
+                category = "capacity"
             else:
                 category = "http"
             raise RequestFailure(

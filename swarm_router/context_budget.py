@@ -84,23 +84,23 @@ class ContextBudgetExceeded(ValueError):
 
 
 def _coerce_positive_int(value: Any, *, name: str) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"{name} must be a positive integer")
     try:
         result = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a positive integer") from exc
-    if result <= 0:
+    if not 0 < result <= 2**63 - 1:
         raise ValueError(f"{name} must be a positive integer")
     return result
 
 
 def _coerce_nonnegative_int(value: Any, *, name: str) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"{name} must be a non-negative integer")
     try:
         result = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a non-negative integer") from exc
     if result < 0:
         raise ValueError(f"{name} must be a non-negative integer")

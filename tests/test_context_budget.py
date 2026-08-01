@@ -269,6 +269,16 @@ if __name__ == "__main__":
 class CatalogOverridesProfilesTest(unittest.TestCase):
     """Catalog/runtime context takes precedence over model-name profiles."""
 
+    def test_invalid_catalog_context_types_use_the_model_fallback(self) -> None:
+        for invalid in (True, 1.5, float("nan"), float("inf"), 2**63):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(
+                    resolve_context_limit("unknown-model", catalog_context=invalid),
+                    DEFAULT_CONTEXT_LIMIT,
+                )
+        with self.assertRaises(ValueError):
+            evaluate_context_budget({"messages": []}, context_limit=2**63)
+
     def test_catalog_context_overrides_model_profile(self) -> None:
         """A qwen36-35b model normally resolves to 65k, but catalog=16k should win."""
         self.assertEqual(

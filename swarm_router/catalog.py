@@ -107,14 +107,22 @@ def _context_length(item: dict[str, Any]) -> int | None:
         info_meta.get("context_length"),
         info_meta.get("n_ctx"),
     ))
+    valid: list[int] = []
     for value in candidates:
-        try:
-            parsed = int(value)
-            if parsed > 0:
-                return parsed
-        except (TypeError, ValueError):
-            pass
-    return None
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                continue
+        else:
+            continue
+        if 0 < parsed <= 2**63 - 1:
+            valid.append(parsed)
+    return min(valid) if valid else None
 
 
 def _bool_meta(item: dict[str, Any], *keys: str, default: bool = False) -> bool:
@@ -427,6 +435,9 @@ class ModelCatalog:
                 supports_streaming = _bool_meta(item, "supports_streaming", "streaming", default=True)
                 supports_images = _bool_meta(item, "supports_images", "vision")
                 supports_reasoning = "reasoning" in capabilities or any(cap.startswith("reasoning.") for cap in capabilities)
+                observed_context = _context_length(item)
+                # ponytail: inventory only auto-tightens context; use a validated
+                # owner update after independently verifying a runtime expansion.
                 db.execute(
                     """
                     INSERT INTO models(
@@ -463,7 +474,11 @@ class ModelCatalog:
                         consecutive_present=models.consecutive_present + 1,
                         consecutive_missing=0,
                         last_inventory_error='',
-                        context_length=COALESCE(excluded.context_length, models.context_length),
+                        context_length=CASE
+                            WHEN ?=1 THEN COALESCE(models.context_length, excluded.context_length)
+                            WHEN models.context_length IS NULL THEN excluded.context_length
+                            ELSE MIN(models.context_length, excluded.context_length)
+                        END,
                         kind=CASE WHEN models.kind='unknown' THEN excluded.kind ELSE models.kind END,
                         capabilities=CASE WHEN models.capabilities='[]' THEN excluded.capabilities ELSE models.capabilities END
                     """,
@@ -477,7 +492,7 @@ class ModelCatalog:
                         json.dumps(capabilities),
                         0 if kind != "chat" else 1,
                         0 if is_new or kind != "chat" else (1 if mode == "live" else 0),
-                        _context_length(item),
+                        observed_context,
                         int(supports_tools),
                         int(supports_streaming),
                         int(supports_images),
@@ -491,6 +506,7 @@ class ModelCatalog:
                         int(was_missing),
                         mode,
                         int(was_missing),
+                        int(observed_context is None),
                     ),
                 )
             known_rows = db.execute(
@@ -655,6 +671,14 @@ class ModelCatalog:
     def update(self, model_id: str, **fields: Any) -> ModelRecord:
         allowed = {"kind", "capabilities", "enabled", "quality", "speed", "notes", "context_length"}
         updates = {key: value for key, value in fields.items() if key in allowed}
+        if "context_length" in updates:
+            value = updates["context_length"]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 < value <= 2**63 - 1
+            ):
+                raise ValueError("context_length must be a positive SQLite integer")
         if "capabilities" in updates:
             updates["capabilities"] = json.dumps(list(updates["capabilities"]))
         if "enabled" in updates:
@@ -682,22 +706,23 @@ class ModelCatalog:
     def record_probe(self, model_id: str, status: str, elapsed_ms: int, error: str = "") -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as db:
-            db.execute(
-                """
-                UPDATE models
-                SET probe_status=?, probe_ms=?, probe_error=?, last_probe=?,
-                    last_successful_probe=CASE WHEN ?='healthy' THEN ? ELSE last_successful_probe END,
-                    last_failure=CASE WHEN ?='failed' THEN ? ELSE last_failure END,
-                    health=CASE WHEN ?='healthy' THEN 'healthy' ELSE 'failed' END,
-                    quarantined=CASE WHEN ?='healthy' THEN 0 ELSE quarantined END,
-                    available=CASE
-                        WHEN ?='healthy' AND observed_available=1 AND kind='chat' THEN 1
-                        ELSE available
-                    END
-                WHERE model_id=?
-                """,
-                (status, elapsed_ms, error[:2000], now, status, now, status, now, status, status, status, model_id),
-            )
+            if status != "context_overflow":
+                db.execute(
+                    """
+                    UPDATE models
+                    SET probe_status=?, probe_ms=?, probe_error=?, last_probe=?,
+                        last_successful_probe=CASE WHEN ?='healthy' THEN ? ELSE last_successful_probe END,
+                        last_failure=CASE WHEN ?='failed' THEN ? ELSE last_failure END,
+                        health=CASE WHEN ?='healthy' THEN 'healthy' ELSE 'failed' END,
+                        quarantined=CASE WHEN ?='healthy' THEN 0 ELSE quarantined END,
+                        available=CASE
+                            WHEN ?='healthy' AND observed_available=1 AND kind='chat' THEN 1
+                            ELSE available
+                        END
+                    WHERE model_id=?
+                    """,
+                    (status, elapsed_ms, error[:2000], now, status, now, status, now, status, status, status, model_id),
+                )
             db.execute(
                 "INSERT INTO probe_history(model_id, probed_at, status, elapsed_ms, error) VALUES (?, ?, ?, ?, ?)",
                 (model_id, now, status, elapsed_ms, error[:2000]),
@@ -722,7 +747,7 @@ class ModelCatalog:
         retry_count: int = 0,
     ) -> None:
         now = datetime.now(timezone.utc)
-        health = "healthy" if status == "success" else status
+        health = None if status == "context_overflow" else ("healthy" if status == "success" else status)
         cooldown_until: str | None = None
         if status == "success":
             cooldown_until = ""
@@ -749,7 +774,7 @@ class ModelCatalog:
             db.execute(
                 """
                 UPDATE models SET
-                    health=?,
+                    health=COALESCE(?, health),
                     cooldown_until=CASE WHEN ? IS NULL THEN cooldown_until ELSE ? END
                 WHERE model_id=?
                 """,
@@ -818,14 +843,17 @@ class ModelCatalog:
             tasks = db.execute(
                 """
                 SELECT attempted_at, status, elapsed_ms
-                FROM task_attempts WHERE model_id=? ORDER BY attempted_at DESC, id DESC LIMIT ?
+                FROM task_attempts
+                WHERE model_id=? AND status!='context_overflow'
+                ORDER BY attempted_at DESC, id DESC LIMIT ?
                 """,
                 (model_id, window),
             ).fetchall()
             probes = db.execute(
                 """
                 SELECT status, elapsed_ms FROM probe_history
-                WHERE model_id=? ORDER BY id DESC LIMIT ?
+                WHERE model_id=? AND status!='context_overflow'
+                ORDER BY id DESC LIMIT ?
                 """,
                 (model_id, window),
             ).fetchall()

@@ -307,6 +307,7 @@ class SwarmOrchestrator:
 
         def call_worker(worker: AgentConfig) -> tuple[str, str, str, int]:
             system_prompt = f"{worker.system.strip()}\n\n{authority_block(config.authority)}"
+            record = self.catalog.get(worker.model)
             worker_prompt_path = prompts_dir / f"worker-{_safe_name(worker.name)}.txt"
             _private_write(worker_prompt_path, f"SYSTEM\n{system_prompt}\n\nUSER\n{base_prompt}\n")
             log.emit(
@@ -322,6 +323,7 @@ class SwarmOrchestrator:
                     max_tokens=config.swarm.max_worker_output_tokens,
                     temperature=config.swarm.temperature,
                     timeout_seconds=config.swarm.worker_timeout_seconds,
+                    catalog_context=record.context_length if record else None,
                 )
             except Exception as exc:
                 elapsed = int((monotonic() - started) * 1000)
@@ -397,11 +399,15 @@ class SwarmOrchestrator:
                 )
 
             if not candidates:
-                categories = ", ".join(sorted({str(item["category"]) for item in failures}))
-                raise RuntimeError(
+                failure_categories = sorted({str(item["category"]) for item in failures})
+                categories = ", ".join(failure_categories)
+                message = (
                     f"Every worker failed within bounded request limits ({categories or 'unknown'}). "
                     "Use an explicit known-working model or retry later; no second swarm was launched."
                 )
+                if len(failure_categories) == 1:
+                    raise RequestFailure(message, failure_categories[0])
+                raise RuntimeError(message)
 
             integration_prompt = judge_prompt(
                 objective=objective,
@@ -424,6 +430,7 @@ class SwarmOrchestrator:
                 timeout_seconds=config.swarm.judge_timeout_seconds, retry_count=0,
             )
             judge_started = monotonic()
+            judge_record = self.catalog.get(judge.model)
             try:
                 judge_result = self.client.chat(
                     model=judge.model,
@@ -432,6 +439,7 @@ class SwarmOrchestrator:
                     max_tokens=config.swarm.max_judge_output_tokens,
                     temperature=0.0,
                     timeout_seconds=config.swarm.judge_timeout_seconds,
+                    catalog_context=judge_record.context_length if judge_record else None,
                 )
             except Exception as exc:
                 elapsed = int((monotonic() - judge_started) * 1000)

@@ -8,7 +8,9 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from swarm_router.client import OpenWebUIClient, RequestFailure
+from swarm_router.catalog import ModelCatalog, _context_length
+from swarm_router.cli import _probe_model, main as cli_main
+from swarm_router.client import ChatResult, OpenWebUIClient, RequestFailure
 from swarm_router.config import load_config
 from swarm_router.context_budget import (
     ContextBudgetExceeded,
@@ -17,7 +19,6 @@ from swarm_router.context_budget import (
     preflight_check,
     resolve_context_limit,
 )
-from swarm_router.catalog import _context_length
 from swarm_router.developer import DeveloperCoordinator, _compact_phase_messages
 
 
@@ -172,7 +173,7 @@ class ContextBudgetReviewedTest(unittest.TestCase):
     def test_catalog_parser_consumes_meta_n_ctx(self) -> None:
         """A response like {"id": "local-qwen36-35b-a3b-windows", "info": {"meta": {"n_ctx": 61440}}}
         must produce record.context_length == 61440.
-        Tests all 8 runtime payload forms in precedence order.
+        Tests all eight runtime payload forms and conservative conflicts.
         """
         # 1) Top-level context_length
         self.assertEqual(_context_length({"context_length": 8192}), 8192)
@@ -191,13 +192,102 @@ class ContextBudgetReviewedTest(unittest.TestCase):
         # 8) info.meta.n_ctx (the form the prompt describes)
         item = {"id": "local-qwen36-35b-a3b-windows", "info": {"meta": {"n_ctx": 61440}}}
         self.assertEqual(_context_length(item), 61440)
-        # context_length at top-level takes precedence over n_ctx
+        # Conflicting values select the smaller credible runtime limit.
         self.assertEqual(_context_length({"context_length": 8192, "n_ctx": 61440}), 8192)
-        # top-level meta.n_ctx takes precedence over info.meta.n_ctx
         self.assertEqual(
             _context_length({"meta": {"n_ctx": 12288}, "info": {"meta": {"n_ctx": 65536}}}),
             12288,
         )
+        # Conflicting runtime fields fail closed at the smallest valid value.
+        self.assertEqual(_context_length({"context_length": 65536, "n_ctx": 8192}), 8192)
+        self.assertEqual(
+            _context_length({"context_length": True, "info": {"meta": {"n_ctx": 4096}}}),
+            4096,
+        )
+        self.assertEqual(_context_length({"context_length": "8192"}), 8192)
+        self.assertEqual(_context_length({"context_length": 1.5, "n_ctx": 4096}), 4096)
+        self.assertEqual(_context_length({"context_length": float("inf"), "n_ctx": 4096}), 4096)
+        self.assertEqual(_context_length({"context_length": 2**63, "n_ctx": 4096}), 4096)
+
+    def test_cli_probe_and_benchmark_forward_catalog_context(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = write_config(root)
+            config_path = root / "config.toml"
+            model_id = "fake/qwen-planner-instruct"
+            catalog = ModelCatalog(config.swarm.catalog_path)
+            catalog.sync([{"id": model_id, "context_length": 24576}])
+            catalog.record_probe(model_id, "healthy", 1)
+            seen: list[int | None] = []
+
+            client = SimpleNamespace(
+                chat=lambda *args, **kwargs: (
+                    seen.append(kwargs.get("catalog_context"))
+                    or ChatResult(model_id, "HEALTHY", {})
+                )
+            )
+            self.assertEqual(_probe_model(catalog, client, config, model_id)[1], "healthy")
+
+            def context_overflow(*_args, **_kwargs):
+                raise RequestFailure("prompt exceeds context", "context_overflow", 413)
+
+            client.chat = context_overflow
+            self.assertEqual(_probe_model(catalog, client, config, model_id)[1], "context_overflow")
+            self.assertEqual(catalog.get(model_id).probe_status, "healthy")  # type: ignore[union-attr]
+            self.assertEqual(catalog.probe_history(1)[0]["status"], "context_overflow")
+            evidence = catalog.reliability_summary(model_id, config.reliability)
+            self.assertEqual(evidence["probe_attempts"], 2)
+            self.assertEqual(evidence["probe_success_rate"], 1.0)
+
+            def benchmark_chat(_client, *args, **kwargs):
+                seen.append(kwargs.get("catalog_context"))
+                return ChatResult(
+                    model_id,
+                    "Repository context was not supplied; inspect it before implementation.",
+                    {},
+                )
+
+            with patch.object(OpenWebUIClient, "chat", benchmark_chat), patch("builtins.print"):
+                status = cli_main([
+                    "--config", str(config_path), "benchmark", "missing-go-context",
+                    "--model", model_id, "--role", "planner",
+                ])
+
+            judge_id = "fake/deepseek-judge-reason"
+            catalog.sync([
+                {"id": model_id, "context_length": 24576},
+                {"id": judge_id, "context_length": 32768},
+            ])
+            run_contexts: list[int | None] = []
+
+            def run_chat(_client, model, system, *args, **kwargs):
+                run_contexts.append(kwargs.get("catalog_context"))
+                content = (
+                    json.dumps({
+                        "answer": "Integrated proposal",
+                        "confidence": 0.8,
+                        "agreements": [],
+                        "disagreements": [],
+                        "verification": [],
+                        "selected_candidates": ["planner"],
+                        "stale_or_uncertain_claims": [],
+                        "confidence_reasons": ["test"],
+                    })
+                    if "integration clerk" in system
+                    else "Candidate"
+                )
+                return ChatResult(model, content, {})
+
+            with patch.object(OpenWebUIClient, "chat", run_chat), patch("builtins.print"):
+                run_status = cli_main([
+                    "--config", str(config_path), "run", "--prompt", "Task",
+                    "--mode", "general", "--worker", "planner", "--json",
+                ])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(seen, [24576, 24576])
+        self.assertEqual(run_status, 0)
+        self.assertEqual(run_contexts, [24576, 32768])
 
     def test_invalid_reserves_fail_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "protocol_reserve"):
