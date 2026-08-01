@@ -148,10 +148,24 @@ def _tool_schemas(tools: Any) -> dict[str, dict[str, Any]]:
     return schemas
 
 
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content if content.strip() else ""
+    if isinstance(content, list):
+        return "\n".join(
+            part if isinstance(part, str) else str(part.get("text", ""))
+            for part in content
+            if isinstance(part, str)
+            or (isinstance(part, dict) and isinstance(part.get("text"), str))
+        ).strip()
+    return ""
+
+
 def _normalize_messages(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise DeveloperError("messages must be a non-empty array.", code="invalid_messages")
     normalized = []
+    seen_tool_call_ids: set[str] = set()
     for item in value:
         if not isinstance(item, dict) or item.get("role") not in {"system", "user", "assistant", "tool"}:
             raise DeveloperError("Invalid OpenAI message.", code="invalid_messages")
@@ -162,19 +176,24 @@ def _normalize_messages(value: Any) -> list[dict[str, Any]]:
             if content is not None and not isinstance(content, str | list):
                 raise DeveloperError("Invalid message content.", code="invalid_messages")
             message["content"] = content
+        if role == "user" and not _message_text(message.get("content")):
+            raise DeveloperError("A text user instruction is required.", code="invalid_messages")
         if role == "assistant" and "tool_calls" in item:
             if not isinstance(item["tool_calls"], list):
                 raise DeveloperError("assistant tool_calls must be an array.", code="invalid_messages")
             message["tool_calls"] = []
             for tc in item["tool_calls"]:
                 if not isinstance(tc, dict):
-                    continue
-                call_id = tc.get("id")
-                normalized_id = _normalize_tool_call_id(call_id)
-                if normalized_id is not None:
-                    tc_copy = {k: v for k, v in tc.items() if k != "id"}
-                    tc_copy["id"] = normalized_id
-                    message["tool_calls"].append(tc_copy)
+                    raise DeveloperError("Invalid assistant tool call.", code="invalid_messages")
+                normalized_id = _normalize_tool_call_id(tc.get("id"))
+                if normalized_id is None or normalized_id in seen_tool_call_ids:
+                    raise DeveloperError("Invalid or duplicate assistant tool-call ID.", code="invalid_messages")
+                seen_tool_call_ids.add(normalized_id)
+                tc_copy = {k: v for k, v in tc.items() if k != "id"}
+                tc_copy["id"] = normalized_id
+                message["tool_calls"].append(tc_copy)
+        if role == "assistant" and not message.get("content") and not message.get("tool_calls"):
+            raise DeveloperError("Assistant message has no content or tool calls.", code="invalid_messages")
         if role == "tool":
             call_id = item.get("tool_call_id")
             if not isinstance(call_id, str):
@@ -193,10 +212,19 @@ def _worker_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for message in messages:
         if message["role"] == "system":
+            content = message.get("content")
             result.append({
                 "role": "user",
-                "content": "BEGIN UNTRUSTED CLIENT TEXT\n"
-                f"{message.get('content') or ''}\nEND UNTRUSTED CLIENT TEXT",
+                "content": (
+                    [
+                        {"type": "text", "text": "BEGIN UNTRUSTED CLIENT TEXT"},
+                        *deepcopy(content),
+                        {"type": "text", "text": "END UNTRUSTED CLIENT TEXT"},
+                    ]
+                    if isinstance(content, list)
+                    else "BEGIN UNTRUSTED CLIENT TEXT\n"
+                    f"{content or ''}\nEND UNTRUSTED CLIENT TEXT"
+                ),
             })
         else:
             result.append(message)
@@ -205,9 +233,12 @@ def _worker_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _latest_user(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
-        if message["role"] == "user" and isinstance(message.get("content"), str):
-            return message["content"]
-    raise DeveloperError("A user instruction is required.", code="invalid_messages")
+        if message["role"] != "user":
+            continue
+        text = _message_text(message.get("content"))
+        if text:
+            return text
+    raise DeveloperError("A text user instruction is required.", code="invalid_messages")
 
 
 def _summarize_role_output(text: str, max_chars: int = 2000) -> str:
@@ -227,6 +258,12 @@ def _summarize_role_output(text: str, max_chars: int = 2000) -> str:
     return summary[:max_chars]
 
 
+def _summarize_tool_result(text: str, max_chars: int = 1200) -> str:
+    return _summarize_role_output(text, max_chars).replace(
+        "[Prior role output truncated:", "[Tool result truncated:", 1
+    )
+
+
 def _compact_phase_messages(
     *,
     system_message: dict[str, Any],
@@ -234,14 +271,16 @@ def _compact_phase_messages(
     worker_messages: Sequence[dict[str, Any]],
     input_limit: int,
     model_id: str | None = None,
+    control_messages: Sequence[dict[str, Any]] = (),
+    worker_user_indices: Sequence[int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Compact one phase request while preserving required protocol structure.
 
-    The system message and latest user objective are retained. Assistant tool
-    calls and matching tool results are removed only as complete atomic groups.
-    Orphaned, incomplete, duplicated, or misordered tool-call groups are excluded
-    because forwarding them would produce an invalid chat transcript. Inputs are
-    deep-copied and never mutated.
+    The system message, latest client objective, latest server control, and newest
+    complete tool group are retained. Handoffs, client messages, and controls keep
+    their caller-supplied provenance; content markers never determine trust. Invalid
+    tool protocol is removed as complete atomic groups. Inputs are deep-copied and
+    never mutated.
     """
 
     if input_limit <= 0:
@@ -251,11 +290,28 @@ def _compact_phase_messages(
             code="context_budget_exceeded",
         )
 
-    original_messages = [
-        deepcopy(system_message),
-        *[deepcopy(message) for message in handoffs],
-        *[deepcopy(message) for message in worker_messages],
+    client_user_indices = (
+        set(worker_user_indices)
+        if worker_user_indices is not None
+        else {
+            index
+            for index, message in enumerate(worker_messages)
+            if message.get("role") == "user"
+        }
+    )
+    entries: list[tuple[str, dict[str, Any]]] = [
+        ("system", deepcopy(system_message)),
+        *(("handoff", deepcopy(message)) for message in handoffs),
+        *(
+            (
+                "client_user" if index in client_user_indices else "worker",
+                deepcopy(message),
+            )
+            for index, message in enumerate(worker_messages)
+        ),
+        *(("control", deepcopy(message)) for message in control_messages),
     ]
+    original_messages = [message for _, message in entries]
 
     def estimate(current: Sequence[dict[str, Any]]) -> int:
         # Only the messages field is estimated here. The caller separately
@@ -265,127 +321,99 @@ def _compact_phase_messages(
     original_estimate = estimate(original_messages)
     original_count = len(original_messages)
 
-    assistant_groups: list[tuple[int, tuple[str, ...]]] = []
-    call_owner_index: dict[str, int] = {}
-    malformed_group_indices: set[int] = set()
-    for index, message in enumerate(original_messages):
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list) or not tool_calls:
-            continue
-        call_ids: list[str] = []
-        malformed = False
-        for tool_call in tool_calls:
-            call_id_raw = tool_call.get("id")
-            if not isinstance(call_id_raw, str):
-                malformed = True
-                continue
-            call_id = _normalize_tool_call_id(call_id_raw)
-            if call_id is None:
-                malformed = True
-                continue
-            if call_id in call_ids:
-                malformed = True
-                continue
-            call_ids.append(call_id)
-            call_owner_index[call_id] = index
-        if malformed or not call_ids:
-            malformed_group_indices.add(index)
-        else:
-            assistant_groups.append((index, tuple(call_ids)))
-
-    result_indices_by_call: dict[str, list[int]] = {}
     orphan_indices: set[int] = set()
-    for index, message in enumerate(original_messages):
-        if message.get("role") != "tool":
-            continue
-        call_id = _normalize_tool_call_id(message.get("tool_call_id"))
-        owner_index = call_owner_index.get(call_id)
-        if owner_index is None or index <= owner_index:
+    invalid_group_indices: set[int] = set()
+    complete_original_groups: list[set[int]] = []
+    group_by_call_id: dict[str, set[int]] = {}
+    index = 0
+    while index < len(original_messages):
+        message = original_messages[index]
+        if message.get("role") == "tool":
             orphan_indices.add(index)
+            index += 1
             continue
-        result_indices_by_call.setdefault(call_id, []).append(index)
-    invalid_group_indices = set(malformed_group_indices)
-    invalid_group_call_ids: set[str] = set()
-    for assistant_index, call_ids in assistant_groups:
-        result_indices = [
-            result_indices_by_call.get(call_id, [])
-            for call_id in call_ids
-        ]
-        flat_results = [index for indices in result_indices for index in indices]
-        expected = set(
-            range(assistant_index + 1, assistant_index + 1 + len(call_ids))
-        )
-        complete = all(len(indices) == 1 for indices in result_indices)
-        contiguous = complete and set(flat_results) == expected
-        if complete and contiguous:
+        if message.get("role") != "assistant" or "tool_calls" not in message:
+            index += 1
             continue
-        invalid_group_indices.add(assistant_index)
-        invalid_group_call_ids.update(call_ids)
 
-    for call_id in invalid_group_call_ids:
-        invalid_group_indices.update(result_indices_by_call.get(call_id, []))
+        raw_calls = message.get("tool_calls")
+        call_ids: list[str] = []
+        malformed = not isinstance(raw_calls, list)
+        if isinstance(raw_calls, list):
+            if not raw_calls:
+                malformed = not bool(message.get("content"))
+            for call in raw_calls:
+                if not isinstance(call, dict):
+                    malformed = True
+                    continue
+                call_id = _normalize_tool_call_id(call.get("id"))
+                if call_id is None or call_id in call_ids:
+                    malformed = True
+                    continue
+                call["id"] = call_id
+                call_ids.append(call_id)
+        if not call_ids and not malformed:
+            index += 1
+            continue
+
+        result_end = index + 1
+        while (
+            result_end < len(original_messages)
+            and original_messages[result_end].get("role") == "tool"
+        ):
+            result_end += 1
+        result_indices: list[int] = []
+        result_ids: list[str] = []
+        for result_index in range(index + 1, result_end):
+            result_id = _normalize_tool_call_id(
+                original_messages[result_index].get("tool_call_id")
+            )
+            if result_id is None or result_id not in call_ids:
+                orphan_indices.add(result_index)
+                continue
+            original_messages[result_index]["tool_call_id"] = result_id
+            result_indices.append(result_index)
+            result_ids.append(result_id)
+
+        duplicate_groups = {
+            member
+            for call_id in call_ids
+            for member in group_by_call_id.get(call_id, set())
+        }
+        complete = (
+            not malformed
+            and not duplicate_groups
+            and len(result_ids) == len(call_ids)
+            and len(result_ids) == len(set(result_ids))
+            and set(result_ids) == set(call_ids)
+        )
+        group = {index, *result_indices}
+        if complete:
+            complete_original_groups.append(group)
+        else:
+            invalid_group_indices.update(group)
+            invalid_group_indices.update(duplicate_groups)
+        for call_id in call_ids:
+            group_by_call_id.setdefault(call_id, set()).update(group)
+        index = result_end
 
     protocol_cleanup_indices = orphan_indices | invalid_group_indices
-    messages = [
-        message
-        for index, message in enumerate(original_messages)
-        if index not in protocol_cleanup_indices
+    kept_entries = [
+        (provenance, message, original_index)
+        for original_index, (provenance, message) in enumerate(entries)
+        if original_index not in protocol_cleanup_indices
     ]
-
-    # Canonicalize all tool-call IDs in the filtered messages so that every
-    # stored ID matches the normalized key used in lookups.
-    for message in messages:
-        if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
-            for tc in message["tool_calls"]:
-                if not isinstance(tc, dict):
-                    continue
-                call_id_raw = tc.get("id")
-                if not isinstance(call_id_raw, str):
-                    continue
-                call_id = _normalize_tool_call_id(call_id_raw)
-                if call_id is not None:
-                    tc["id"] = call_id
-        if message.get("role") == "tool":
-            call_id_raw = message.get("tool_call_id")
-            if not isinstance(call_id_raw, str):
-                continue
-            call_id = _normalize_tool_call_id(call_id_raw)
-            if call_id is not None:
-                message["tool_call_id"] = call_id
-
-    call_owner: dict[str, int] = {}
-    groups: list[set[int]] = []
-    for index, message in enumerate(messages):
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        call_ids: set[str] = set()
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            call_id_raw = tool_call.get("id")
-            if not isinstance(call_id_raw, str):
-                continue
-            call_id = _normalize_tool_call_id(call_id_raw)
-            if call_id is not None:
-                call_ids.add(call_id)
-        if not call_ids:
-            continue
-        group_index = len(groups)
-        groups.append({index})
-        for call_id in call_ids:
-            call_owner[call_id] = group_index
-
-    for index, message in enumerate(messages):
-        if message.get("role") != "tool":
-            continue
-        group_index = call_owner.get(_normalize_tool_call_id(message.get("tool_call_id")))
-        if group_index is not None:
-            groups[group_index].add(index)
+    messages = [message for _, message, _ in kept_entries]
+    provenance = [source for source, _, _ in kept_entries]
+    new_index = {
+        original_index: filtered_index
+        for filtered_index, (_, _, original_index) in enumerate(kept_entries)
+    }
+    groups = [
+        {new_index[member] for member in group}
+        for group in complete_original_groups
+        if not (group & invalid_group_indices)
+    ]
 
     current_estimate = estimate(messages)
     if current_estimate <= input_limit:
@@ -398,6 +426,8 @@ def _compact_phase_messages(
             "compaction_applied": bool(protocol_cleanup_indices),
             "orphaned_tools_removed": bool(orphan_indices),
             "invalid_tool_groups_removed": bool(invalid_group_indices),
+            "latest_tool_group_preserved": bool(groups),
+            "tool_evidence_summarized": False,
             "reason": (
                 "protocol_cleanup"
                 if protocol_cleanup_indices
@@ -409,20 +439,30 @@ def _compact_phase_messages(
         (
             index
             for index in range(len(messages) - 1, -1, -1)
-            if messages[index].get("role") == "user"
+            if provenance[index] == "client_user"
+            and messages[index].get("role") == "user"
         ),
         None,
     )
+    latest_control = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if provenance[index] == "control"
+        ),
+        None,
+    )
+    handoff_indices = [
+        index for index, source in enumerate(provenance) if source == "handoff"
+    ]
     required = {0}
     if latest_user is not None:
         required.add(latest_user)
+    elif handoff_indices:
+        required.add(handoff_indices[-1])
+    if latest_control is not None:
+        required.add(latest_control)
 
-    handoff_indices = [
-        index
-        for index, message in enumerate(messages)
-        if isinstance(message.get("content"), str)
-        and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT" in str(message["content"])
-    ]
     summarized = False
     for index in handoff_indices[:-1]:
         content = str(messages[index]["content"])
@@ -430,6 +470,51 @@ def _compact_phase_messages(
         if replacement != content:
             messages[index]["content"] = replacement
             summarized = True
+
+    newest_group = groups[-1] if groups else set()
+    tool_evidence_summarized = False
+    if newest_group:
+        required.update(newest_group)
+    if newest_group and estimate(messages) > input_limit:
+        for group_index in sorted(newest_group):
+            message = messages[group_index]
+            if message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                replacement = _summarize_tool_result(content)
+                if replacement == content:
+                    continue
+                message["content"] = replacement
+                tool_evidence_summarized = True
+                summarized = True
+                continue
+            if not isinstance(content, list):
+                continue
+            bounded = deepcopy(content)
+            text_indices = [
+                index
+                for index, part in enumerate(bounded)
+                if isinstance(part, str)
+                or (isinstance(part, dict) and isinstance(part.get("text"), str))
+            ]
+            part_limit = max(200, 1200 // max(1, len(text_indices)))
+            changed = False
+            for part_index in text_indices:
+                part = bounded[part_index]
+                text = part if isinstance(part, str) else part["text"]
+                replacement = _summarize_tool_result(text, part_limit)
+                if replacement == text:
+                    continue
+                if isinstance(part, str):
+                    bounded[part_index] = replacement
+                else:
+                    part["text"] = replacement
+                changed = True
+            if changed:
+                message["content"] = bounded
+                tool_evidence_summarized = True
+                summarized = True
 
     grouped_indices = set().union(*groups) if groups else set()
     removable_units: list[set[int]] = [
@@ -474,6 +559,8 @@ def _compact_phase_messages(
         ),
         "orphaned_tools_removed": bool(orphan_indices),
         "invalid_tool_groups_removed": bool(invalid_group_indices),
+        "latest_tool_group_preserved": bool(newest_group and not (newest_group & removed)),
+        "tool_evidence_summarized": tool_evidence_summarized,
         "reason": "budget_compaction",
     }
 
@@ -1877,11 +1964,22 @@ class DeveloperCoordinator:
                 }
                 for name, text in run["role_outputs"].items()
             ]
+            system_context = {
+                "role": "system",
+                "content": self._system(run["task_id"], role),
+            }
+            worker_context = _worker_messages(messages)
+            worker_user_indices = [
+                index
+                for index, message in enumerate(messages)
+                if message["role"] == "user"
+            ]
+            control_context: list[dict[str, Any]] = []
             payload: dict[str, Any] = {
                 "messages": [
-                    {"role": "system", "content": self._system(run["task_id"], role)},
+                    system_context,
                     *handoff_context,
-                    *_worker_messages(messages),
+                    *worker_context,
                 ],
                 "tools": approved_tools,
                 "tool_choice": selected_choice,
@@ -1900,7 +1998,15 @@ class DeveloperCoordinator:
                 attempt_payload = {
                     **payload,
                     "model": record.model_id,
-                    "messages": [deepcopy(message) for message in payload["messages"]],
+                    "messages": [
+                        deepcopy(message)
+                        for message in (
+                            system_context,
+                            *handoff_context,
+                            *worker_context,
+                            *control_context,
+                        )
+                    ],
                 }
                 reason = (
                     run["role_models"].get(role, {}).get("reason")
@@ -1957,23 +2063,11 @@ class DeveloperCoordinator:
                             code="context_budget_exceeded",
                         )
                     compacted_messages, compaction = _compact_phase_messages(
-                        system_message=attempt_payload["messages"][0],
-                        handoffs=[
-                            message
-                            for message in attempt_payload["messages"][1:]
-                            if isinstance(message.get("content"), str)
-                            and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT"
-                            in str(message["content"])
-                        ],
-                        worker_messages=[
-                            message
-                            for message in attempt_payload["messages"][1:]
-                            if not (
-                                isinstance(message.get("content"), str)
-                                and "BEGIN UNTRUSTED PRIOR ROLE OUTPUT"
-                                in str(message["content"])
-                            )
-                        ],
+                        system_message=system_context,
+                        handoffs=handoff_context,
+                        worker_messages=worker_context,
+                        control_messages=control_context,
+                        worker_user_indices=worker_user_indices,
                         input_limit=message_input_limit,
                         model_id=record.model_id,
                     )
@@ -2216,8 +2310,8 @@ class DeveloperCoordinator:
                     failures.append(failure)
                     run["attempts"].append(failure)
                     if isinstance(exc, DeveloperError) and exc.code == "missing_phase_evidence":
-                        payload["messages"] = [
-                            *payload["messages"],
+                        control_context = [
+                            *control_context,
                             {
                                 "role": "user",
                                 "content": (
@@ -2245,8 +2339,8 @@ class DeveloperCoordinator:
                                 "executed": False,
                             },
                         )
-                        payload["messages"] = [
-                            *payload["messages"],
+                        control_context = [
+                            *control_context,
                             {
                                 "role": "user",
                                 "content": (

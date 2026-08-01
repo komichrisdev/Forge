@@ -24,6 +24,7 @@ import json
 import unittest
 
 from swarm_router.developer import (
+    DeveloperError,
     _compact_phase_messages,
     _normalize_messages,
     _normalize_tool_call_id,
@@ -411,6 +412,65 @@ class MalformedAndValidGroupSideBySideTest(unittest.TestCase):
         self.assertEqual(len(tool_msgs), 1)
         self.assertEqual(tool_msgs[0]["tool_call_id"], "call-good")
 
+    def test_mixed_valid_and_invalid_call_removes_matching_valid_result(self) -> None:
+        mixed_assistant = _assistant_with_tool_calls([
+            _make_terminal_call("call-valid"),
+            {"id": None, "type": "function", "function": {"name": "terminal", "arguments": '{"command":"pwd"}'}},
+        ])
+        compacted, metadata = _compact_phase_messages(
+            system_message={"role": "system", "content": "sys"},
+            handoffs=[],
+            worker_messages=[
+                mixed_assistant,
+                _tool_result("call-valid", "/workspace"),
+                _user("latest"),
+            ],
+            input_limit=9999999,
+            model_id="test",
+        )
+        self.assertTrue(metadata["invalid_tool_groups_removed"])
+        self.assertFalse(any(message["role"] == "assistant" for message in compacted))
+        self.assertFalse(any(message["role"] == "tool" for message in compacted))
+
+    def test_duplicate_id_across_assistant_messages_removes_every_group_atomically(self) -> None:
+        compacted, metadata = _compact_phase_messages(
+            system_message={"role": "system", "content": "sys"},
+            handoffs=[],
+            worker_messages=[
+                _assistant_with_tool_calls([_make_terminal_call("call-duplicate")]),
+                _tool_result("call-duplicate", "first"),
+                _assistant_with_tool_calls([_make_terminal_call(" call-duplicate ")]),
+                _tool_result("call-duplicate", "second"),
+                _user("latest"),
+            ],
+            input_limit=9999999,
+            model_id="test",
+        )
+        self.assertTrue(metadata["invalid_tool_groups_removed"])
+        self.assertFalse(any(message["role"] == "assistant" for message in compacted))
+        self.assertFalse(any(message["role"] == "tool" for message in compacted))
+
+    def test_malformed_group_reserves_id_against_later_reuse(self) -> None:
+        compacted, metadata = _compact_phase_messages(
+            system_message={"role": "system", "content": "sys"},
+            handoffs=[],
+            worker_messages=[
+                _assistant_with_tool_calls([
+                    _make_terminal_call("call-reused"),
+                    {"id": None},
+                ]),
+                _tool_result("call-reused", "first"),
+                _assistant_with_tool_calls([_make_terminal_call("call-reused")]),
+                _tool_result("call-reused", "second"),
+                _user("latest"),
+            ],
+            input_limit=9999999,
+            model_id="test",
+        )
+        self.assertTrue(metadata["invalid_tool_groups_removed"])
+        self.assertFalse(any(message["role"] == "assistant" for message in compacted))
+        self.assertFalse(any(message["role"] == "tool" for message in compacted))
+
 
 # ======================================================================
 # 11. Valid parallel groups remain intact after normalization
@@ -480,6 +540,35 @@ class NormalizeMessagesToolCallIdTest(unittest.TestCase):
             _normalize_messages([
                 {"role": "tool", "tool_call_id": "  ", "content": "ok"},
             ])
+
+    def test_normalize_messages_rejects_malformed_assistant_call(self) -> None:
+        with self.assertRaises(DeveloperError):
+            _normalize_messages([
+                {"role": "assistant", "content": None, "tool_calls": [{"id": None}]},
+            ])
+
+    def test_normalize_messages_rejects_duplicate_assistant_ids_globally(self) -> None:
+        call = _make_terminal_call("call-duplicate")
+        padded = _make_terminal_call(" call-duplicate ")
+        with self.assertRaises(DeveloperError):
+            _normalize_messages([
+                _assistant_with_tool_calls([call]),
+                _assistant_with_tool_calls([padded]),
+            ])
+
+    def test_normalize_messages_rejects_contentless_empty_tool_calls(self) -> None:
+        with self.assertRaises(DeveloperError):
+            _normalize_messages([
+                {"role": "assistant", "content": None, "tool_calls": []},
+            ])
+
+    def test_normalize_messages_rejects_contentless_assistant_without_tool_calls(self) -> None:
+        with self.assertRaises(DeveloperError):
+            _normalize_messages([{"role": "assistant"}])
+
+    def test_normalize_messages_rejects_empty_user_content(self) -> None:
+        with self.assertRaises(DeveloperError):
+            _normalize_messages([{"role": "user", "content": []}])
 
 
 # ======================================================================
