@@ -1,0 +1,212 @@
+# Forge Planning Implementation Matrix
+
+Authoritative source: Planning tab, spreadsheet
+`1YIZn_4FE2aqJD5RX4nj-qw5nCZ2-u0UoYB1HCocKY84`
+Planning tab ID: `1849918313`
+Last live read: 2026-08-01
+
+Status values are evidence states, not estimates: `MAPPED`, `IN_PROGRESS`,
+`REVIEW`, `COMPLETE`, or `BLOCKED`.
+
+| # | Planning row | Task | Dependencies | Writer | Branch / commit | Status | Verification | Luna Architecture | Luna Product | Remaining risk |
+| ---: | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | Shared sticky page/table headers | FG-010 | FG-000 | Qwen Code | pending isolated commit | MAPPED | `test_dashboard`, browser | pending | pending | nested scroll/z-index/mobile |
+| 2 | Overview Waifu PNG panel | FG-080 | FG-010 | Qwen Code | pending isolated commit | MAPPED | dashboard/static/auth tests, browser | pending | pending | authorized path, fallback, work-safe control |
+| 3 | Durable Active Runs display | FG-020 | FG-010 | SOL | pending | MAPPED | journal/developer/personal/dashboard tests | pending | pending | stale and inferred run sources |
+| 4 | Prompt Assistant chat/model controls | FG-090 | FG-060 | SOL | pending | MAPPED | routing/auth/API/browser tests | pending | pending | prompt-only eligibility and no silent generation |
+| 5 | Enhance, Rewrite, Expand | FG-100 | FG-090 | Qwen Code | pending isolated commit | MAPPED | prompt diff/original/model tests, browser | pending | pending | preserving original and scoped ignore |
+| 6 | Image loading/progress states | FG-030 | FG-010 | Qwen Code | pending isolated commit | MAPPED | image/personal/dashboard tests, browser refresh | pending | pending | cancellation truth and no fake percentages |
+| 7 | Previous-image gallery | FG-040 | FG-030 | SOL | pending | MAPPED | pagination/auth/retention/scale/browser tests | pending | pending | current API scans direct children only |
+| 8 | Reuse image settings | FG-040 | FG-030 | Qwen Code | pending isolated commit | MAPPED | metadata round-trip/preset compatibility/browser | pending | pending | unavailable preset versions |
+| 9 | Delete one image | FG-140 | FG-120 | SOL | pending | MAPPED | auth/CSRF/path/audit/trash/flag tests | pending | pending | destructive fail-closed contract absent |
+| 10 | Scoped delete all/restore | FG-170 | FG-140, FG-150 | SOL | pending | MAPPED | scope/count/size/typed-confirm/restore tests | pending | pending | protected/pinned and retention policy |
+| 11 | Bounded download all ZIP | FG-150 | FG-120 | SOL | pending | MAPPED | auth/manifest/count/size/disk/memory/timeout tests | pending | pending | streamed archive resource limits |
+| 12 | Virtual collections | FG-120 | FG-040 | SOL | pending | MAPPED | collection CRUD/concurrency/provenance tests | pending | pending | migration and immutable masters |
+| 13 | Prompt library | FG-110 | FG-100 | Qwen Code | pending isolated commit | MAPPED | version/conflict/order/composition/browser tests | pending | pending | saved text remains non-executable |
+| 14 | Structured prompt GUI | FG-110 | FG-100 | Qwen Code | pending isolated commit | MAPPED | deterministic composer/template/raw tests | pending | pending | preset-family compatibility |
+| 15 | Structured fields as visual metadata/plain text | FG-110 | FG-100 | Qwen Code | pending isolated commit | MAPPED | exact text/metadata/API preview tests | pending | pending | reproducibility across versions |
+| 16 | Sequential prompt queue | FG-130 | FG-110, FG-120 | SOL | pending | MAPPED | one-GPU/restart/pause/cancel/isolation tests | pending | pending | durable recovery and quota semantics |
+| 17 | Unified Logs presentation | FG-050 | FG-020 | Qwen Code | pending isolated commit | MAPPED | chronology/filter/pagination/auth/legacy-link tests | pending | pending | preserve notification/audit storage |
+| 18 | Agents & Models | FG-060 | FG-020 | Qwen Code | pending isolated commit | MAPPED | registry/catalog/health/fallback/dashboard tests | pending | pending | do not conflate agents and provider models |
+| 19 | Night Owl as Dispatch profile | FG-160 | FG-070 | SOL | pending | MAPPED | profile/schedule/handoff/approval tests | pending | pending | stricter worktree/deadline policy |
+| 20 | Expandable Forge task rows | FG-070 | FG-050, FG-060 | Qwen Code | pending isolated commit | MAPPED | bounded detail/pagination/redaction/browser tests | pending | pending | full terminal and secret leakage |
+| 21 | Separate Night Owl from Jira | FG-070 | FG-050, FG-060 | SOL | pending | MAPPED | compatibility/migration/rollback tests | pending | pending | existing record interpretation |
+| 22 | First-class work items | FG-180 | FG-070, FG-160 | SOL | pending | MAPPED | permission/version/audit/migration/browser tests | pending | pending | must not duplicate execution ledger |
+| 23 | Task attachments | FG-190 | FG-180 | SOL | pending | MAPPED | MIME/size/hash/quota/malware/retention/auth tests | pending | pending | decompression bombs and privacy policy |
+| 24 | Manual recurring-profile launch | FG-160 | FG-070 | SOL | pending | MAPPED | allowlist/dry-run/pause/schedule/journal tests | pending | pending | no arbitrary prompt or shell endpoint |
+
+## Authoritative acceptance contracts
+
+These contracts preserve the live Planning-row detail needed to audit the compact
+matrix above. All dashboard work also inherits the global browser gates below.
+
+1. Sticky page and table headers are shared across applicable views and remain
+   usable with nested scrolling, keyboard navigation, small screens, and zoom.
+2. Overview renders a responsive Waifu PNG only through authorized static or
+   artifact IDs, with fallback art and a persistent work-safe visibility control.
+3. Active Runs shows run ID, task, phase, executor type, logical agent,
+   provider/model, elapsed time, and durable state; process/file inference alone is
+   never reported as active.
+4. Prompt Assistant is text-only, may ask clarifying questions, returns a revised
+   prompt plus diff, routes only to eligible models, supports scoped enable/disable/
+   ignore/restore and feedback, never claims safeguard bypass, and never submits an
+   image automatically.
+5. Enhance, Rewrite, and Expand preserve the original, support compare/discard,
+   record the producer model, and exclude weak models only from Prompt Assistant.
+6. Image work exposes submitted, queued, running, artifact-processing, completed,
+   failed, elapsed, and supported cancellation states without invented GPU percent.
+7. Gallery APIs and UI provide bounded pagination, thumbnails, prompt excerpt, seed,
+   preset, date, status, collection, and retention-aware behavior.
+8. Reuse restores prompt, negative prompt, seed, and a compatible preset and warns
+   when the recorded preset version is unavailable.
+9. Delete-one requires authentication, CSRF, confirmation, a fail-closed feature
+   flag, path-safe artifact authorization, trash/restore retention, and an audit event;
+   protected assets are rejected.
+10. Delete-all is limited to the explicit current collection/filter, previews exact
+    count and size, requires typed confirmation, trashes before retention deletion,
+    supports restore, and separates protected/pinned assets.
+11. Download-all streams a bounded ZIP of authorized artifact IDs in the current
+    collection with a manifest and count, size, memory, disk, and timeout limits.
+12. Folders are virtual collections with create, rename, move, and archive; masters
+    remain immutable and no API accepts an arbitrary filesystem path.
+13. Prompt library stores named, categorized, ordered, enabled, versioned fragments
+    with reusable groups/tags, insertion toggles, composition preview, and conflict
+    handling.
+14. Structured prompt UI covers quality/style, medium, subject/character,
+    pose/action, setting/environment, composition/camera, lighting/color, details,
+    constraints/negative, preset-family templates, and raw override.
+15. Structured fields remain visual metadata, deterministically compose one ordinary
+    prompt string for the existing image API, store sections plus final text, and show
+    the final preview before explicit submission.
+16. Sequential queue has a durable batch parent, ordered children, one active GPU
+    image job, pause/resume/cancel, per-item status, automatic collection, restart
+    recovery, and isolated item failures.
+17. The final navigation destination is Logs: a chronological combined notification
+    and audit view with severity/source filters; storage remains separate and delivery
+    failures stay visible.
+18. Agents & Models combines logical agent/role, active provider/model, fallback,
+    health, capacity, active run, recent failures, and expandable provider inventory
+    without conflating logical agents with provider models.
+19. Night Owl is a Dispatch execution profile with schedule, intake, current job,
+    handoff artifacts, and stricter worktree, approval, and deadline policy.
+20. Expandable Forge task rows show objective, phase, agents/models, progress,
+    artifacts, tests, errors, audit events, and paginated bounded logs without secrets
+    or full raw terminal dumps.
+21. Night Owl is independent of Jira; Jira is an optional source/integration and
+    existing records retain migration and display compatibility.
+22. First-class work items provide title, description, status, priority, owner,
+    due/schedule, labels, source links, updates, activity, dense list/detail UI,
+    permissions, optimistic concurrency, and audit history without duplicating the
+    execution ledger.
+23. Task attachments use authorized IDs, MIME/size/checksum/quota rules, thumbnails,
+    retention, generated-artifact links, malware/decompression-bomb handling, and
+    privacy controls; browser paths are never trusted.
+24. Manual recurring-profile controls list only approved profiles and schedules and
+    offer run-now, dry-run, pause/resume, and previous/next run through normal
+    journalled task creation, never arbitrary shell or free-form execution.
+
+## Global browser acceptance gates
+
+- All controls are keyboard reachable, semantically labelled, and show visible focus;
+  disclosure controls expose expanded state and dialogs manage/restore focus.
+- Tables, cards, prompts, dialogs, and sticky regions remain readable and operable on
+  small screens and at browser zoom without hiding required actions.
+- Navigation has durable URLs: deep links, back/forward, and refresh restore the
+  selected view and fetch durable server state rather than relying on a JS variable.
+- Loading, empty, stale, partial, permission-denied, and failure states are explicit;
+  destructive confirmation cannot be triggered accidentally or only by pointer.
+- A real-browser harness must cover these gates before a row can become `COMPLETE`;
+  unit-level HTML string assertions alone are insufficient.
+
+## Foundation and repair tasks
+
+| Task | Owner | State | Evidence / next gate |
+| --- | --- | --- | --- |
+| FG-000 architecture baseline | SOL; Qwen Mini advisory rejected | COMPLETE | 171 focused, 332 full, frontend/build/parity; both Luna re-reviews PASS |
+| `1bbad6a` context/compaction recovery | SOL | IN_PROGRESS | baseline 171 focused and 332 full tests pass; confirmed defects require regression tests and repair |
+| Qwen Autopilot reliability | SOL | IN_PROGRESS | paused; 20 tests pass, checksums stale, completion/backoff/lease/signal/polling defects open |
+| Terminal evidence/session polling | SOL | MAPPED | recovered diagnostics contain no repair commit; inspect Developer pending-call lifecycle |
+| Model Monitor | Qwen Code after FG-020 | MAPPED | recovered handoff is design input to FG-060, not a separate screen |
+| Open Terminal installer | SOL audit only | MAPPED | v0.13-v0.15 STOP defects resolved by preserved v0.16 evidence; no deployment authorized |
+| R-001 lifecycle/journal reconciliation | SOL | MAPPED | crash consistency and durable Active Runs are blocking FG-020 gates |
+| R-002 writer lease/session cleanup | SOL | MAPPED | reject expired leases; poll/close pending sessions; blocking before new writes |
+| R-003 cancellation/process cleanup | SOL | MAPPED | cancel image side effects and terminate Night Owl process groups |
+| R-004 personal API hardening | SOL | MAPPED | bounded bodies, constant-time bearer validation, and explicit loopback/Docker-bridge authorization tests |
+| R-005 artifact integrity | SOL | MAPPED | atomic no-overwrite masters, cleanup, digest verification; blocks FG-040/120/140/150/170/190 |
+| R-006 scheduler integrity | SOL | MAPPED | renew/cover manual leases, reject malformed success, and make ambiguous submission outcomes idempotent; blocks FG-160 |
+| R-007 schema migration/feature flags | SOL | MAPPED | fixture upgrade, documented rollback, fail-closed destructive defaults; blocks schema/destructive work |
+| R-008 browser acceptance harness | Qwen Code, SOL verification | MAPPED | keyboard/focus/mobile/history/refresh gates; blocks every dashboard row from COMPLETE |
+| R-009 packaging/version alignment | SOL | MAPPED | installer covers approved dashboard/personal/scheduler/MCP units; one package version source; blocks deployment package |
+
+## Independent FG-000 review findings
+
+Both Lunas reviewed the same unmodified draft without seeing the other's result.
+`RESOLVED-IN-BASELINE` means the defect is now accurately recorded and assigned;
+it does not mean the implementation defect itself is fixed.
+
+| Finding | Reviewer | Result | Resolution / owned gate |
+| --- | --- | --- | --- |
+| LA-001 cross-store lifecycle is non-atomic | Luna Architecture | RESOLVED-IN-BASELINE | corrected single-ledger wording; R-001 / FG-020 |
+| LA-002 expired Developer writer leases are not fenced | Luna Architecture | RESOLVED-IN-BASELINE | R-002 |
+| LA-003 cancellation permits later side effects | Luna Architecture | RESOLVED-IN-BASELINE | R-003 |
+| LA-004 Night Owl timeout leaves process descendants | Luna Architecture | RESOLVED-IN-BASELINE | R-003 |
+| LA-005 personal request body is unbounded and bridge bind was omitted | Luna Architecture | RESOLVED-IN-BASELINE | boundary corrected; R-004 |
+| LA-006 artifact immutability/integrity was overstated | Luna Architecture | RESOLVED-IN-BASELINE | claim corrected; R-005 |
+| LA-007 scheduler lease/result integrity gaps | Luna Architecture | RESOLVED-IN-BASELINE | R-006 |
+| LA-008 catalog context omitted by generic callers | Luna Architecture | RESOLVED-IN-BASELINE | explicit `1bbad6a` repair gate |
+| LA-009 ComfyUI progress percentage is fabricated | Luna Architecture | RESOLVED-IN-BASELINE | FG-030 acceptance explicitly forbids it |
+| LA-010 migration/feature-flag gate was not owned | Luna Architecture | RESOLVED-IN-BASELINE | R-007 blocks dependent rows |
+| LP-001 accessibility/mobile/history/refresh gates absent | Luna Product | RESOLVED-IN-BASELINE | global browser gates plus R-008 |
+| LP-002 read-only review could not rerun write/socket tests | Luna Product | ENVIRONMENT-CAVEAT | commands/results retained; writable host rerun required |
+| LP-003 row shorthand lacked auditable acceptance detail | Luna Product | RESOLVED-IN-BASELINE | 24 authoritative acceptance contracts added |
+| LA-R2-001 scheduler ambiguous submission/manual lease gap | Luna Architecture | RESOLVED-IN-BASELINE | R-006 expanded with idempotency and manual-run fencing |
+| LA-R2-002 installer/version gaps lacked an owner | Luna Architecture | RESOLVED-IN-BASELINE | R-009 added as deployment blocker |
+| LA-R2-003 personal token equality was not in security gate | Luna Architecture | RESOLVED-IN-BASELINE | R-004 expanded with constant-time validation |
+| LA-R2-004 matrix described itself as already committed | Luna Architecture | RESOLVED-IN-BASELINE | wording corrected to durable checkpoint |
+
+Final re-review: Luna Product returned PASS with no remaining findings; Luna
+Architecture returned PASS after the four second-round corrections, with no remaining
+findings or new critical contradiction.
+
+## Significant decisions and corrections
+
+1. The live Planning tab, not the Autopilot manifest status, defines the 24 product
+   requirements. The manifest's 21 dependency tasks are retained as IDs and planning
+   input.
+2. `TaskJournal` remains the intended canonical execution ledger. This durable matrix
+   is an engineering checkpoint, not a second task-journal subsystem; the live catalog
+   is not mutated for program tracking.
+3. Qwen Autopilot remains paused. Its timer is disabled, its database is backed up,
+   and SOL holds its process lock until the write phase ends.
+4. The current Autopilot repairs are useful but incomplete: five checksum entries are
+   stale and the new non-thinking/block validation behavior lacks focused tests.
+5. `1bbad6a` is retained, not reverted, but is under STOP-for-acceptance until its
+   untested compaction and metadata defects are corrected.
+6. The five previously unreachable Qwen context commits are preserved by local
+   `refs/archive/qwen-context/*`; no recovered material was deleted.
+7. Model Monitor research will extend Agents & Models. It will not create another
+   inventory or dashboard destination.
+8. Open Terminal v0.16 resolved the historical installer STOP defects. The recorded
+   missing Windows ComfyUI tunnel is an external deployment-acceptance dependency,
+   not authority to change live services during this program.
+9. Push, deployment, service restarts, live database changes, firewall changes, sudo,
+   and production migrations remain prohibited without later authorization.
+10. Qwen Mini was run twice read-only. Both responses were rejected: the first was
+    empty and the narrowed retry invented nonexistent `src/components/*` paths. Qwen
+    output remains advisory and repository evidence controls.
+11. Independent Luna Product and Architecture reviews both passed the corrected
+    FG-000 baseline. Their STOP findings remain recorded above as implementation
+    gates rather than being erased after correction.
+
+## Current rollover checkpoint
+
+- Branch/HEAD: `feature/swarm-developer` at `1bbad6a` before FG-000 documentation.
+- Active task: commit FG-000, then repair `1bbad6a` and Autopilot reliability.
+- Exact next action: commit the two reviewed FG-000 documents with explicit paths,
+  then add regression tests for the confirmed context/compaction defects.
+- Open findings: context compaction provenance/atomicity/evidence retention;
+  catalog-context propagation; overflow classification; Autopilot retries/backoff,
+  polling, signal cleanup, checksums, and tests.
+- Verified baseline: Python 171 focused and 332 full; frontend check/test/build/MCP
+  parity; compileall and `git diff --check` all passed.
+- Pending commits: FG-000 documentation only; no feature implementation accepted.
