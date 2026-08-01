@@ -314,6 +314,7 @@ class DashboardTest(unittest.TestCase):
                     "2026-07-29T12:01:00+00:00",
                 ),
             )
+        lock = self.app.developer.acquire_writer("FT-20260729-999999")
         self.assertEqual(self.call("/api/developer-runs")[0], 401)
         cookie, _csrf = self.login()
         status, data, _ = self.call("/api/developer-runs", cookie=cookie)
@@ -321,6 +322,9 @@ class DashboardTest(unittest.TestCase):
         encoded = json.dumps(data)
         self.assertNotIn("sk-1234567890", encoded)
         self.assertNotIn("hunter2", encoded)
+        self.assertNotIn(lock["lease_id"], encoded)
+        self.assertNotIn("lease_id", encoded)
+        self.assertEqual(data["writer_lock"]["state"], "locked")
         self.assertEqual(data["runs"][0]["created_at"], "2026-07-29 08:00:00 EDT")
         self.assertEqual(data["runs"][0]["roles"]["planner"]["model"], "fake/planner")
 

@@ -603,6 +603,13 @@ class DashboardApp:
         })
 
     def developer_rows(self) -> dict[str, Any]:
+        def public_lock(lock: dict[str, Any]) -> dict[str, Any]:
+            return {
+                key: lock[key]
+                for key in ("workspace", "task_id", "acquired_at", "expires_at", "state")
+                if key in lock
+            }
+
         rows = []
         for run in self.developer.list_runs():
             instruction = _redact_text(str(run.get("instruction", "")))
@@ -625,7 +632,12 @@ class DashboardApp:
                 "requested_task": instruction[:240],
                 "phase": run["phase"],
                 "roles": roles,
-                "writer_lock": run.get("writer_lock", {}),
+                "writer_lock": public_lock(run.get("writer_lock", {})),
+                "active_process": {
+                    key: run.get("active_process", {}).get(key)
+                    for key in ("process_id", "next_offset", "started_at", "updated_at")
+                    if key in run.get("active_process", {})
+                },
                 "status": run["status"],
                 "last_tool_call": str(run.get("last_tool_summary", ""))[:300],
                 "changed_file_count": len(run.get("changed_files", [])),
@@ -635,7 +647,7 @@ class DashboardApp:
                 "created_at": _toronto_time(run.get("created_at", "")),
                 "updated_at": _toronto_time(run.get("updated_at", "")),
             })
-        return _sanitize({"runs": rows, "writer_lock": self.developer.writer_lock()})
+        return _sanitize({"runs": rows, "writer_lock": public_lock(self.developer.writer_lock())})
 
     def schedule_rows(self) -> dict[str, Any]:
         return _sanitize(self.schedules.status(self._personal_status))

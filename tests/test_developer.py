@@ -3,13 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from http.server import ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Thread
 from unittest.mock import patch
 from urllib import request
 import json
 import unittest
 
-from swarm_router.developer import DeveloperCoordinator, DeveloperError, _arguments_digest
+from swarm_router.developer import (
+    DeveloperCoordinator,
+    DeveloperError,
+    _arguments_digest,
+    _tool_schemas,
+)
 from swarm_router.journal import JournalEventType
 from swarm_router.personal import PersonalHandler, PersonalTaskManager
 from tests.test_personal import PERSONAL_TOKEN, seed_catalog, write_config
@@ -28,6 +33,62 @@ TOOL = {
     },
 }
 TOOL_SCHEMAS = {"terminal": TOOL["function"]["parameters"]}
+
+PROCESS_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Execute a command in the Forge terminal.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "wait": {"type": "number", "minimum": 0, "maximum": 300},
+                    "tail": {"type": "integer", "minimum": 1},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_process_status",
+            "description": "Poll an Open Terminal process.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string"},
+                    "wait": {"type": "number", "minimum": 0, "maximum": 300},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "tail": {"type": "integer", "minimum": 1},
+                },
+                "required": ["process_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kill_process",
+            "description": "Terminate an Open Terminal process.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string"},
+                    "force": {"type": "boolean"},
+                },
+                "required": ["process_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+PROCESS_SCHEMAS = _tool_schemas(PROCESS_TOOLS)
 
 
 def completion(tool_call: dict[str, object] | None = None, content: str | None = None) -> dict[str, object]:
@@ -54,6 +115,14 @@ def tool_call(call_id: str, command: str) -> dict[str, object]:
         "id": call_id,
         "type": "function",
         "function": {"name": "terminal", "arguments": json.dumps({"command": command})},
+    }
+
+
+def process_call(call_id: str, name: str, arguments: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
     }
 
 
@@ -357,22 +426,34 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                 """,
                 (first, "2026-07-29T12:00:00+00:00", "2099-07-29T12:00:00+00:00"),
             )
-        self.coordinator.acquire_writer(first)
+        original = self.coordinator.acquire_writer(first)
         with self.assertRaisesRegex(DeveloperError, "busy"):
             self.coordinator.acquire_writer(second)
         with self.coordinator._connect() as db:
             db.execute(
                 "UPDATE forge_developer_writer_lock SET expires_at='2000-01-01T00:00:00+00:00'"
             )
+        recovered_same_task = self.coordinator.acquire_writer(first)
+        self.assertNotEqual(recovered_same_task["lease_id"], original["lease_id"])
         with self.assertRaisesRegex(DeveloperError, "busy"):
             self.coordinator.acquire_writer(second)
+        with self.assertRaisesRegex(DeveloperError, "lease"):
+            self.coordinator.release_writer(first, original["lease_id"])
+        self.assertEqual(
+            self.coordinator.writer_lock()["lease_id"],
+            recovered_same_task["lease_id"],
+        )
         with self.coordinator._connect() as db:
             db.execute(
                 "UPDATE forge_developer_runs SET updated_at='2000-01-01T00:00:00+00:00' WHERE task_id=?",
                 (first,),
             )
-        self.assertEqual(self.coordinator.acquire_writer(second)["task_id"], second)
-        self.coordinator.release_writer(second)
+            db.execute(
+                "UPDATE forge_developer_writer_lock SET expires_at='2000-01-01T00:00:00+00:00'"
+            )
+        recovered = self.coordinator.acquire_writer(second)
+        self.assertEqual(recovered["task_id"], second)
+        self.coordinator.release_writer(second, recovered["lease_id"])
 
     def test_pending_write_call_prevents_stale_lock_takeover_and_lease_is_fenced(self) -> None:
         first = self.coordinator.journal.next_task_id()
@@ -411,6 +492,11 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(DeveloperError, "busy"):
             self.coordinator.acquire_writer(second)
+        with self.assertRaisesRegex(DeveloperError, "expired"):
+            self.coordinator.acquire_writer(first)
+        with self.assertRaisesRegex(DeveloperError, "lease"):
+            self.coordinator.release_writer(first, "stale-token")
+        self.assertEqual(self.coordinator.writer_lock()["lease_id"], lock["lease_id"])
         with self.coordinator._connect() as db:
             db.execute(
                 "UPDATE forge_developer_writer_lock SET lease_id='replacement'"
@@ -455,8 +541,13 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             })
         self.assertEqual(first["forge_task_id"], self.coordinator._find_run("call-shared")["task_id"])
 
-    def test_cancel_releases_writer_and_pending_call(self) -> None:
+    def test_cancel_keeps_inflight_writer_fenced_until_exact_process_kill(self) -> None:
         task_id = self.coordinator.journal.next_task_id()
+        command = process_call(
+            "call-cancel",
+            "run_command",
+            {"command": "touch /workspace/forge/cancelled.txt"},
+        )
         with self.coordinator._connect() as db:
             db.execute(
                 """
@@ -472,22 +563,293 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                     "2026-07-29T12:00:00+00:00",
                 ),
             )
+        lock = self.coordinator.acquire_writer(task_id)
+        with self.coordinator._connect() as db:
+            db.execute(
+                """
+                INSERT INTO forge_developer_pending_calls(
+                    tool_call_id, task_id, role, provider, model, tool_name,
+                    arguments_digest, evidence_kind, test_command, lease_id, created_at
+                ) VALUES ('call-cancel', ?, 'implementer', 'fake', 'fake/model',
+                    'run_command', ?, 'write', 0, ?, ?)
+                """,
+                (
+                    task_id,
+                    _arguments_digest(str(command["function"]["arguments"])),
+                    lock["lease_id"],
+                    "2026-07-29T12:00:00+00:00",
+                ),
+            )
+        self.coordinator.cancel(task_id)
+        self.assertEqual(self.coordinator._run(task_id)["status"], "cancelling")
+        self.assertEqual(self.coordinator.writer_lock()["lease_id"], lock["lease_id"])
+        self.assertEqual(self.coordinator._find_run("call-cancel")["task_id"], task_id)
+
+        running = json.dumps({
+            "id": "process-123",
+            "status": "running",
+            "exit_code": None,
+            "output": "",
+            "next_offset": 0,
+        })
+        with patch.object(self.coordinator.client, "completion") as upstream:
+            response = self.coordinator.complete({
+                "model": "swarm-developer",
+                "messages": [
+                    {"role": "user", "content": "Make a focused Forge change."},
+                    {"role": "assistant", "content": None, "tool_calls": [command]},
+                    {"role": "tool", "tool_call_id": "call-cancel", "content": running},
+                ],
+                "tools": PROCESS_TOOLS,
+            })
+        upstream.assert_not_called()
+        kill = response["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(kill["function"]["name"], "kill_process")
+        self.assertEqual(json.loads(kill["function"]["arguments"]), {"process_id": "process-123"})
+        self.assertEqual(self.coordinator._run(task_id)["status"], "cancelling")
+
+        with patch.object(self.coordinator.client, "completion") as upstream:
+            done = self.coordinator.complete({
+                "model": "swarm-developer",
+                "messages": [
+                    {"role": "user", "content": "Make a focused Forge change."},
+                    {"role": "assistant", "content": None, "tool_calls": [kill]},
+                    {
+                        "role": "tool",
+                        "tool_call_id": kill["id"],
+                        "content": '{"status":"killed"}',
+                    },
+                ],
+                "tools": PROCESS_TOOLS,
+            })
+        upstream.assert_not_called()
+        self.assertEqual(done["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(self.coordinator._run(task_id)["status"], "cancelled")
+        self.assertEqual(self.coordinator.writer_lock()["state"], "available")
+
+    def test_cancel_during_model_response_cannot_launch_stale_write(self) -> None:
+        planner = tool_call("call-plan-cancel-race", "pwd")
+        with patch.object(self.coordinator.client, "completion", return_value=completion(planner)):
+            first = self.coordinator.complete({
+                "model": "swarm-developer",
+                "messages": [{"role": "user", "content": "Make a focused Forge change."}],
+                "tools": [TOOL],
+            })
+        task_id = first["forge_task_id"]
+        entered = Event()
+        resume = Event()
+        responses = iter([
+            completion(content="Plan ready."),
+            completion(tool_call("call-stale-write", "touch /workspace/forge/stale.txt")),
+        ])
+
+        def delayed_completion(*_args: object, **_kwargs: object) -> dict[str, object]:
+            response = next(responses)
+            if response["choices"][0]["message"].get("tool_calls"):
+                entered.set()
+                self.assertTrue(resume.wait(2))
+            return response
+
+        outcome: list[dict[str, object] | BaseException] = []
+
+        def callback() -> None:
+            try:
+                outcome.append(self.coordinator.complete({
+                    "model": "swarm-developer",
+                    "messages": [
+                        {"role": "user", "content": "Make a focused Forge change."},
+                        {"role": "assistant", "content": None, "tool_calls": [planner]},
+                        {
+                            "role": "tool",
+                            "tool_call_id": planner["id"],
+                            "content": "/workspace/forge\n",
+                        },
+                    ],
+                    "tools": [TOOL],
+                }))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcome.append(exc)
+
+        with patch.object(self.coordinator.client, "completion", side_effect=delayed_completion):
+            thread = Thread(target=callback)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            self.coordinator.cancel(task_id, "Test cancellation race.")
+            resume.set()
+            thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(outcome), 1)
+        self.assertNotIsInstance(outcome[0], BaseException)
+        response = outcome[0]
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", response["choices"][0]["message"])
+        self.assertEqual(self.coordinator._run(task_id)["status"], "cancelled")
+        self.assertEqual(self.coordinator.writer_lock()["state"], "available")
+        with self.coordinator._connect() as db:
+            pending = db.execute(
+                "SELECT COUNT(*) FROM forge_developer_pending_calls WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+        self.assertEqual(pending, 0)
+
+    def test_open_terminal_running_result_requires_exact_offset_poll(self) -> None:
+        active = {
+            "process_id": "process-123",
+            "next_offset": 7,
+            "role": "verifier",
+        }
+        poll = process_call(
+            "call-poll",
+            "get_process_status",
+            {"process_id": "process-123", "offset": 7, "wait": 30},
+        )
+        self.coordinator._validate_tool_calls(
+            [poll], PROCESS_SCHEMAS, "verifier", active_process=active
+        )
+        with self.assertRaisesRegex(DeveloperError, "offset"):
+            self.coordinator._validate_tool_calls(
+                [process_call(
+                    "call-wrong-offset",
+                    "get_process_status",
+                    {"process_id": "process-123", "offset": 0},
+                )],
+                PROCESS_SCHEMAS,
+                "verifier",
+                active_process=active,
+            )
+        with self.assertRaisesRegex(DeveloperError, "active process"):
+            self.coordinator._validate_tool_calls(
+                [process_call("call-second", "run_command", {"command": "pwd"})],
+                PROCESS_SCHEMAS,
+                "verifier",
+                active_process=active,
+            )
+        with self.assertRaisesRegex(DeveloperError, "cancellation"):
+            self.coordinator._validate_tool_calls(
+                [process_call(
+                    "call-kill",
+                    "kill_process",
+                    {"process_id": "process-123"},
+                )],
+                PROCESS_SCHEMAS,
+                "verifier",
+                active_process=active,
+            )
+        with self.assertRaisesRegex(DeveloperError, "lossless"):
+            self.coordinator._validate_tool_calls(
+                [process_call(
+                    "call-tail",
+                    "run_command",
+                    {"command": "pwd", "tail": 10},
+                )],
+                PROCESS_SCHEMAS,
+                "verifier",
+            )
+
+    def test_running_process_is_durable_and_only_completion_adds_evidence(self) -> None:
+        task_id = self.coordinator.journal.next_task_id()
+        command = process_call(
+            "call-run",
+            "run_command",
+            {"command": "python3 -m unittest tests/test_client.py -v"},
+        )
+        with self.coordinator._connect() as db:
+            db.execute(
+                """
+                INSERT INTO forge_developer_runs(
+                    task_id, status, phase, instruction, instruction_digest,
+                    created_at, updated_at
+                ) VALUES (?, 'waiting_tool', 'verifier', 'test', 'digest', ?, ?)
+                """,
+                (task_id, "2026-07-29T12:00:00+00:00", "2026-07-29T12:00:00+00:00"),
+            )
             db.execute(
                 """
                 INSERT INTO forge_developer_pending_calls(
                     tool_call_id, task_id, role, provider, model, tool_name,
                     arguments_digest, evidence_kind, test_command, created_at
-                ) VALUES ('call-cancel', ?, 'implementer', 'fake', 'fake/model',
-                    'terminal', 'digest', 'write', 0, ?)
+                ) VALUES (?, ?, 'verifier', 'fake', 'fake/model', 'run_command',
+                    ?, 'test', 1, ?)
                 """,
-                (task_id, "2026-07-29T12:00:00+00:00"),
+                (
+                    command["id"],
+                    task_id,
+                    _arguments_digest(str(command["function"]["arguments"])),
+                    "2026-07-29T12:00:00+00:00",
+                ),
             )
-        self.coordinator.acquire_writer(task_id)
-        self.coordinator.cancel(task_id)
-        self.assertEqual(self.coordinator._run(task_id)["status"], "cancelled")
-        self.assertEqual(self.coordinator.writer_lock()["state"], "available")
-        with self.assertRaises(DeveloperError):
-            self.coordinator._find_run("call-cancel")
+        running_content = json.dumps({
+            "id": "process-123",
+            "status": "running",
+            "exit_code": None,
+            "output": "test started\n",
+            "next_offset": 1,
+        })
+        callback_messages = [
+            {"role": "assistant", "content": None, "tool_calls": [command]},
+            {"role": "tool", "tool_call_id": "call-run", "content": running_content},
+        ]
+        self.coordinator._record_tool_results(
+            self.coordinator._run(task_id),
+            callback_messages,
+        )
+        run = self.coordinator._run(task_id)
+        self.assertEqual(run["active_process"]["process_id"], "process-123")
+        self.assertEqual(run["active_process"]["next_offset"], 1)
+        self.assertEqual(run["phase_evidence"], {})
+        self.assertEqual(run["test_state"], "not_started")
+        self.assertEqual(self.coordinator._tool_status('{"status":"running"}'), "running")
+        self.assertFalse(self.coordinator._phase_ready(run, "verifier", True))
+        with self.assertRaisesRegex(DeveloperError, "checkpoint"):
+            self.coordinator.complete({
+                "model": "swarm-developer",
+                "messages": [
+                    {"role": "user", "content": "Run the focused test."},
+                    callback_messages[0],
+                    {**callback_messages[1], "content": running_content + "tampered"},
+                ],
+                "tools": PROCESS_TOOLS,
+            })
+
+        poll = process_call(
+            "call-poll",
+            "get_process_status",
+            {"process_id": "process-123", "offset": 1, "wait": 30},
+        )
+        with patch.object(self.coordinator.client, "completion", return_value=completion(poll)):
+            resumed = self.coordinator.complete({
+                "model": "swarm-developer",
+                "messages": [
+                    {"role": "user", "content": "Run the focused test."},
+                    *callback_messages,
+                ],
+                "tools": PROCESS_TOOLS,
+            })
+        self.assertEqual(
+            resumed["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call-poll",
+        )
+        self.coordinator._record_tool_results(
+            self.coordinator._run(task_id),
+            [
+                {"role": "assistant", "content": None, "tool_calls": [poll]},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-poll",
+                    "content": json.dumps({
+                        "id": "process-123",
+                        "status": "done",
+                        "exit_code": 0,
+                        "output": "Ran 1 test in 0.01s\nOK\n",
+                        "next_offset": 2,
+                    }),
+                },
+            ],
+        )
+        run = self.coordinator._run(task_id)
+        self.assertEqual(run["active_process"], {})
+        self.assertEqual(run["phase_evidence"]["verifier"], ["test"])
+        self.assertEqual(run["test_state"], "passed")
 
     def test_implementer_policy_rejection_fails_run_and_releases_lock(self) -> None:
         planner = tool_call("call-policy-plan", "pwd")

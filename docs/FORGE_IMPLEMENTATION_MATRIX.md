@@ -125,12 +125,12 @@ matrix above. All dashboard work also inherits the global browser gates below.
 | FG-000 architecture baseline | SOL; Qwen Mini advisory rejected | COMPLETE | 171 focused, 332 full, frontend/build/parity; both Luna re-reviews PASS |
 | `1bbad6a` context/compaction recovery | SOL | COMPLETE | `19dfb0c` plus `9592d46`: 234 focused and 359 full tests pass; frontend test/check/build/MCP parity, compileall, and diff checks pass; both independent Luna High reviews PASS on each final slice |
 | Qwen Autopilot reliability | SOL | REVIEW | isolated commits `5f218e6`, `6eb637f`; package verifier passes 53 tests plus checksum/compile/shell/manifest gates; install is held for required Luna reviews |
-| Terminal evidence/session polling | SOL | MAPPED | recovered diagnostics contain no repair commit; inspect Developer pending-call lifecycle |
+| Terminal evidence/session polling | SOL | REVIEW | working tree: exact Open Terminal ID/offset polling, terminal-only evidence, durable active process, bounded redacted dashboard state; 25 focused tests pass |
 | Model Monitor | Qwen Code after FG-020 | MAPPED | recovered handoff is design input to FG-060, not a separate screen |
 | Open Terminal installer | SOL audit only | MAPPED | v0.13-v0.15 STOP defects resolved by preserved v0.16 evidence; no deployment authorized |
 | R-001 lifecycle/journal reconciliation | SOL | MAPPED | crash consistency and durable Active Runs are blocking FG-020 gates |
-| R-002 writer lease/session cleanup | SOL | MAPPED | reject expired leases; poll/close pending sessions; blocking before new writes |
-| R-003 cancellation/process cleanup | SOL | MAPPED | cancel image side effects and terminate Night Owl process groups |
+| R-002 writer lease/session cleanup | SOL | REVIEW | token-fenced release, exact-callback stale renewal, digest-checked restart replay, in-flight takeover rejection, deterministic process kill, and stale model-response guard implemented; Luna reviews and host HTTP rerun pending |
+| R-003 cancellation/process cleanup | SOL | IN_PROGRESS | Developer cancellation now keeps its fence through exact process kill; image side effects and Night Owl process groups remain |
 | R-004 personal API hardening | SOL | MAPPED | bounded bodies, constant-time bearer validation, and explicit loopback/Docker-bridge authorization tests |
 | R-005 artifact integrity | SOL | MAPPED | atomic no-overwrite masters, cleanup, digest verification; blocks FG-040/120/140/150/170/190 |
 | R-006 scheduler integrity | SOL | MAPPED | renew/cover manual leases, reject malformed success, and make ambiguous submission outcomes idempotent; blocks FG-160 |
@@ -246,18 +246,25 @@ commit `9592d46`.
 
 ## Current rollover checkpoint
 
-- Branch: `feature/swarm-developer`; accepted code checkpoint `679e0e6` before this
-  journal update.
-- Active task: R-002 terminal evidence, writer fencing, and pending-session cleanup.
-- Exact next action: trace every `DeveloperTerminal` caller and existing terminal
-  session contract, add focused failing lifecycle tests, then make the smallest shared
-  polling/close/lease-token repair.
-- Open findings: Autopilot installation awaits both Luna PASS results; R-002 terminal
-  polling and lease-token invariants; provider-qualified model identity remains a
-  later Agents & Models migration concern.
+- Branch: `feature/swarm-developer`; accepted HEAD `d3a0c14`; R-002 implementation is
+  in the working tree pending its local commit and independent review.
+- Active task: R-002 terminal evidence, writer fencing, pending-session cleanup, and
+  cancellation race closure.
+- Exact next action: finish SOL diff review, run every non-sandboxed verification
+  available, create the narrow local implementation commit, then hold R-002 at
+  `REVIEW` until both required Luna reviews and the socket-based HTTP rerun are
+  available.
+- Open findings: Autopilot and R-002 await both Luna PASS results; the account's
+  external-model/host-execution gate is exhausted until 2026-08-08; provider-qualified
+  model identity remains a later Agents & Models migration concern.
 - Verified context recovery: 234 focused and 359 full Python tests; frontend
   test/check/build/MCP parity; compileall and `git diff --check` all passed. The bare
   `python -m unittest` command discovers zero repository tests, so the recorded full
   command is `python -m unittest discover -s tests`.
 - Pending external repair commits: Autopilot `5f218e6` and `6eb637f` remain isolated
   and are not installed or represented as reviewed.
+- R-002 evidence: `python3 -m unittest tests.test_developer.DeveloperCoordinatorTest
+  -v` passed 25/25; compileall and `git diff --check` passed. Full discovery ran 362
+  tests: 333 passed and 29 socket-dependent tests errored uniformly with sandbox
+  `PermissionError`. The required host rerun was requested and rejected by the same
+  exhausted external-usage gate, so no HTTP/browser PASS is claimed.
