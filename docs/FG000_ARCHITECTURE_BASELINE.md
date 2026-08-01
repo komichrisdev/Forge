@@ -208,10 +208,10 @@ errors are an execution-environment baseline, not repository failures.
 
 ## Confirmed baseline defects and gaps
 
-- `1bbad6a` passes its tests but remains a repair candidate: handoff provenance,
-  atomic tool-group cleanup, newest terminal-evidence retention, retry-objective
-  retention, context-overflow classification, and catalog-context propagation have
-  untested defects.
+- `19dfb0c` repairs and tests the `1bbad6a` handoff provenance, atomic tool-group
+  cleanup, newest terminal-evidence retention, and retry-objective defects. The
+  remaining context repair scope is overflow classification, conservative metadata
+  resolution, and catalog-context propagation.
 - Personal task state and journal events are non-atomic; generic runs remain
   file-ledger based, so legacy activity can become stale or disagree across stores.
 - Developer tool-result acceptance does not reject an expired writer lease.

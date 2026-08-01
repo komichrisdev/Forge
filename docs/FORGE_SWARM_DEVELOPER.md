@@ -22,6 +22,17 @@ state, review state, and outcome are stored in the existing catalog SQLite
 database and append-only task journal. Tool-call IDs correlate Open WebUI
 round trips after refresh or model rotation.
 
+Context handling is structure-aware. Client system messages are demoted to
+explicitly bounded untrusted user content without flattening structured parts.
+Client messages, role handoffs, and coordinator retry controls retain caller-owned
+provenance; marker text cannot change those classifications. Invalid, incomplete,
+or duplicate tool-call groups are removed atomically. Under context pressure the
+original client objective, latest coordinator control, and newest complete tool
+group remain required; large text evidence is summarized in place with its protocol
+shape intact. If that minimum cannot fit, the request fails before provider
+submission. Every fallback candidate is rebuilt from the original logical transcript
+rather than a prior candidate's compacted copy.
+
 Planner, reviewer, and verifier are read-only. Only the implementer may edit
 under `/workspace/forge`. Destructive Git, commit, push, checkout/switch,
 deployment, Docker, sudo, systemd, networking/exfiltration tools, outside

@@ -123,7 +123,7 @@ matrix above. All dashboard work also inherits the global browser gates below.
 | Task | Owner | State | Evidence / next gate |
 | --- | --- | --- | --- |
 | FG-000 architecture baseline | SOL; Qwen Mini advisory rejected | COMPLETE | 171 focused, 332 full, frontend/build/parity; both Luna re-reviews PASS |
-| `1bbad6a` context/compaction recovery | SOL | IN_PROGRESS | baseline 171 focused and 332 full tests pass; confirmed defects require regression tests and repair |
+| `1bbad6a` context/compaction recovery | SOL | IN_PROGRESS | compaction/normalization slice committed as `19dfb0c`: 186 focused and 348 full tests pass; both Luna High reviews PASS; overflow classification and catalog-context propagation remain open |
 | Qwen Autopilot reliability | SOL | IN_PROGRESS | paused; 20 tests pass, checksums stale, completion/backoff/lease/signal/polling defects open |
 | Terminal evidence/session polling | SOL | MAPPED | recovered diagnostics contain no repair commit; inspect Developer pending-call lifecycle |
 | Model Monitor | Qwen Code after FG-020 | MAPPED | recovered handoff is design input to FG-060, not a separate screen |
@@ -168,6 +168,24 @@ Final re-review: Luna Product returned PASS with no remaining findings; Luna
 Architecture returned PASS after the four second-round corrections, with no remaining
 findings or new critical contradiction.
 
+## Independent context-compaction repair findings
+
+Architecture and Product reviewed identical snapshots independently. SOL corrected
+each reproducible STOP finding before requesting another review. The final snapshot
+at `19dfb0c` received PASS from both Luna High reviewers and the original read-only
+context auditor.
+
+| Finding | Disposition |
+| --- | --- |
+| content markers could spoof handoff provenance | fixed with caller-owned provenance buckets and a true-client-user index sidecar |
+| retries could displace the original objective | fixed by separate server-control context; both messages are required under compaction |
+| malformed or duplicate tool groups could leave half-groups | fixed by one sequential atomic parser and global normalized-ID reservation |
+| newest terminal evidence could be discarded | fixed by atomic retention and bounded in-place head/tail summaries |
+| list-shaped objectives or tool results could change shape or disappear | fixed with text extraction for durable objectives and structure-preserving part compaction |
+| contentless user/assistant messages were accepted | fixed by boundary validation |
+| converted client-system messages could replace the objective or stringify parts | fixed by positional provenance and structure-preserving untrusted wrappers |
+| structured status evidence was alleged to become `unknown` | not reproduced; existing status fallback classified nested/list exit codes and now has an explicit regression assertion |
+
 ## Significant decisions and corrections
 
 1. The live Planning tab, not the Autopilot manifest status, defines the 24 product
@@ -180,8 +198,10 @@ findings or new critical contradiction.
    and SOL holds its process lock until the write phase ends.
 4. The current Autopilot repairs are useful but incomplete: five checksum entries are
    stale and the new non-thinking/block validation behavior lacks focused tests.
-5. `1bbad6a` is retained, not reverted, but is under STOP-for-acceptance until its
-   untested compaction and metadata defects are corrected.
+5. `1bbad6a` is retained, not reverted. Commit `19dfb0c` completes and independently
+   accepts its compaction/normalization repair slice. Context-overflow classification,
+   conservative metadata resolution, and catalog-context caller propagation remain
+   separate open repairs.
 6. The five previously unreachable Qwen context commits are preserved by local
    `refs/archive/qwen-context/*`; no recovered material was deleted.
 7. Model Monitor research will extend Agents & Models. It will not create another
@@ -200,13 +220,14 @@ findings or new critical contradiction.
 
 ## Current rollover checkpoint
 
-- Branch/HEAD: `feature/swarm-developer` at `1bbad6a` before FG-000 documentation.
-- Active task: commit FG-000, then repair `1bbad6a` and Autopilot reliability.
-- Exact next action: commit the two reviewed FG-000 documents with explicit paths,
-  then add regression tests for the confirmed context/compaction defects.
-- Open findings: context compaction provenance/atomicity/evidence retention;
-  catalog-context propagation; overflow classification; Autopilot retries/backoff,
-  polling, signal cleanup, checksums, and tests.
-- Verified baseline: Python 171 focused and 332 full; frontend check/test/build/MCP
+- Branch: `feature/swarm-developer`; accepted code checkpoint `19dfb0c`.
+- Active task: finish the remaining `1bbad6a` context-metadata/caller repairs, then
+  repair Autopilot reliability.
+- Exact next action: add failing tests for overflow error classification and every
+  catalog-context caller before changing shared resolution code.
+- Open findings: catalog-context propagation; overflow classification; conservative
+  metadata conflict handling; Autopilot retries/backoff, polling, signal cleanup,
+  checksums, and tests.
+- Verified repair: Python 186 focused and 348 full; frontend check/test/build/MCP
   parity; compileall and `git diff --check` all passed.
-- Pending commits: FG-000 documentation only; no feature implementation accepted.
+- Pending code commits: none; this matrix update records `19dfb0c`.
