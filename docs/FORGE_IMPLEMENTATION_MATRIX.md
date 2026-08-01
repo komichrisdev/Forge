@@ -124,7 +124,7 @@ matrix above. All dashboard work also inherits the global browser gates below.
 | --- | --- | --- | --- |
 | FG-000 architecture baseline | SOL; Qwen Mini advisory rejected | COMPLETE | 171 focused, 332 full, frontend/build/parity; both Luna re-reviews PASS |
 | `1bbad6a` context/compaction recovery | SOL | COMPLETE | `19dfb0c` plus `9592d46`: 234 focused and 359 full tests pass; frontend test/check/build/MCP parity, compileall, and diff checks pass; both independent Luna High reviews PASS on each final slice |
-| Qwen Autopilot reliability | SOL | IN_PROGRESS | paused; 20 tests pass, checksums stale, completion/backoff/lease/signal/polling defects open |
+| Qwen Autopilot reliability | SOL | REVIEW | isolated commits `5f218e6`, `6eb637f`; package verifier passes 53 tests plus checksum/compile/shell/manifest gates; install is held for required Luna reviews |
 | Terminal evidence/session polling | SOL | MAPPED | recovered diagnostics contain no repair commit; inspect Developer pending-call lifecycle |
 | Model Monitor | Qwen Code after FG-020 | MAPPED | recovered handoff is design input to FG-060, not a separate screen |
 | Open Terminal installer | SOL audit only | MAPPED | v0.13-v0.15 STOP defects resolved by preserved v0.16 evidence; no deployment authorized |
@@ -215,8 +215,12 @@ commit `9592d46`.
    is not mutated for program tracking.
 3. Qwen Autopilot remains paused. Its timer is disabled, its database is backed up,
    and SOL holds its process lock until the write phase ends.
-4. The current Autopilot repairs are useful but incomplete: five checksum entries are
-   stale and the new non-thinking/block validation behavior lacks focused tests.
+4. Autopilot recovery is frozen in the disposable `sol/autopilot-repair` branch at
+   `6eb637f` (aggregate diff SHA-256
+   `c841c63a32f593cfe62a34346168fc3f61a026606c50606be695e8539518f043`).
+   Its verifier passes 53 tests plus checksum, compile, shell, and manifest gates;
+   deliberate checksum tampering fails. The installed package remains untouched until
+   independent Luna Architecture and Product reviews pass.
 5. `1bbad6a` is retained, not reverted. Commit `19dfb0c` completes its
    compaction/normalization repair slice; `9592d46` completes conservative context
    metadata, caller propagation, and neutral context-overflow handling. Both slices
@@ -236,22 +240,24 @@ commit `9592d46`.
 11. Independent Luna Product and Architecture reviews both passed the corrected
     FG-000 baseline. Their STOP findings remain recorded above as implementation
     gates rather than being erased after correction.
+12. The required Autopilot Luna reviews could not start because the external Luna
+    usage gate is exhausted until 2026-08-08. No substitute model is being presented
+    as Luna; implementation continues while this review gate remains open.
 
 ## Current rollover checkpoint
 
-- Branch: `feature/swarm-developer`; accepted code checkpoint `9592d46`.
-- Active task: repair Qwen Autopilot reliability, then R-002 terminal evidence,
-  writer fencing, and pending-session cleanup.
-- Exact next action: preserve the installed package, build the Autopilot repair in a
-  temporary reviewed copy, and begin with failing tests for action validation,
-  non-thinking defaults, completion probing, retry accounting/backoff, and long-call
-  lease/logging behavior.
-- Open findings: Autopilot completion probes, retry/backoff, hard deadlines, lease
-  renewal, interruption cleanup, checksums, and shared writer fencing; R-002 terminal
+- Branch: `feature/swarm-developer`; accepted code checkpoint `679e0e6` before this
+  journal update.
+- Active task: R-002 terminal evidence, writer fencing, and pending-session cleanup.
+- Exact next action: trace every `DeveloperTerminal` caller and existing terminal
+  session contract, add focused failing lifecycle tests, then make the smallest shared
+  polling/close/lease-token repair.
+- Open findings: Autopilot installation awaits both Luna PASS results; R-002 terminal
   polling and lease-token invariants; provider-qualified model identity remains a
   later Agents & Models migration concern.
 - Verified context recovery: 234 focused and 359 full Python tests; frontend
   test/check/build/MCP parity; compileall and `git diff --check` all passed. The bare
   `python -m unittest` command discovers zero repository tests, so the recorded full
   command is `python -m unittest discover -s tests`.
-- Pending code commits: none; this matrix update records `9592d46`.
+- Pending external repair commits: Autopilot `5f218e6` and `6eb637f` remain isolated
+  and are not installed or represented as reviewed.
