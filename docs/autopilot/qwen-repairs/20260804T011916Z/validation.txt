@@ -1,0 +1,8 @@
+patch_applied=False
+validation_passed=False
+patch_error=error: corrupt patch at line 13
+
+
+Patch was not applied.
+error: corrupt patch at line 13
+
