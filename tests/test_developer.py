@@ -12,6 +12,7 @@ import unittest
 from swarm_router.developer import (
     DeveloperCoordinator,
     DeveloperError,
+    PHASE_TOOL_RESULT_BUDGETS,
     _arguments_digest,
     _tool_schemas,
 )
@@ -214,7 +215,44 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                 "model": "swarm-developer", "messages": messages, "tools": [TOOL], "tool_choice": "auto",
             })
 
-        self.assertIn("Verification passed.", second["choices"][0]["message"]["content"])
+        final_content = (
+            second["choices"][0][
+                "message"
+            ]["content"]
+        )
+
+        self.assertIn(
+            (
+                "Forge swarm run "
+                f"{task_id} completed."
+            ),
+            final_content,
+        )
+        self.assertIn(
+            (
+                "Tests: passed. "
+                "Review: completed."
+            ),
+            final_content,
+        )
+        self.assertIn(
+            (
+                "Changed files: "
+                "focused-change.txt."
+            ),
+            final_content,
+        )
+        self.assertIn(
+            (
+                "- Verifier: "
+                "test, git_status"
+            ),
+            final_content,
+        )
+        self.assertNotIn(
+            "Verification passed.",
+            final_content,
+        )
         self.assertEqual(second["forge_task_id"], task_id)
         self.assertEqual(upstream.call_args_list[0].args[0]["tool_choice"], "auto")
         self.assertEqual(upstream.call_args_list[1].args[0]["messages"][-1]["tool_call_id"], "call-planner")
@@ -266,6 +304,304 @@ class DeveloperCoordinatorTest(unittest.TestCase):
         self.assertEqual(len(run["attempts"]), 2)
         self.assertTrue(run["attempts"][0]["failure"])
         self.assertNotEqual(run["attempts"][0]["model"], run["attempts"][1]["model"])
+
+    def test_multiple_process_starts_retry_same_model_once(
+        self,
+    ) -> None:
+        first = completion(
+            process_call(
+                "call-multi-one",
+                "run_command",
+                {
+                    "command": "pwd",
+                },
+            )
+        )
+        first["choices"][0]["message"][
+            "tool_calls"
+        ].append(
+            process_call(
+                "call-multi-two",
+                "run_command",
+                {
+                    "command": (
+                        "git status --short"
+                    ),
+                },
+            )
+        )
+        accepted = completion(
+            process_call(
+                "call-serial-accepted",
+                "run_command",
+                {
+                    "command": "pwd",
+                },
+            )
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                first,
+                accepted,
+            ],
+        ) as upstream:
+            result = self.coordinator.complete(
+                {
+                    "model": (
+                        "swarm-developer"
+                    ),
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect Forge."
+                            ),
+                        }
+                    ],
+                    "tools": PROCESS_TOOLS,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": False,
+                }
+            )
+
+        self.assertEqual(
+            upstream.call_count,
+            2,
+        )
+        self.assertEqual(
+            upstream.call_args_list[0]
+            .args[0]["model"],
+            upstream.call_args_list[1]
+            .args[0]["model"],
+        )
+        self.assertIs(
+            upstream.call_args_list[1]
+            .args[0]["parallel_tool_calls"],
+            False,
+        )
+        self.assertIn(
+            "exactly one terminal tool call",
+            upstream.call_args_list[1]
+            .args[0]["messages"][-1][
+                "content"
+            ],
+        )
+
+        run = self.coordinator._run(
+            result["forge_task_id"]
+        )
+
+        self.assertEqual(
+            [
+                item["id"]
+                for item
+                in run[
+                    "pending_tool_calls"
+                ]
+            ],
+            [
+                "call-serial-accepted",
+            ],
+        )
+        self.assertEqual(
+            len(run["attempts"]),
+            2,
+        )
+        self.assertIn(
+            "Only one Open Terminal",
+            run["attempts"][0][
+                "failure"
+            ],
+        )
+        self.assertFalse(
+            run["attempts"][1][
+                "failure"
+            ],
+        )
+
+        with self.coordinator._connect() as db:
+            pending = db.execute(
+                """
+                SELECT tool_call_id
+                FROM forge_developer_pending_calls
+                WHERE task_id=?
+                """,
+                (run["task_id"],),
+            ).fetchall()
+            event = db.execute(
+                """
+                SELECT metadata
+                FROM forge_journal_events
+                WHERE task_id=?
+                  AND stage='serial_tool_retry'
+                """,
+                (run["task_id"],),
+            ).fetchone()
+
+        self.assertEqual(
+            [
+                row["tool_call_id"]
+                for row in pending
+            ],
+            [
+                "call-serial-accepted",
+            ],
+        )
+        metadata = json.loads(
+            event["metadata"]
+        )
+        self.assertFalse(
+            metadata["executed"]
+        )
+        self.assertEqual(
+            metadata["role"],
+            "planner",
+        )
+
+    def test_repeated_multiple_process_starts_fail_closed(
+        self,
+    ) -> None:
+        rejected = completion(
+            process_call(
+                "call-repeat-one",
+                "run_command",
+                {
+                    "command": "pwd",
+                },
+            )
+        )
+        rejected["choices"][0][
+            "message"
+        ]["tool_calls"].append(
+            process_call(
+                "call-repeat-two",
+                "run_command",
+                {
+                    "command": (
+                        "git status --short"
+                    ),
+                },
+            )
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                rejected,
+                rejected,
+            ],
+        ) as upstream:
+            with self.assertRaisesRegex(
+                DeveloperError,
+                (
+                    "repeated multiple-process "
+                    "tool responses"
+                ),
+            ):
+                self.coordinator.complete(
+                    {
+                        "model": (
+                            "swarm-developer"
+                        ),
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Inspect Forge."
+                                ),
+                            }
+                        ],
+                        "tools": (
+                            PROCESS_TOOLS
+                        ),
+                        "tool_choice": "auto",
+                        "parallel_tool_calls": (
+                            False
+                        ),
+                    }
+                )
+
+        self.assertEqual(
+            upstream.call_count,
+            2,
+        )
+        self.assertEqual(
+            upstream.call_args_list[0]
+            .args[0]["model"],
+            upstream.call_args_list[1]
+            .args[0]["model"],
+        )
+
+        with self.coordinator._connect() as db:
+            run = db.execute(
+                """
+                SELECT
+                    task_id,
+                    status,
+                    attempts,
+                    pending_tool_calls,
+                    active_process
+                FROM forge_developer_runs
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            pending_count = db.execute(
+                """
+                SELECT COUNT(*)
+                FROM forge_developer_pending_calls
+                WHERE task_id=?
+                """,
+                (run["task_id"],),
+            ).fetchone()[0]
+            retry_events = db.execute(
+                """
+                SELECT COUNT(*)
+                FROM forge_journal_events
+                WHERE task_id=?
+                  AND stage='serial_tool_retry'
+                """,
+                (run["task_id"],),
+            ).fetchone()[0]
+
+        self.assertEqual(
+            run["status"],
+            "failed",
+        )
+        self.assertEqual(
+            pending_count,
+            0,
+        )
+        self.assertEqual(
+            retry_events,
+            2,
+        )
+        self.assertEqual(
+            json.loads(
+                run[
+                    "pending_tool_calls"
+                ]
+            ),
+            [],
+        )
+        self.assertEqual(
+            json.loads(
+                run["active_process"]
+            ),
+            {},
+        )
+        self.assertEqual(
+            len(
+                json.loads(
+                    run["attempts"]
+                )
+            ),
+            2,
+        )
 
     def test_unknown_tool_result_and_read_only_policy_fail_closed(self) -> None:
         with self.assertRaisesRegex(DeveloperError, "Unknown or expired"):
@@ -890,6 +1226,58 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             upstream.call_args_list[3].args[0]["messages"][-1]["content"],
         )
 
+    def test_developer_forces_serial_terminal_calls_upstream(self) -> None:
+        planner_call = tool_call(
+            "call-serial-terminal",
+            "pwd",
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            return_value=completion(
+                planner_call
+            ),
+        ) as upstream:
+            response = self.coordinator.complete(
+                {
+                    "model": (
+                        "swarm-developer"
+                    ),
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect the Forge "
+                                "repository root."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": True,
+                }
+            )
+
+        payload = upstream.call_args.args[0]
+
+        self.assertIs(
+            payload[
+                "parallel_tool_calls"
+            ],
+            False,
+        )
+        self.assertEqual(
+            response["forge_role"],
+            "planner",
+        )
+        self.assertEqual(
+            response["choices"][0][
+                "message"
+            ]["tool_calls"][0]["id"],
+            "call-serial-terminal",
+        )
+
     def test_duplicate_ids_and_tool_choice_none_are_rejected(self) -> None:
         call = tool_call("call-duplicate", "pwd")
         with self.assertRaisesRegex(DeveloperError, "Duplicate"):
@@ -1397,7 +1785,35 @@ class DeveloperCoordinatorTest(unittest.TestCase):
         run = self.coordinator._run(response["forge_task_id"])
         self.assertEqual(run["status"], "completed")
         self.assertEqual({item["model"] for item in run["attempts"]}, {keep})
-        self.assertIn("Verification complete.", response["choices"][0]["message"]["content"])
+        final_content = (
+            response["choices"][0][
+                "message"
+            ]["content"]
+        )
+
+        self.assertIn(
+            "Forge swarm run ",
+            final_content,
+        )
+        self.assertIn(
+            (
+                "Tests: not_started. "
+                "Review: completed."
+            ),
+            final_content,
+        )
+        self.assertIn(
+            "Changed files: none.",
+            final_content,
+        )
+        self.assertIn(
+            "- Verifier: none",
+            final_content,
+        )
+        self.assertNotIn(
+            "Verification complete.",
+            final_content,
+        )
         run["attempts"] = []
         self.assertEqual(len(self.coordinator._candidates(run, "planner")), 3)
         run["attempts"] = [
@@ -1405,6 +1821,1235 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             {"role": "planner", "model": keep, "failure": ""},
         ]
         self.assertEqual(len(self.coordinator._candidates(run, "planner")), 2)
+
+    def test_phase_tool_budget_forces_planner_to_finish(self) -> None:
+        planner_call = tool_call(
+            "call-budget-seed",
+            "pwd",
+        )
+        extra_planner_call = tool_call(
+            "call-budget-extra",
+            "git status --short",
+        )
+        implementer_call = tool_call(
+            "call-budget-implementer",
+            "git status --short",
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                completion(planner_call),
+                completion(extra_planner_call),
+                completion(
+                    content=(
+                        "Plan complete after bounded "
+                        "repository inspection."
+                    )
+                ),
+                completion(implementer_call),
+            ],
+        ) as upstream:
+            first = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect Forge and produce "
+                                "a bounded plan."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+            task_id = first["forge_task_id"]
+
+            with self.coordinator._connect() as db:
+                db.execute(
+                    """
+                    UPDATE forge_developer_runs
+                    SET phase_evidence=?
+                    WHERE task_id=?
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "planner": [
+                                    "inspection"
+                                ]
+                                * (
+                                    PHASE_TOOL_RESULT_BUDGETS[
+                                        "planner"
+                                    ]
+                                    - 1
+                                )
+                            }
+                        ),
+                        task_id,
+                    ),
+                )
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Inspect Forge and produce "
+                        "a bounded plan."
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [planner_call],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": (
+                        "call-budget-seed"
+                    ),
+                    "content": (
+                        "/workspace/forge\n"
+                    ),
+                },
+            ]
+
+            result = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": messages,
+                    "tools": [TOOL],
+                }
+            )
+
+        self.assertEqual(
+            result["forge_task_id"],
+            task_id,
+        )
+        self.assertEqual(
+            result["forge_role"],
+            "implementer",
+        )
+        self.assertEqual(
+            result["choices"][0]["message"][
+                "tool_calls"
+            ][0]["id"],
+            "call-budget-implementer",
+        )
+        self.assertEqual(
+            upstream.call_count,
+            4,
+        )
+
+        retry_messages = (
+            upstream.call_args_list[2]
+            .args[0]["messages"]
+        )
+
+        self.assertIn(
+            "terminal-call budget is exhausted",
+            retry_messages[-1]["content"],
+        )
+
+        budget_retry_payload = (
+            upstream.call_args_list[2].args[0]
+        )
+        self.assertEqual(
+            budget_retry_payload["tool_choice"],
+            "none",
+        )
+        self.assertEqual(
+            budget_retry_payload["tools"],
+            [],
+        )
+        self.assertFalse(
+            budget_retry_payload[
+                "parallel_tool_calls"
+            ]
+        )
+
+        with self.coordinator._connect() as db:
+            run = db.execute(
+                """
+                SELECT
+                    phase,
+                    status,
+                    role_outputs
+                FROM forge_developer_runs
+                WHERE task_id=?
+                """,
+                (task_id,),
+            ).fetchone()
+
+            pending = db.execute(
+                """
+                SELECT tool_call_id
+                FROM forge_developer_pending_calls
+                WHERE task_id=?
+                ORDER BY created_at
+                """,
+                (task_id,),
+            ).fetchall()
+
+            budget_events = db.execute(
+                """
+                SELECT metadata
+                FROM forge_journal_events
+                WHERE task_id=?
+                  AND stage='phase_tool_budget'
+                """,
+                (task_id,),
+            ).fetchall()
+
+        self.assertEqual(
+            run["phase"],
+            "implementer",
+        )
+        self.assertEqual(
+            run["status"],
+            "waiting_tool",
+        )
+        self.assertIn(
+            "Plan complete after bounded",
+            json.loads(
+                run["role_outputs"]
+            )["planner"],
+        )
+        self.assertEqual(
+            [
+                row["tool_call_id"]
+                for row in pending
+            ],
+            ["call-budget-implementer"],
+        )
+        self.assertEqual(
+            len(budget_events),
+            1,
+        )
+
+        metadata = json.loads(
+            budget_events[0]["metadata"]
+        )
+
+        self.assertEqual(
+            metadata["completed_tool_results"],
+            PHASE_TOOL_RESULT_BUDGETS[
+                "planner"
+            ],
+        )
+        self.assertEqual(
+            metadata["budget"],
+            PHASE_TOOL_RESULT_BUDGETS[
+                "planner"
+            ],
+        )
+        self.assertFalse(
+            metadata["executed"]
+        )
+
+
+    def test_planner_accepts_safe_short_rev_parse(self) -> None:
+        calls = self.coordinator._validate_tool_calls(
+            [
+                tool_call(
+                    "call-rev-parse-short",
+                    "git rev-parse --short HEAD",
+                )
+            ],
+            TOOL_SCHEMAS,
+            "planner",
+        )
+
+        self.assertEqual(
+            calls[0]["id"],
+            "call-rev-parse-short",
+        )
+
+    def test_ready_phase_policy_rejection_forces_conclusion(self) -> None:
+        planner_call = tool_call(
+            "call-ready-seed",
+            "pwd",
+        )
+        rejected_call = tool_call(
+            "call-ready-rejected",
+            "pwd && ls -la",
+        )
+        implementer_call = tool_call(
+            "call-ready-implementer",
+            "git status --short",
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                completion(planner_call),
+                completion(rejected_call),
+                completion(
+                    content=(
+                        "Plan complete using the existing "
+                        "terminal evidence."
+                    )
+                ),
+                completion(implementer_call),
+            ],
+        ) as upstream:
+            first = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect Forge and provide "
+                                "a bounded plan."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+            task_id = first["forge_task_id"]
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Inspect Forge and provide "
+                        "a bounded plan."
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [planner_call],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-ready-seed",
+                    "content": "/workspace/forge\n",
+                },
+            ]
+
+            result = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": messages,
+                    "tools": [TOOL],
+                }
+            )
+
+        self.assertEqual(
+            result["forge_task_id"],
+            task_id,
+        )
+        self.assertEqual(
+            result["forge_role"],
+            "implementer",
+        )
+        self.assertEqual(
+            result["choices"][0]["message"][
+                "tool_calls"
+            ][0]["id"],
+            "call-ready-implementer",
+        )
+        self.assertEqual(
+            upstream.call_count,
+            4,
+        )
+
+        conclusion_messages = (
+            upstream.call_args_list[2]
+            .args[0]["messages"]
+        )
+
+        self.assertIn(
+            "required phase evidence is already present",
+            conclusion_messages[-1]["content"],
+        )
+        self.assertIn(
+            "Do not call another tool",
+            conclusion_messages[-1]["content"],
+        )
+
+        conclusion_payload = (
+            upstream.call_args_list[2].args[0]
+        )
+        self.assertEqual(
+            conclusion_payload["tool_choice"],
+            "none",
+        )
+        self.assertEqual(
+            conclusion_payload["tools"],
+            [],
+        )
+        self.assertFalse(
+            conclusion_payload[
+                "parallel_tool_calls"
+            ]
+        )
+
+        implementer_payload = (
+            upstream.call_args_list[3].args[0]
+        )
+        self.assertEqual(
+            implementer_payload["tool_choice"],
+            "auto",
+        )
+        self.assertTrue(
+            implementer_payload["tools"]
+        )
+
+        with self.coordinator._connect() as db:
+            run = db.execute(
+                """
+                SELECT
+                    phase,
+                    status,
+                    role_outputs
+                FROM forge_developer_runs
+                WHERE task_id=?
+                """,
+                (task_id,),
+            ).fetchone()
+
+            pending = db.execute(
+                """
+                SELECT tool_call_id
+                FROM forge_developer_pending_calls
+                WHERE task_id=?
+                ORDER BY created_at
+                """,
+                (task_id,),
+            ).fetchall()
+
+            rejection = db.execute(
+                """
+                SELECT metadata
+                FROM forge_journal_events
+                WHERE task_id=?
+                  AND stage='policy_rejection'
+                """,
+                (task_id,),
+            ).fetchone()
+
+        self.assertEqual(
+            run["phase"],
+            "implementer",
+        )
+        self.assertEqual(
+            run["status"],
+            "waiting_tool",
+        )
+        self.assertIn(
+            "Plan complete using",
+            json.loads(
+                run["role_outputs"]
+            )["planner"],
+        )
+        self.assertEqual(
+            [
+                row["tool_call_id"]
+                for row in pending
+            ],
+            ["call-ready-implementer"],
+        )
+
+        metadata = json.loads(
+            rejection["metadata"]
+        )
+
+        self.assertTrue(
+            metadata["phase_already_ready"]
+        )
+        self.assertFalse(
+            metadata["executed"]
+        )
+
+    def test_missing_evidence_retries_same_model_with_required_tool(self) -> None:
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                completion(
+                    content=(
+                        "Plan without terminal "
+                        "evidence."
+                    )
+                ),
+                completion(
+                    tool_call(
+                        "call-required-evidence",
+                        "pwd",
+                    )
+                ),
+            ],
+        ) as upstream:
+            response = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect Forge and provide "
+                                "a grounded plan."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+        self.assertEqual(
+            response["choices"][0]["message"][
+                "tool_calls"
+            ][0]["id"],
+            "call-required-evidence",
+        )
+        self.assertEqual(
+            upstream.call_count,
+            2,
+        )
+
+        first_payload = (
+            upstream.call_args_list[0].args[0]
+        )
+        retry_payload = (
+            upstream.call_args_list[1].args[0]
+        )
+
+        self.assertEqual(
+            retry_payload["model"],
+            first_payload["model"],
+        )
+        self.assertEqual(
+            retry_payload["tool_choice"],
+            "required",
+        )
+        self.assertFalse(
+            retry_payload[
+                "parallel_tool_calls"
+            ]
+        )
+        self.assertTrue(
+            retry_payload["tools"]
+        )
+        self.assertIn(
+            "Call exactly one available "
+            "terminal tool",
+            retry_payload["messages"][-1][
+                "content"
+            ],
+        )
+
+    def test_verifier_budget_allows_only_missing_test_evidence(self) -> None:
+        planner_call = tool_call(
+            "call-budget-verifier-seed",
+            "pwd",
+        )
+        repeated_status = tool_call(
+            "call-budget-verifier-status",
+            "git status --short",
+        )
+        verifier_test = tool_call(
+            "call-budget-verifier-test",
+            (
+                "python3 -m unittest "
+                "tests.test_autopilot_adapter -v"
+            ),
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                completion(planner_call),
+                completion(repeated_status),
+                completion(verifier_test),
+            ],
+        ) as upstream:
+            first = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Run a bounded verifier "
+                                "lifecycle test."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+            task_id = first["forge_task_id"]
+
+            with self.coordinator._connect() as db:
+                db.execute(
+                    """
+                    UPDATE forge_developer_runs
+                    SET
+                        phase='verifier',
+                        phase_evidence=?,
+                        test_state='passed',
+                        review_state='completed'
+                    WHERE task_id=?
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "verifier": [
+                                    "git_status"
+                                ]
+                                * (
+                                    PHASE_TOOL_RESULT_BUDGETS[
+                                        "verifier"
+                                    ]
+                                    - 1
+                                )
+                            }
+                        ),
+                        task_id,
+                    ),
+                )
+
+            response = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Run a bounded verifier "
+                                "lifecycle test."
+                            ),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                planner_call
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": (
+                                "call-budget-verifier-seed"
+                            ),
+                            "content": (
+                                "/workspace/forge\n"
+                            ),
+                        },
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+        self.assertEqual(
+            response["forge_task_id"],
+            task_id,
+        )
+        self.assertEqual(
+            response["forge_role"],
+            "verifier",
+        )
+        self.assertEqual(
+            response["choices"][0]["message"][
+                "tool_calls"
+            ][0]["id"],
+            "call-budget-verifier-test",
+        )
+        self.assertEqual(
+            upstream.call_count,
+            3,
+        )
+
+        rejected_payload = (
+            upstream.call_args_list[1].args[0]
+        )
+        retry_payload = (
+            upstream.call_args_list[2].args[0]
+        )
+
+        self.assertEqual(
+            retry_payload["model"],
+            rejected_payload["model"],
+        )
+        self.assertEqual(
+            retry_payload["tool_choice"],
+            "required",
+        )
+        self.assertFalse(
+            retry_payload[
+                "parallel_tool_calls"
+            ]
+        )
+        self.assertIn(
+            "Missing evidence kinds: test",
+            retry_payload["messages"][-1][
+                "content"
+            ],
+        )
+
+        with self.coordinator._connect() as db:
+            run = db.execute(
+                """
+                SELECT
+                    status,
+                    phase,
+                    phase_evidence
+                FROM forge_developer_runs
+                WHERE task_id=?
+                """,
+                (task_id,),
+            ).fetchone()
+
+            pending = db.execute(
+                """
+                SELECT tool_call_id
+                FROM forge_developer_pending_calls
+                WHERE task_id=?
+                ORDER BY created_at
+                """,
+                (task_id,),
+            ).fetchall()
+
+            events = db.execute(
+                """
+                SELECT metadata
+                FROM forge_journal_events
+                WHERE task_id=?
+                  AND stage='phase_evidence_budget'
+                """,
+                (task_id,),
+            ).fetchall()
+
+        verifier_evidence = json.loads(
+            run["phase_evidence"]
+        )["verifier"]
+
+        self.assertEqual(
+            len(verifier_evidence),
+            PHASE_TOOL_RESULT_BUDGETS[
+                "verifier"
+            ],
+        )
+        self.assertEqual(
+            run["status"],
+            "waiting_tool",
+        )
+        self.assertEqual(
+            run["phase"],
+            "verifier",
+        )
+        self.assertEqual(
+            [
+                row["tool_call_id"]
+                for row in pending
+            ],
+            ["call-budget-verifier-test"],
+        )
+        self.assertEqual(
+            len(events),
+            1,
+        )
+
+        metadata = json.loads(
+            events[0]["metadata"]
+        )
+
+        self.assertEqual(
+            metadata["missing_evidence"],
+            ["test"],
+        )
+        self.assertFalse(
+            metadata["executed"]
+        )
+
+    def test_verifier_missing_evidence_grace_fails_closed(self) -> None:
+        planner_call = tool_call(
+            "call-grace-seed",
+            "pwd",
+        )
+        repeated_test_one = tool_call(
+            "call-grace-test-one",
+            (
+                "python3 -m unittest "
+                "tests.test_autopilot_adapter -v"
+            ),
+        )
+        repeated_test_two = tool_call(
+            "call-grace-test-two",
+            (
+                "python3 -m unittest "
+                "tests.test_autopilot_adapter -v"
+            ),
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                completion(planner_call),
+                completion(repeated_test_one),
+                completion(repeated_test_two),
+            ],
+        ) as upstream:
+            first = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Verify a bounded failure."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+            task_id = first["forge_task_id"]
+
+            with self.coordinator._connect() as db:
+                db.execute(
+                    """
+                    UPDATE forge_developer_runs
+                    SET
+                        phase='verifier',
+                        phase_evidence=?,
+                        test_state='failed',
+                        review_state='completed'
+                    WHERE task_id=?
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "verifier": (
+                                    [
+                                        "git_status"
+                                    ]
+                                    * (
+                                        PHASE_TOOL_RESULT_BUDGETS[
+                                            "verifier"
+                                        ]
+                                    )
+                                    + ["test"]
+                                )
+                            }
+                        ),
+                        task_id,
+                    ),
+                )
+
+            with self.assertRaisesRegex(
+                DeveloperError,
+                (
+                    "repeated non-progressing "
+                    "terminal evidence requests"
+                ),
+            ):
+                self.coordinator.complete(
+                    {
+                        "model": "swarm-developer",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Verify a bounded failure."
+                                ),
+                            },
+                            {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    planner_call
+                                ],
+                            },
+                            {
+                                "role": "tool",
+                                "tool_call_id": (
+                                    "call-grace-seed"
+                                ),
+                                "content": (
+                                    "/workspace/forge\n"
+                                ),
+                            },
+                        ],
+                        "tools": [TOOL],
+                    }
+                )
+
+        self.assertEqual(
+            upstream.call_count,
+            3,
+        )
+
+        with self.coordinator._connect() as db:
+            run = db.execute(
+                """
+                SELECT status
+                FROM forge_developer_runs
+                WHERE task_id=?
+                """,
+                (task_id,),
+            ).fetchone()
+
+            pending = db.execute(
+                """
+                SELECT tool_call_id
+                FROM forge_developer_pending_calls
+                WHERE task_id=?
+                """,
+                (task_id,),
+            ).fetchall()
+
+            events = db.execute(
+                """
+                SELECT sequence
+                FROM forge_journal_events
+                WHERE task_id=?
+                  AND stage='phase_evidence_budget'
+                """,
+                (task_id,),
+            ).fetchall()
+
+        self.assertEqual(
+            run["status"],
+            "failed",
+        )
+        self.assertEqual(
+            pending,
+            [],
+        )
+        self.assertEqual(
+            len(events),
+            2,
+        )
+
+    def test_future_role_completion_claim_is_rejected(self) -> None:
+        with self.assertRaises(
+            DeveloperError
+        ) as raised:
+            self.coordinator._validate_phase_output(
+                (
+                    "Independent review found no "
+                    "repository changes. The verifier "
+                    "phase has also completed."
+                ),
+                "reviewer",
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "invalid_phase_output",
+        )
+        self.assertIn(
+            "boundary into verifier",
+            str(raised.exception),
+        )
+
+    def test_manager_owned_all_phases_claim_is_rejected(self) -> None:
+        with self.assertRaises(
+            DeveloperError
+        ) as raised:
+            self.coordinator._validate_phase_output(
+                (
+                    "Tests passed and Git status "
+                    "is unchanged. All phases complete."
+                ),
+                "verifier",
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "invalid_phase_output",
+        )
+        self.assertIn(
+            "manager-owned final summary",
+            str(raised.exception),
+        )
+
+    def test_current_role_completion_claim_remains_valid(self) -> None:
+        self.coordinator._validate_phase_output(
+            (
+                "Reviewer phase complete. "
+                "The diff is unchanged."
+            ),
+            "reviewer",
+        )
+
+        self.coordinator._validate_phase_output(
+            (
+                "Verifier phase completed. "
+                "Tests passed."
+            ),
+            "verifier",
+        )
+
+    def test_serialized_tool_protocol_phase_output_is_rejected(self) -> None:
+        with self.assertRaises(
+            DeveloperError
+        ) as raised:
+            self.coordinator._validate_phase_output(
+                (
+                    "Planner conclusion. "
+                    "<|message_model|>"
+                    "run_command"
+                ),
+                "planner",
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "invalid_phase_output",
+        )
+        self.assertIn(
+            "serialized tool protocol",
+            str(raised.exception),
+        )
+
+    def test_invalid_future_role_output_rotates_and_is_not_stored(self) -> None:
+        planner_call = tool_call(
+            "call-output-boundary-seed",
+            "pwd",
+        )
+        implementer_call = tool_call(
+            "call-output-boundary-implementer",
+            "git status --short",
+        )
+        invalid_output = (
+            "Planner conclusion complete.\n\n"
+            "## Phase 2: Implementer\n"
+            "No edit is required."
+        )
+        valid_output = (
+            "Planner conclusion: bounded "
+            "inspection complete."
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                completion(planner_call),
+                completion(
+                    content=invalid_output
+                ),
+                completion(
+                    content=valid_output
+                ),
+                completion(
+                    implementer_call
+                ),
+            ],
+        ) as upstream:
+            first = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect Forge and provide "
+                                "a bounded plan."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+            task_id = first[
+                "forge_task_id"
+            ]
+
+            response = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Inspect Forge and provide "
+                                "a bounded plan."
+                            ),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                planner_call
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": (
+                                "call-output-boundary-seed"
+                            ),
+                            "content": (
+                                "/workspace/forge\n"
+                            ),
+                        },
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+        self.assertEqual(
+            upstream.call_count,
+            4,
+        )
+        self.assertEqual(
+            response["forge_role"],
+            "implementer",
+        )
+        self.assertEqual(
+            response["choices"][0][
+                "message"
+            ]["tool_calls"][0]["id"],
+            (
+                "call-output-boundary-"
+                "implementer"
+            ),
+        )
+
+        with self.coordinator._connect() as db:
+            run = db.execute(
+                """
+                SELECT
+                    role_outputs,
+                    attempts
+                FROM forge_developer_runs
+                WHERE task_id=?
+                """,
+                (task_id,),
+            ).fetchone()
+
+        outputs = json.loads(
+            run["role_outputs"]
+        )
+        attempts = json.loads(
+            run["attempts"]
+        )
+
+        self.assertEqual(
+            outputs["planner"],
+            valid_output,
+        )
+        self.assertNotIn(
+            "Phase 2",
+            outputs["planner"],
+        )
+        self.assertTrue(
+            any(
+                (
+                    "crosses the role "
+                    "boundary"
+                )
+                in str(
+                    item.get(
+                        "failure",
+                        "",
+                    )
+                )
+                for item in attempts
+            )
+        )
+
+    def test_final_message_does_not_replay_role_outputs(self) -> None:
+        message = (
+            self.coordinator._final_message(
+                {
+                    "task_id": (
+                        "FT-OUTPUT-TEST"
+                    ),
+                    "test_state": "passed",
+                    "review_state": (
+                        "completed"
+                    ),
+                    "changed_files": [
+                        "example.py"
+                    ],
+                    "phase_evidence": {
+                        "planner": [
+                            "git_status"
+                        ],
+                        "implementer": [
+                            "diff",
+                            "git_status",
+                        ],
+                        "reviewer": [
+                            "git_status"
+                        ],
+                        "verifier": [
+                            "git_status",
+                            "git_status",
+                            "test",
+                        ],
+                    },
+                    "role_outputs": {
+                        "planner": (
+                            "CONTAMINATED "
+                            "<|message_model|>"
+                        ),
+                        "implementer": (
+                            "## Final Summary"
+                        ),
+                        "reviewer": (
+                            "Verifier conclusion"
+                        ),
+                        "verifier": (
+                            "raw verifier prose"
+                        ),
+                    },
+                }
+            )
+        )
+
+        self.assertIn(
+            (
+                "Forge swarm run "
+                "FT-OUTPUT-TEST completed."
+            ),
+            message,
+        )
+        self.assertIn(
+            (
+                "- Verifier: "
+                "git_status, test"
+            ),
+            message,
+        )
+        self.assertIn(
+            "Changed files: example.py.",
+            message,
+        )
+        self.assertNotIn(
+            "CONTAMINATED",
+            message,
+        )
+        self.assertNotIn(
+            "<|message_model|>",
+            message,
+        )
+        self.assertNotIn(
+            "Final Summary",
+            message,
+        )
+        self.assertNotIn(
+            "raw verifier prose",
+            message,
+        )
 
     def test_degraded_retry_prompts_for_missing_terminal_evidence(self) -> None:
         with self.coordinator._connect() as db:
@@ -1431,6 +3076,23 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             message.get("content") == "Inspect Forge."
             for message in upstream.call_args_list[1].args[0]["messages"]
         ))
+
+        retry_payload = (
+            upstream.call_args_list[1].args[0]
+        )
+
+        self.assertEqual(
+            retry_payload["tool_choice"],
+            "required",
+        )
+        self.assertFalse(
+            retry_payload[
+                "parallel_tool_calls"
+            ]
+        )
+        self.assertTrue(
+            retry_payload["tools"]
+        )
 
 
 class DeveloperHttpTest(unittest.TestCase):
