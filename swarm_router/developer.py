@@ -1198,6 +1198,59 @@ class DeveloperCoordinator:
 
     def _candidates(self, run: dict[str, Any], role: str) -> list[ModelRecord]:
         eligible = self._eligible_models()
+
+        active_process = run.get("active_process")
+        if (
+            isinstance(active_process, dict)
+            and active_process
+        ):
+            owner_model = str(
+                active_process.get("model", "")
+            )
+            owner_provider = str(
+                active_process.get("provider", "")
+            )
+            owner_record = (
+                self.catalog.get(owner_model)
+                if owner_model
+                else None
+            )
+
+            # A known durable process must remain assigned to
+            # its owning model for exact status polling. A
+            # failure recorded for the process-start turn must
+            # not rotate polling to a different model.
+            if owner_record is not None:
+                eligible_ids = {
+                    record.model_id
+                    for record in eligible
+                }
+
+                if (
+                    owner_record.model_id
+                    not in eligible_ids
+                    or (
+                        owner_provider
+                        and owner_record.provider
+                        != owner_provider
+                    )
+                ):
+                    raise DeveloperError(
+                        "The model owning the active "
+                        "terminal process is no longer "
+                        "healthy or eligible.",
+                        status=503,
+                        code="no_healthy_model",
+                    )
+
+                return [owner_record]
+
+            # Legacy and synthetic active-process records can
+            # reference an owner absent from the catalog.
+            # Preserve the existing eligible-model fallback for
+            # those records so historical polling remains
+            # resumable.
+
         if len(eligible) == 1:
             record = eligible[0]
             failures = sum(

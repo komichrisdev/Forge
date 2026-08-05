@@ -3653,6 +3653,191 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             retry_payload["tools"]
         )
 
+    def test_active_process_owner_remains_candidate_after_prior_failure(
+        self,
+    ) -> None:
+        eligible = self.coordinator._eligible_models()
+        self.assertGreaterEqual(
+            len(eligible),
+            2,
+        )
+
+        owner = eligible[0]
+        alternatives = eligible[1:]
+
+        self.assertIsNotNone(
+            self.coordinator.catalog.get(
+                owner.model_id
+            )
+        )
+
+        run = {
+            "attempts": [
+                {
+                    "role": "implementer",
+                    "provider": owner.provider,
+                    "model": owner.model_id,
+                    "health": owner.health,
+                    "attempt": 1,
+                    "failure": (
+                        "Implementer tool call "
+                        "violates policy."
+                    ),
+                    "elapsed_ms": 1,
+                },
+            ],
+            "role_models": {
+                "implementer": {
+                    "provider": (
+                        alternatives[0].provider
+                    ),
+                    "model": (
+                        alternatives[0].model_id
+                    ),
+                },
+            },
+            "active_process": {
+                "process_id": "process-owner",
+                "next_offset": 1,
+                "provider": owner.provider,
+                "model": owner.model_id,
+                "role": "implementer",
+                "evidence_kind": "inspection",
+                "test_command": False,
+            },
+        }
+
+        with patch.object(
+            self.coordinator,
+            "_eligible_models",
+            return_value=eligible,
+        ):
+            candidates = (
+                self.coordinator._candidates(
+                    run,
+                    "implementer",
+                )
+            )
+
+        self.assertEqual(
+            [
+                record.model_id
+                for record in candidates
+            ],
+            [owner.model_id],
+        )
+
+    def test_active_process_known_ineligible_owner_fails_closed(
+        self,
+    ) -> None:
+        eligible = self.coordinator._eligible_models()
+        self.assertGreaterEqual(
+            len(eligible),
+            2,
+        )
+
+        owner = eligible[0]
+        alternatives = eligible[1:]
+
+        self.assertIsNotNone(
+            self.coordinator.catalog.get(
+                owner.model_id
+            )
+        )
+
+        run = {
+            "attempts": [],
+            "role_models": {
+                "verifier": {
+                    "provider": owner.provider,
+                    "model": owner.model_id,
+                },
+            },
+            "active_process": {
+                "process_id": "process-owner",
+                "next_offset": 1,
+                "provider": owner.provider,
+                "model": owner.model_id,
+                "role": "verifier",
+                "evidence_kind": "test",
+                "test_command": True,
+            },
+        }
+
+        with patch.object(
+            self.coordinator,
+            "_eligible_models",
+            return_value=alternatives,
+        ):
+            with self.assertRaisesRegex(
+                DeveloperError,
+                (
+                    "owning the active "
+                    "terminal process"
+                ),
+            ):
+                self.coordinator._candidates(
+                    run,
+                    "verifier",
+                )
+
+    def test_active_process_unknown_owner_preserves_candidate_fallback(
+        self,
+    ) -> None:
+        eligible = self.coordinator._eligible_models()
+        self.assertGreaterEqual(
+            len(eligible),
+            2,
+        )
+
+        self.assertIsNone(
+            self.coordinator.catalog.get(
+                "fake/model"
+            )
+        )
+
+        preferred = eligible[0]
+
+        run = {
+            "attempts": [],
+            "role_models": {
+                "verifier": {
+                    "provider": preferred.provider,
+                    "model": preferred.model_id,
+                },
+            },
+            "active_process": {
+                "process_id": "legacy-process",
+                "next_offset": 1,
+                "provider": "fake",
+                "model": "fake/model",
+                "role": "verifier",
+                "evidence_kind": "test",
+                "test_command": True,
+            },
+        }
+
+        with patch.object(
+            self.coordinator,
+            "_eligible_models",
+            return_value=eligible,
+        ):
+            candidates = (
+                self.coordinator._candidates(
+                    run,
+                    "verifier",
+                )
+            )
+
+        self.assertTrue(candidates)
+        self.assertIn(
+            candidates[0].model_id,
+            {
+                record.model_id
+                for record in eligible
+            },
+        )
+
 
 class DeveloperHttpTest(unittest.TestCase):
     def setUp(self) -> None:
