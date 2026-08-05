@@ -1406,7 +1406,14 @@ class DeveloperCoordinator:
                 "do not chain commands; use only approved read-only commands. For repository status, use exactly `git status --short`; plain `git status` is not allowed. If a command is rejected "
                 "by policy, retry once with one safe equivalent."
             ),
-            "implementer": "You alone may edit files under /workspace/forge. For small text writes use one quoted printf redirected to an in-workspace path, not a heredoc. Follow the approved plan, then call exactly `git status --short` or an approved Git diff form and report changed files and commands even when no edit is needed.",
+            "implementer": (
+                "You alone may edit files under /workspace/forge. For small text writes use one "
+                "quoted printf redirected to an in-workspace path, not a heredoc. Follow the "
+                "approved plan, then call exactly `git status --short` or an approved Git diff "
+                "form and report changed files and commands even when no edit is needed. Issue "
+                "one command per tool call and never use shell pipelines. For a bounded source "
+                "search, use `rg -n -m N 'PATTERN' PATH`; do not use `grep ... | head`."
+            ),
             "reviewer": "You are read-only. Call exactly `git status --short` and an approved Git diff form, inspect for correctness, security, regressions, and scope, and do not repair code.",
             "verifier": "You are read-only except ordinary test temporary files. Run a focused test plus exactly `git status --short`, report evidence, and do not repair code. After both terminal results are complete, do not call another tool; return the verifier conclusion.",
         }[role]
@@ -3375,6 +3382,7 @@ class DeveloperCoordinator:
             failures = []
             candidates = list(self._candidates(run, role))
             planner_policy_rejections = 0
+            implementer_policy_rejections = 0
             phase_budget_retries = 0
             phase_conclusion_retries = 0
             missing_evidence_retries = 0
@@ -4421,6 +4429,11 @@ class DeveloperCoordinator:
                                     record,
                                 )
                         else:
+                            retry_equivalent = (
+                                "one approved read-only equivalent"
+                                if role == "planner"
+                                else "one approved equivalent"
+                            )
                             control_context = [
                                 *control_context,
                                 {
@@ -4428,15 +4441,24 @@ class DeveloperCoordinator:
                                     "content": (
                                         f"Your prior {role} tool call was rejected and not executed. "
                                         "Issue one command per tool call; do not chain commands. "
-                                        "Retry once using one approved read-only equivalent. "
-                                        "For repository status, use exactly `git status --short`; "
-                                        "plain `git status` is not allowed."
+                                        f"Retry once using {retry_equivalent}. "
+                                        "Do not use a shell pipeline. For a bounded source search, "
+                                        "replace `grep PATTERN PATH | head -N` with "
+                                        "`rg -n -m N 'PATTERN' PATH`. For repository status, use "
+                                        "exactly `git status --short`; plain `git status` is not allowed."
                                     ),
                                 },
                             ]
                             if role == "planner":
                                 planner_policy_rejections += 1
                                 if planner_policy_rejections == 1:
+                                    candidates.insert(
+                                        attempt,
+                                        record,
+                                    )
+                            elif role == "implementer":
+                                implementer_policy_rejections += 1
+                                if implementer_policy_rejections == 1:
                                     candidates.insert(
                                         attempt,
                                         record,

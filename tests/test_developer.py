@@ -1216,6 +1216,7 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                 completion(forbidden),
                 completion(forbidden),
                 completion(forbidden),
+                completion(forbidden),
             ],
         ) as upstream:
             first = self.coordinator.complete({
@@ -1233,11 +1234,33 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                     ],
                     "tools": [TOOL],
                 })
+        self.assertEqual(upstream.call_count, 6)
+        self.assertEqual(
+            upstream.call_args_list[2].args[0]["model"],
+            upstream.call_args_list[3].args[0]["model"],
+        )
         self.assertEqual(self.coordinator._run(first["forge_task_id"])["status"], "failed")
         self.assertEqual(self.coordinator.writer_lock()["state"], "available")
+        retry_message = upstream.call_args_list[3].args[0]["messages"][-1]["content"]
         self.assertIn(
             "rejected and not executed",
-            upstream.call_args_list[3].args[0]["messages"][-1]["content"],
+            retry_message,
+        )
+        self.assertIn(
+            "Retry once using one approved equivalent",
+            retry_message,
+        )
+        self.assertIn(
+            "do not chain commands",
+            retry_message,
+        )
+        self.assertIn(
+            "Do not use a shell pipeline",
+            retry_message,
+        )
+        self.assertIn(
+            "rg -n -m N 'PATTERN' PATH",
+            retry_message,
         )
 
     def test_developer_forces_serial_terminal_calls_upstream(self) -> None:
