@@ -649,6 +649,7 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                     "planner",
                 )
         rejected = (
+            "git status",
             "pwd && ls -la",
             "ls | head",
             "pwd > /workspace/forge/output",
@@ -692,9 +693,22 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             upstream.call_args_list[0].args[0]["model"],
             upstream.call_args_list[1].args[0]["model"],
         )
+        retry_message = (
+            upstream.call_args_list[1]
+            .args[0]["messages"][-1]["content"]
+        )
+
         self.assertIn(
             "Retry once using one approved read-only equivalent",
-            upstream.call_args_list[1].args[0]["messages"][-1]["content"],
+            retry_message,
+        )
+        self.assertIn(
+            "git status --short",
+            retry_message,
+        )
+        self.assertIn(
+            "plain `git status` is not allowed",
+            retry_message,
         )
         run = self.coordinator._run(result["forge_task_id"])
         self.assertEqual([item["id"] for item in run["pending_tool_calls"]], ["call-accepted"])
@@ -2052,6 +2066,46 @@ class DeveloperCoordinatorTest(unittest.TestCase):
         )
 
 
+    def test_role_prompts_name_exact_git_status_form(
+        self,
+    ) -> None:
+        for role in (
+            "planner",
+            "implementer",
+            "reviewer",
+            "verifier",
+        ):
+            with self.subTest(role=role):
+                prompt = self.coordinator._system(
+                    "FT-20000101-000001",
+                    role,
+                )
+
+                self.assertIn(
+                    "git status --short",
+                    prompt,
+                )
+
+                self.assertNotIn(
+                    "Call Git status or diff",
+                    prompt,
+                )
+
+                self.assertNotIn(
+                    "plus Git status",
+                    prompt,
+                )
+
+        planner_prompt = self.coordinator._system(
+            "FT-20000101-000001",
+            "planner",
+        )
+
+        self.assertIn(
+            "plain `git status` is not allowed",
+            planner_prompt,
+        )
+
     def test_planner_accepts_safe_short_rev_parse(self) -> None:
         calls = self.coordinator._validate_tool_calls(
             [
@@ -2347,6 +2401,31 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                 "content"
             ],
         )
+
+
+    def test_verifier_budget_matches_required_evidence(
+        self,
+    ) -> None:
+        self.assertEqual(
+            PHASE_TOOL_RESULT_BUDGETS[
+                "verifier"
+            ],
+            2,
+        )
+
+        prompt = self.coordinator._system(
+            "FT-VERIFIER-BUDGET",
+            "verifier",
+        )
+
+        self.assertIn(
+            (
+                "After both terminal results are "
+                "complete, do not call another tool"
+            ),
+            prompt,
+        )
+
 
     def test_verifier_budget_allows_only_missing_test_evidence(self) -> None:
         planner_call = tool_call(
@@ -2736,6 +2815,328 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             2,
         )
 
+    def test_planner_status_request_receives_manager_context_without_terminal(
+        self,
+    ) -> None:
+        prior_task_id = "FT-20000101-999999"
+
+        with self.coordinator._connect() as db:
+            db.execute(
+                """
+                INSERT INTO forge_developer_runs(
+                    task_id,
+                    status,
+                    phase,
+                    instruction,
+                    instruction_digest,
+                    selected_model,
+                    selected_provider,
+                    failure_summary,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    ?,
+                    'failed',
+                    'planner',
+                    'Prior task',
+                    'prior-digest',
+                    'model-prior',
+                    'provider-prior',
+                    'Prior planner failure.',
+                    '2000-01-01T00:00:00+00:00',
+                    '2000-01-01T00:01:00+00:00'
+                )
+                """,
+                (prior_task_id,),
+            )
+
+        output = (
+            "FORGE_ACTION: INFORMATIONAL\n"
+            "The recent Forge task record "
+            f"{prior_task_id} failed in planner."
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            return_value=completion(content=output),
+        ) as upstream:
+            result = self.coordinator.complete({
+                "model": "swarm-developer",
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "Tell me the current status "
+                        "of Forge tasks."
+                    ),
+                }],
+                "tools": [TOOL],
+            })
+
+        self.assertEqual(upstream.call_count, 1)
+        self.assertEqual(
+            result["forge_role"],
+            "planner",
+        )
+        self.assertEqual(
+            result["choices"][0]["finish_reason"],
+            "stop",
+        )
+        self.assertIn(
+            prior_task_id,
+            result["choices"][0]["message"]["content"],
+        )
+
+        upstream_request = repr(upstream.call_args)
+
+        self.assertIn(
+            "BEGIN TRUSTED MANAGER STATUS CONTEXT",
+            upstream_request,
+        )
+        self.assertIn(
+            prior_task_id,
+            upstream_request,
+        )
+        self.assertIn(
+            "Prior planner failure.",
+            upstream_request,
+        )
+
+        run = self.coordinator._run(
+            result["forge_task_id"]
+        )
+
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["phase"], "planner")
+        self.assertEqual(run["changed_files"], [])
+        self.assertEqual(
+            run["test_state"],
+            "not_required",
+        )
+        self.assertEqual(
+            run["review_state"],
+            "not_required",
+        )
+        self.assertEqual(
+            self.coordinator.writer_lock()["state"],
+            "available",
+        )
+
+        events = self.coordinator.journal.events(
+            result["forge_task_id"]
+        )
+
+        self.assertFalse(
+            any(
+                event.event_type
+                == JournalEventType.HANDOFF_REQUESTED.value
+                for event in events
+            )
+        )
+
+    def test_planner_informational_request_completes_without_writer(
+        self,
+    ) -> None:
+        planner_call = tool_call(
+            "call-informational-status",
+            "pwd",
+        )
+        informational_output = (
+            "FORGE_ACTION: INFORMATIONAL\n"
+            "Forge task status was inspected. "
+            "No repository change is required."
+        )
+
+        with patch.object(
+            self.coordinator.client,
+            "completion",
+            side_effect=[
+                completion(planner_call),
+                completion(
+                    content=informational_output
+                ),
+            ],
+        ) as upstream:
+            first = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Tell me the current status "
+                                "of Forge tasks."
+                            ),
+                        }
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+            result = self.coordinator.complete(
+                {
+                    "model": "swarm-developer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Tell me the current status "
+                                "of Forge tasks."
+                            ),
+                        },
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                planner_call
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": (
+                                planner_call["id"]
+                            ),
+                            "content": (
+                                "/workspace/forge\n"
+                            ),
+                        },
+                    ],
+                    "tools": [TOOL],
+                }
+            )
+
+        self.assertEqual(
+            upstream.call_count,
+            2,
+        )
+        self.assertEqual(
+            result["forge_task_id"],
+            first["forge_task_id"],
+        )
+        self.assertEqual(
+            result["forge_role"],
+            "planner",
+        )
+        self.assertEqual(
+            result["choices"][0][
+                "finish_reason"
+            ],
+            "stop",
+        )
+        self.assertEqual(
+            result["choices"][0][
+                "message"
+            ]["content"],
+            (
+                "Forge task status was inspected. "
+                "No repository change is required."
+            ),
+        )
+
+        run = self.coordinator._run(
+            first["forge_task_id"]
+        )
+
+        self.assertEqual(
+            run["status"],
+            "completed",
+        )
+        self.assertEqual(
+            run["phase"],
+            "planner",
+        )
+        self.assertEqual(
+            run["test_state"],
+            "not_required",
+        )
+        self.assertEqual(
+            run["review_state"],
+            "not_required",
+        )
+        self.assertEqual(
+            run["changed_files"],
+            [],
+        )
+        self.assertEqual(
+            run["role_outputs"]["planner"],
+            (
+                "Forge task status was inspected. "
+                "No repository change is required."
+            ),
+        )
+        self.assertEqual(
+            self.coordinator.writer_lock()[
+                "state"
+            ],
+            "available",
+        )
+
+        events = self.coordinator.journal.events(
+            first["forge_task_id"]
+        )
+
+        self.assertFalse(
+            any(
+                event.event_type
+                == JournalEventType.HANDOFF_REQUESTED.value
+                for event in events
+            )
+        )
+        self.assertEqual(
+            events[-1].event_type,
+            JournalEventType.TASK_COMPLETED.value,
+        )
+        self.assertEqual(
+            events[-1].metadata[
+                "completion_mode"
+            ],
+            "informational",
+        )
+
+    def test_planner_informational_marker_fails_closed(
+        self,
+    ) -> None:
+        output = (
+            "FORGE_ACTION: INFORMATIONAL\n"
+            "No work is required."
+        )
+
+        for instruction in (
+            "Fix the Forge task status page.",
+            (
+                "Execute this Forge autopilot task "
+                "using the complete planner -> "
+                "implementer -> reviewer -> "
+                "verifier lifecycle."
+            ),
+            (
+                '{"autopilot_task_id":"FG-999",'
+                '"objective":"Report status"}'
+            ),
+        ):
+            with (
+                self.subTest(
+                    instruction=instruction
+                ),
+                self.assertRaisesRegex(
+                    DeveloperError,
+                    (
+                        "change-capable or "
+                        "full-lifecycle"
+                    ),
+                ),
+            ):
+                self.coordinator._planner_informational_content(
+                    instruction,
+                    output,
+                )
+
+        self.assertIsNone(
+            self.coordinator._planner_informational_content(
+                "Implement a focused Forge repair.",
+                "Normal implementation plan.",
+            )
+        )
+
     def test_future_role_completion_claim_is_rejected(self) -> None:
         with self.assertRaises(
             DeveloperError
@@ -2818,7 +3219,7 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             str(raised.exception),
         )
 
-    def test_invalid_future_role_output_rotates_and_is_not_stored(self) -> None:
+    def test_ready_invalid_manager_summary_retries_same_model_and_is_not_stored(self) -> None:
         planner_call = tool_call(
             "call-output-boundary-seed",
             "pwd",
@@ -2828,13 +3229,20 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             "git status --short",
         )
         invalid_output = (
-            "Planner conclusion complete.\n\n"
-            "## Phase 2: Implementer\n"
-            "No edit is required."
+            "Final summary: all phases complete."
+        )
+        invalid_informational_output = (
+            "FORGE_ACTION: INFORMATIONAL\n"
+            "No implementation work is required."
         )
         valid_output = (
             "Planner conclusion: bounded "
             "inspection complete."
+        )
+        lifecycle_instruction = (
+            "Implement a focused Forge repair using "
+            "the complete planner -> implementer -> "
+            "reviewer -> verifier lifecycle."
         )
 
         with patch.object(
@@ -2844,6 +3252,11 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                 completion(planner_call),
                 completion(
                     content=invalid_output
+                ),
+                completion(
+                    content=(
+                        invalid_informational_output
+                    )
                 ),
                 completion(
                     content=valid_output
@@ -2860,8 +3273,7 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                         {
                             "role": "user",
                             "content": (
-                                "Inspect Forge and provide "
-                                "a bounded plan."
+                                lifecycle_instruction
                             ),
                         }
                     ],
@@ -2880,8 +3292,7 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                         {
                             "role": "user",
                             "content": (
-                                "Inspect Forge and provide "
-                                "a bounded plan."
+                                lifecycle_instruction
                             ),
                         },
                         {
@@ -2907,8 +3318,77 @@ class DeveloperCoordinatorTest(unittest.TestCase):
 
         self.assertEqual(
             upstream.call_count,
-            4,
+            5,
         )
+
+        invalid_payload = (
+            upstream.call_args_list[1].args[0]
+        )
+        first_retry_payload = (
+            upstream.call_args_list[2].args[0]
+        )
+        second_retry_payload = (
+            upstream.call_args_list[3].args[0]
+        )
+
+        for retry_payload in (
+            first_retry_payload,
+            second_retry_payload,
+        ):
+            self.assertEqual(
+                invalid_payload["model"],
+                retry_payload["model"],
+            )
+            self.assertEqual(
+                retry_payload["tool_choice"],
+                "none",
+            )
+            self.assertEqual(
+                retry_payload["tools"],
+                [],
+            )
+            self.assertFalse(
+                retry_payload[
+                    "parallel_tool_calls"
+                ]
+            )
+            self.assertIn(
+                (
+                    "Required terminal evidence "
+                    "is already complete"
+                ),
+                retry_payload["messages"][-1][
+                    "content"
+                ],
+            )
+            self.assertIn(
+                "Do not call another tool",
+                retry_payload["messages"][-1][
+                    "content"
+                ],
+            )
+            self.assertIn(
+                "manager-owned final summary",
+                retry_payload["messages"][-1][
+                    "content"
+                ],
+            )
+            self.assertIn(
+                "FORGE_ACTION: INFORMATIONAL",
+                retry_payload["messages"][-1][
+                    "content"
+                ],
+            )
+            self.assertIn(
+                (
+                    "change-capable or "
+                    "full-lifecycle task"
+                ),
+                retry_payload["messages"][-1][
+                    "content"
+                ],
+            )
+
         self.assertEqual(
             response["forge_role"],
             "implementer",
@@ -2947,14 +3427,56 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             valid_output,
         )
         self.assertNotIn(
-            "Phase 2",
+            "Final summary",
             outputs["planner"],
         )
+        self.assertNotIn(
+            "FORGE_ACTION: INFORMATIONAL",
+            outputs["planner"],
+        )
+
+        retry_events = [
+            event
+            for event
+            in self.coordinator.journal.events(
+                task_id
+            )
+            if event.stage
+            == "phase_output_retry"
+        ]
+
+        self.assertEqual(
+            len(retry_events),
+            2,
+        )
+        self.assertTrue(
+            all(
+                event.agent_id == "planner"
+                for event in retry_events
+            )
+        )
+        self.assertTrue(
+            all(
+                event.metadata[
+                    "phase_already_ready"
+                ]
+                for event in retry_events
+            )
+        )
+        self.assertTrue(
+            all(
+                not event.metadata[
+                    "executed"
+                ]
+                for event in retry_events
+            )
+        )
+
         self.assertTrue(
             any(
                 (
-                    "crosses the role "
-                    "boundary"
+                    "manager-owned final "
+                    "summary"
                 )
                 in str(
                     item.get(
@@ -2962,6 +3484,20 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                         "",
                     )
                 )
+                for item in attempts
+            )
+        )
+        self.assertTrue(
+            any(
+                (
+                    "informational completion"
+                )
+                in str(
+                    item.get(
+                        "failure",
+                        "",
+                    )
+                ).lower()
                 for item in attempts
             )
         )
