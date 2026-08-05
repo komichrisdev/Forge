@@ -866,8 +866,13 @@ class DeveloperCoordinator:
         healthy = [
             record for record in self.catalog.list()
             if record.enabled and record.available and record.kind == "chat"
-            and record.probe_status == "healthy" and not record.quarantined
-            and record.model_id not in {DEVELOPER_MODEL_ID, self.config.personal.model_id}
+            and record.health == "healthy"
+            and record.probe_status == "healthy"
+            and not record.quarantined
+            and record.model_id not in {
+                DEVELOPER_MODEL_ID,
+                self.config.personal.model_id,
+            }
         ]
         with self._connect() as db:
             probe_rows = {
@@ -927,6 +932,71 @@ class DeveloperCoordinator:
                     """,
                     (model_id, provider, _now(), _redact_text(failure)[:500]),
                 )
+
+    @staticmethod
+    def _developer_attempt_status(
+        failure: Exception | None,
+    ) -> str:
+        if failure is None:
+            return "success"
+
+        if isinstance(failure, RequestFailure):
+            return failure.category
+
+        if isinstance(failure, ContextBudgetExceeded):
+            return "context_overflow"
+
+        if isinstance(failure, DeveloperError):
+            if failure.code == "context_budget_exceeded":
+                return "context_overflow"
+
+            if failure.code in {
+                "policy_rejected",
+                "phase_tool_budget",
+                "phase_evidence_budget",
+                "missing_phase_evidence",
+                "serial_tool_calls",
+                "invalid_phase_output",
+            }:
+                return "policy"
+
+            if failure.code in {
+                "malformed_tool_call",
+                "unknown_tool",
+                "malformed_response",
+                "invalid_tools",
+            }:
+                return "protocol"
+
+        return "failure"
+
+    def _record_developer_attempt(
+        self,
+        run: dict[str, Any],
+        role: str,
+        record: ModelRecord,
+        failure: Exception | None,
+        elapsed_ms: int,
+        attempt: int,
+    ) -> None:
+        self.catalog.record_task_attempt(
+            (
+                f"{run['task_id']}:developer:"
+                f"{role}:{attempt}:{uuid.uuid4().hex}"
+            ),
+            record.model_id,
+            role,
+            (
+                "code"
+                if role == "implementer"
+                else "spec"
+            ),
+            self._developer_attempt_status(
+                failure
+            ),
+            max(0, elapsed_ms),
+            max(0, attempt - 1),
+        )
 
     def _ranked_models(
         self,
@@ -3314,6 +3384,8 @@ class DeveloperCoordinator:
             force_phase_conclusion = False
             context_budget_failures = 0
             for attempt, record in enumerate(candidates, start=1):
+                attempt_started_at = datetime.now(timezone.utc)
+
                 # Build each candidate request from the un-compacted logical
                 # transcript. A smaller failed model must not permanently drop
                 # context before a larger fallback model is attempted.
@@ -3460,6 +3532,16 @@ class DeveloperCoordinator:
                     run = current_run
                     calls = message.get("tool_calls")
                     rejected_command = _command_summary(calls)
+                    attempt_elapsed_ms = max(
+                        0,
+                        int(
+                            (
+                                datetime.now(timezone.utc)
+                                - attempt_started_at
+                            ).total_seconds()
+                            * 1000
+                        ),
+                    )
                     success = {
                         "role": role,
                         "provider": record.provider,
@@ -3467,6 +3549,7 @@ class DeveloperCoordinator:
                         "health": record.health,
                         "attempt": attempt,
                         "failure": "",
+                        "elapsed_ms": attempt_elapsed_ms,
                     }
                     attempts = [*run["attempts"], success]
                     if calls is not None:
@@ -3756,6 +3839,14 @@ class DeveloperCoordinator:
                                     "evidence_kind": item["evidence_kind"],
                                 },
                             )
+                        self._record_developer_attempt(
+                            run,
+                            role,
+                            record,
+                            None,
+                            attempt_elapsed_ms,
+                            attempt,
+                        )
                         return self._response(
                             self._run(run["task_id"]),
                             message,
@@ -3793,12 +3884,23 @@ class DeveloperCoordinator:
                         )
 
                         if informational_content is not None:
-                            return self._complete_informational_run(
-                                run,
-                                informational_content,
-                                record,
-                                attempts,
+                            completed_response = (
+                                self._complete_informational_run(
+                                    run,
+                                    informational_content,
+                                    record,
+                                    attempts,
+                                )
                             )
+                            self._record_developer_attempt(
+                                run,
+                                role,
+                                record,
+                                None,
+                                attempt_elapsed_ms,
+                                attempt,
+                            )
+                            return completed_response
 
                     role_models = dict(run["role_models"])
                     role_models[role] = {
@@ -3827,6 +3929,14 @@ class DeveloperCoordinator:
                             ),
                         )
                     run = self._run(run["task_id"])
+                    self._record_developer_attempt(
+                        run,
+                        role,
+                        record,
+                        None,
+                        attempt_elapsed_ms,
+                        attempt,
+                    )
                     next_run = self._handoff(
                         run,
                         role,
@@ -3874,6 +3984,16 @@ class DeveloperCoordinator:
                         "process_mismatch",
                     }:
                         raise
+                    attempt_elapsed_ms = max(
+                        0,
+                        int(
+                            (
+                                datetime.now(timezone.utc)
+                                - attempt_started_at
+                            ).total_seconds()
+                            * 1000
+                        ),
+                    )
                     failure = {
                         "role": role,
                         "provider": record.provider,
@@ -3881,6 +4001,7 @@ class DeveloperCoordinator:
                         "health": record.health,
                         "attempt": attempt,
                         "failure": _redact_text(str(exc))[:500],
+                        "elapsed_ms": attempt_elapsed_ms,
                     }
                     failures.append(failure)
                     run["attempts"].append(failure)
@@ -4325,6 +4446,16 @@ class DeveloperCoordinator:
                             "UPDATE forge_developer_runs SET attempts=?, updated_at=? WHERE task_id=?",
                             (json.dumps(run["attempts"]), _now(), run["task_id"]),
                         )
+
+                    self._record_developer_attempt(
+                        run,
+                        role,
+                        record,
+                        exc,
+                        attempt_elapsed_ms,
+                        attempt,
+                    )
+
                     if (
                         serial_tool_retries
                         > MAX_SERIAL_TOOL_RETRIES

@@ -94,10 +94,26 @@ class OpenWebUIClient:
                 "prompt is too long", "too many tokens", "context length",
             )):
                 category = "context_overflow"
-            elif exc.code in {429, 503} or any(token in lower for token in (
-                "resourceexhausted", "resource exhausted", "quota",
-                "capacity", "rate limit", "ratelimit",
-            )):
+            elif exc.code in {429, 500, 502, 503, 504} or any(
+                token in lower
+                for token in (
+                    "resourceexhausted",
+                    "resource exhausted",
+                    "quota",
+                    "capacity",
+                    "rate limit",
+                    "ratelimit",
+                    "too many requests",
+                    "service temporarily overloaded",
+                    "temporarily overloaded",
+                    "internal server error",
+                    "upstream server error",
+                    "provider unavailable",
+                )
+            ):
+                # Open WebUI can wrap an upstream provider 429/5xx
+                # response in HTTP 400. Preserve the provider failure
+                # classification from the bounded error detail.
                 category = "capacity"
             else:
                 category = "http"

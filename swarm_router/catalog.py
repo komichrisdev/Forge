@@ -747,7 +747,11 @@ class ModelCatalog:
         retry_count: int = 0,
     ) -> None:
         now = datetime.now(timezone.utc)
-        health = None if status == "context_overflow" else ("healthy" if status == "success" else status)
+        health = (
+            None
+            if status in {"context_overflow", "policy"}
+            else ("healthy" if status == "success" else status)
+        )
         cooldown_until: str | None = None
         if status == "success":
             cooldown_until = ""
