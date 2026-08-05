@@ -198,6 +198,7 @@ def _is_developer_status_request(
 
 
 READ_COMMANDS = {
+    "grep",
     "pwd", "id", "hostname", "git", "rg", "ls", "head", "tail",
     "stat", "file", "wc", "sha256sum", "cat", "python3", "python", "node",
 }
@@ -721,6 +722,142 @@ def _command_summary(calls: Any) -> str:
         except (DeveloperError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
     return "<unavailable>"
+
+
+
+_GREP_BOOLEAN_FLAGS = frozenset(
+    {
+        "n",
+        "i",
+        "E",
+        "F",
+        "w",
+        "I",
+    }
+)
+
+_GREP_LONG_BOOLEAN_FLAGS = frozenset(
+    {
+        "--line-number",
+        "--ignore-case",
+        "--extended-regexp",
+        "--fixed-strings",
+        "--word-regexp",
+        "--binary-files=without-match",
+    }
+)
+
+_MAX_GREP_MATCHES = 200
+
+
+def _is_bounded_grep_argv(
+    tokens: list[str],
+) -> bool:
+    """Validate a bounded, non-recursive, read-only grep command."""
+
+    if not tokens or tokens[0] != "grep":
+        return False
+
+    max_count: int | None = None
+    positionals: list[str] = []
+    options_enabled = True
+    index = 1
+
+    while index < len(tokens):
+        token = tokens[index]
+
+        if options_enabled and token == "--":
+            options_enabled = False
+            index += 1
+            continue
+
+        if options_enabled and token == "--max-count":
+            if max_count is not None or index + 1 >= len(tokens):
+                return False
+
+            value = tokens[index + 1]
+
+            if not value.isdigit():
+                return False
+
+            max_count = int(value)
+            index += 2
+            continue
+
+        if options_enabled and token.startswith("--max-count="):
+            if max_count is not None:
+                return False
+
+            value = token.split("=", 1)[1]
+
+            if not value.isdigit():
+                return False
+
+            max_count = int(value)
+            index += 1
+            continue
+
+        if options_enabled and token in _GREP_LONG_BOOLEAN_FLAGS:
+            index += 1
+            continue
+
+        if options_enabled and token == "-m":
+            if max_count is not None or index + 1 >= len(tokens):
+                return False
+
+            value = tokens[index + 1]
+
+            if not value.isdigit():
+                return False
+
+            max_count = int(value)
+            index += 2
+            continue
+
+        if (
+            options_enabled
+            and token.startswith("-m")
+            and len(token) > 2
+        ):
+            if max_count is not None:
+                return False
+
+            value = token[2:]
+
+            if not value.isdigit():
+                return False
+
+            max_count = int(value)
+            index += 1
+            continue
+
+        if (
+            options_enabled
+            and token.startswith("-")
+            and token != "-"
+        ):
+            flags = token[1:]
+
+            if (
+                not flags
+                or any(
+                    flag not in _GREP_BOOLEAN_FLAGS
+                    for flag in flags
+                )
+            ):
+                return False
+
+            index += 1
+            continue
+
+        positionals.append(token)
+        index += 1
+
+    return bool(
+        max_count is not None
+        and 1 <= max_count <= _MAX_GREP_MATCHES
+        and len(positionals) >= 2
+    )
 
 
 class DeveloperCoordinator:
@@ -1945,6 +2082,12 @@ class DeveloperCoordinator:
                             "Command path is outside /workspace/forge.",
                             code="policy_rejected",
                         )
+            if command == "grep" and not _is_bounded_grep_argv(tokens):
+                raise DeveloperError(
+                    "grep requires a non-recursive max-count between "
+                    "1 and 200 and only approved read-only options.",
+                    code="policy_rejected",
+                )
             if command == "find" and any(token in {"-exec", "-execdir", "-delete"} for token in tokens):
                 raise DeveloperError("Nested or destructive find is not allowed.", code="policy_rejected")
             if command == "printf" and (

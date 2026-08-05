@@ -1343,6 +1343,98 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             _arguments_digest('{"command":"pwd","cwd":"/workspace/forge"}'),
             _arguments_digest('{"cwd": "/workspace/forge", "command": "pwd"}'),
         )
+    def test_implementer_accepts_only_bounded_read_only_grep(self) -> None:
+        accepted = (
+            (
+                "grep -n -m 30 'agent' "
+                "/workspace/forge/README.md"
+            ),
+            (
+                "grep -niF --max-count=200 agent "
+                "/workspace/forge/README.md"
+            ),
+            (
+                "grep -I -w -m1 agent "
+                "/workspace/forge/swarm_router/developer.py"
+            ),
+            (
+                "grep --line-number --ignore-case "
+                "--max-count 20 agent "
+                "/workspace/forge/tests/test_developer.py"
+            ),
+        )
+
+        for index, command in enumerate(accepted):
+            with self.subTest(command=command):
+                self.coordinator._validate_tool_calls(
+                    [
+                        tool_call(
+                            f"call-grep-accepted-{index}",
+                            command,
+                        )
+                    ],
+                    TOOL_SCHEMAS,
+                    "implementer",
+                )
+
+        rejected = (
+            (
+                "grep -n agent "
+                "/workspace/forge/README.md"
+            ),
+            (
+                "grep -r -m 30 agent "
+                "/workspace/forge"
+            ),
+            (
+                "grep -R --max-count=30 agent "
+                "/workspace/forge"
+            ),
+            (
+                "grep -n -m 0 agent "
+                "/workspace/forge/README.md"
+            ),
+            (
+                "grep -n -m 201 agent "
+                "/workspace/forge/README.md"
+            ),
+            (
+                "grep --max-count=201 agent "
+                "/workspace/forge/README.md"
+            ),
+            (
+                "grep -f /workspace/forge/patterns.txt "
+                "-m 30 /workspace/forge/README.md"
+            ),
+            (
+                "grep -A 50 -m 30 agent "
+                "/workspace/forge/README.md"
+            ),
+            (
+                "grep -n -m 30 agent"
+            ),
+            (
+                "python3 -c "
+                "\"open('owned', 'w').write('x')\""
+            ),
+        )
+
+        for index, command in enumerate(rejected):
+            with (
+                self.subTest(command=command),
+                self.assertRaises(DeveloperError),
+            ):
+                self.coordinator._validate_tool_calls(
+                    [
+                        tool_call(
+                            f"call-grep-rejected-{index}",
+                            command,
+                        )
+                    ],
+                    TOOL_SCHEMAS,
+                    "implementer",
+                )
+
     def test_only_implementer_may_write_and_destructive_commands_always_fail(self) -> None:
         write = [
             {
