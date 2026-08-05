@@ -3838,6 +3838,407 @@ class DeveloperCoordinatorTest(unittest.TestCase):
             },
         )
 
+    def test_resume_result_owner_remains_candidate_after_prior_failure(
+        self,
+    ) -> None:
+        eligible = self.coordinator._eligible_models()
+        self.assertGreaterEqual(
+            len(eligible),
+            2,
+        )
+
+        owner = eligible[0]
+        alternative = eligible[1]
+
+        self.assertIsNotNone(
+            self.coordinator.catalog.get(
+                owner.model_id
+            )
+        )
+
+        call_id = "call-resume-owner"
+
+        run = {
+            "attempts": [
+                {
+                    "role": "implementer",
+                    "provider": owner.provider,
+                    "model": owner.model_id,
+                    "health": owner.health,
+                    "attempt": 1,
+                    "failure": (
+                        "Implementer tool call "
+                        "violates policy."
+                    ),
+                    "elapsed_ms": 1,
+                },
+            ],
+            "role_models": {
+                "implementer": {
+                    "provider": (
+                        alternative.provider
+                    ),
+                    "model": (
+                        alternative.model_id
+                    ),
+                },
+            },
+            "active_process": {},
+            "resume_call_id": call_id,
+            "resume_tool_results": {
+                call_id: {
+                    "tool_call_id": call_id,
+                    "role": "implementer",
+                    "provider": owner.provider,
+                    "model": owner.model_id,
+                    "tool_name": "run_command",
+                    "result_digest": "digest",
+                },
+            },
+        }
+
+        with patch.object(
+            self.coordinator,
+            "_eligible_models",
+            return_value=eligible,
+        ):
+            candidates = (
+                self.coordinator._candidates(
+                    run,
+                    "implementer",
+                )
+            )
+
+        self.assertEqual(
+            [
+                record.model_id
+                for record in candidates
+            ],
+            [owner.model_id],
+        )
+
+    def test_resume_result_from_prior_phase_does_not_pin_owner(
+        self,
+    ) -> None:
+        eligible = self.coordinator._eligible_models()
+        self.assertGreaterEqual(
+            len(eligible),
+            2,
+        )
+
+        owner = eligible[0]
+        alternative = eligible[1]
+        call_id = "call-prior-phase"
+
+        run = {
+            "attempts": [
+                {
+                    "role": "reviewer",
+                    "provider": owner.provider,
+                    "model": owner.model_id,
+                    "health": owner.health,
+                    "attempt": 1,
+                    "failure": "review failure",
+                    "elapsed_ms": 1,
+                },
+            ],
+            "role_models": {
+                "reviewer": {
+                    "provider": (
+                        alternative.provider
+                    ),
+                    "model": (
+                        alternative.model_id
+                    ),
+                },
+            },
+            "active_process": {},
+            "resume_call_id": call_id,
+            "resume_tool_results": {
+                call_id: {
+                    "tool_call_id": call_id,
+                    "role": "implementer",
+                    "provider": owner.provider,
+                    "model": owner.model_id,
+                    "tool_name": "run_command",
+                    "result_digest": "digest",
+                },
+            },
+        }
+
+        with patch.object(
+            self.coordinator,
+            "_eligible_models",
+            return_value=eligible,
+        ):
+            candidates = (
+                self.coordinator._candidates(
+                    run,
+                    "reviewer",
+                )
+            )
+
+        self.assertTrue(candidates)
+        self.assertNotEqual(
+            [
+                record.model_id
+                for record in candidates
+            ],
+            [owner.model_id],
+        )
+        self.assertNotIn(
+            owner.model_id,
+            {
+                record.model_id
+                for record in candidates
+            },
+        )
+
+    def test_candidate_exhaustion_after_resume_result_fails_and_releases_writer(
+        self,
+    ) -> None:
+        eligible = self.coordinator._eligible_models()
+        self.assertTrue(eligible)
+
+        owner = eligible[0]
+        task_id = (
+            self.coordinator.journal
+            .next_task_id()
+        )
+        call_id = "call-exhausted-resume"
+        now = "2026-08-05T22:00:00+00:00"
+
+        resume_results = {
+            call_id: {
+                "tool_call_id": call_id,
+                "task_id": task_id,
+                "role": "implementer",
+                "provider": owner.provider,
+                "model": owner.model_id,
+                "tool_name": "run_command",
+                "result_digest": "digest",
+            },
+        }
+
+        with self.coordinator._connect() as db:
+            db.execute(
+                """
+                INSERT INTO forge_developer_runs(
+                    task_id,
+                    status,
+                    phase,
+                    instruction,
+                    instruction_digest,
+                    selected_model,
+                    selected_provider,
+                    role_models,
+                    resume_call_id,
+                    resume_tool_results,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    ?,
+                    'running',
+                    'implementer',
+                    'test',
+                    'digest',
+                    ?,
+                    ?,
+                    '{}',
+                    ?,
+                    ?,
+                    ?,
+                    ?
+                )
+                """,
+                (
+                    task_id,
+                    owner.model_id,
+                    owner.provider,
+                    call_id,
+                    json.dumps(
+                        resume_results
+                    ),
+                    now,
+                    now,
+                ),
+            )
+
+        lock = self.coordinator.acquire_writer(
+            task_id
+        )
+        run = self.coordinator._run(
+            task_id
+        )
+
+        with patch.object(
+            self.coordinator,
+            "_candidates",
+            side_effect=DeveloperError(
+                (
+                    "No healthy eligible model "
+                    "remains for role implementer."
+                ),
+                status=503,
+                code="no_healthy_model",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                DeveloperError,
+                "No healthy eligible model",
+            ):
+                self.coordinator._phase_candidates(
+                    run,
+                    "implementer",
+                )
+
+        recovered = self.coordinator._run(
+            task_id
+        )
+
+        self.assertEqual(
+            recovered["status"],
+            "failed",
+        )
+        self.assertEqual(
+            recovered["writer_lease_id"],
+            "",
+        )
+        self.assertEqual(
+            recovered["resume_call_id"],
+            "",
+        )
+        self.assertEqual(
+            recovered["resume_tool_results"],
+            {},
+        )
+        self.assertEqual(
+            self.coordinator.writer_lock(),
+            {
+                "workspace": "/workspace/forge",
+                "state": "available",
+            },
+        )
+        self.assertTrue(lock["lease_id"])
+
+    def test_active_process_candidate_exhaustion_keeps_writer_fenced(
+        self,
+    ) -> None:
+        eligible = self.coordinator._eligible_models()
+        self.assertTrue(eligible)
+
+        owner = eligible[0]
+        task_id = (
+            self.coordinator.journal
+            .next_task_id()
+        )
+        now = "2026-08-05T22:00:00+00:00"
+
+        active_process = {
+            "process_id": "process-fenced",
+            "next_offset": 1,
+            "role": "implementer",
+            "provider": owner.provider,
+            "model": owner.model_id,
+            "evidence_kind": "inspection",
+            "test_command": False,
+        }
+
+        with self.coordinator._connect() as db:
+            db.execute(
+                """
+                INSERT INTO forge_developer_runs(
+                    task_id,
+                    status,
+                    phase,
+                    instruction,
+                    instruction_digest,
+                    selected_model,
+                    selected_provider,
+                    role_models,
+                    active_process,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    ?,
+                    'running',
+                    'implementer',
+                    'test',
+                    'digest',
+                    ?,
+                    ?,
+                    '{}',
+                    ?,
+                    ?,
+                    ?
+                )
+                """,
+                (
+                    task_id,
+                    owner.model_id,
+                    owner.provider,
+                    json.dumps(
+                        active_process
+                    ),
+                    now,
+                    now,
+                ),
+            )
+
+        lock = self.coordinator.acquire_writer(
+            task_id
+        )
+        run = self.coordinator._run(
+            task_id
+        )
+
+        with patch.object(
+            self.coordinator,
+            "_candidates",
+            side_effect=DeveloperError(
+                (
+                    "No healthy eligible model "
+                    "remains for role implementer."
+                ),
+                status=503,
+                code="no_healthy_model",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                DeveloperError,
+                "No healthy eligible model",
+            ):
+                self.coordinator._phase_candidates(
+                    run,
+                    "implementer",
+                )
+
+        fenced = self.coordinator._run(
+            task_id
+        )
+
+        self.assertEqual(
+            fenced["status"],
+            "running",
+        )
+        self.assertEqual(
+            fenced["writer_lease_id"],
+            lock["lease_id"],
+        )
+        self.assertEqual(
+            fenced["active_process"][
+                "process_id"
+            ],
+            "process-fenced",
+        )
+        self.assertEqual(
+            self.coordinator.writer_lock()[
+                "task_id"
+            ],
+            task_id,
+        )
 
 class DeveloperHttpTest(unittest.TestCase):
     def setUp(self) -> None:

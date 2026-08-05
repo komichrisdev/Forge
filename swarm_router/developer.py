@@ -1251,6 +1251,77 @@ class DeveloperCoordinator:
             # those records so historical polling remains
             # resumable.
 
+        resume_call_id = str(
+            run.get("resume_call_id", "")
+        )
+        resume_results = run.get(
+            "resume_tool_results",
+            {},
+        )
+        resume_owner = (
+            resume_results.get(resume_call_id)
+            if (
+                resume_call_id
+                and isinstance(
+                    resume_results,
+                    dict,
+                )
+            )
+            else None
+        )
+
+        if (
+            isinstance(resume_owner, dict)
+            and str(
+                resume_owner.get("role", "")
+            )
+            == role
+        ):
+            owner_model = str(
+                resume_owner.get("model", "")
+            )
+            owner_provider = str(
+                resume_owner.get("provider", "")
+            )
+            owner_record = (
+                self.catalog.get(owner_model)
+                if owner_model
+                else None
+            )
+
+            # The model that requested a completed durable
+            # tool callback owns the immediate continuation
+            # turn. Earlier rejected attempts must not rotate
+            # interpretation of that result to another model.
+            if owner_record is not None:
+                eligible_ids = {
+                    record.model_id
+                    for record in eligible
+                }
+
+                if (
+                    owner_record.model_id
+                    not in eligible_ids
+                    or (
+                        owner_provider
+                        and owner_record.provider
+                        != owner_provider
+                    )
+                ):
+                    raise DeveloperError(
+                        "The model owning the durable "
+                        "tool result is no longer "
+                        "healthy or eligible.",
+                        status=503,
+                        code="no_healthy_model",
+                    )
+
+                return [owner_record]
+
+            # Preserve ordinary candidate fallback for
+            # historical or synthetic checkpoints whose
+            # owner is absent from the current catalog.
+
         if len(eligible) == 1:
             record = eligible[0]
             failures = sum(
@@ -1312,6 +1383,61 @@ class DeveloperCoordinator:
                 code="no_healthy_model",
             )
         return result[:MAX_ATTEMPTS]
+
+    def _phase_candidates(
+        self,
+        run: dict[str, Any],
+        role: str,
+    ) -> list[ModelRecord]:
+        try:
+            return list(
+                self._candidates(
+                    run,
+                    role,
+                )
+            )
+        except DeveloperError as exc:
+            # Candidate exhaustion with no in-flight work is
+            # terminal. Record the failed run and release any
+            # implementer writer lease before returning the
+            # original no_healthy_model response.
+            if (
+                exc.code
+                != "no_healthy_model"
+                or run.get("active_process")
+                or run.get("pending_tool_calls")
+            ):
+                raise
+
+            failure = {
+                "role": role,
+                "provider": str(
+                    run.get(
+                        "selected_provider",
+                        "",
+                    )
+                ),
+                "model": str(
+                    run.get(
+                        "selected_model",
+                        "",
+                    )
+                ),
+                "health": "",
+                "attempt": 0,
+                "failure": (
+                    _redact_text(str(exc))[:500]
+                ),
+                "elapsed_ms": 0,
+            }
+
+            self._fail_run(
+                run,
+                role,
+                [failure],
+            )
+
+            raise
 
     def _developer_status_context(
         self,
@@ -3433,7 +3559,7 @@ class DeveloperCoordinator:
                 "max_tokens": max_tokens,
             }
             failures = []
-            candidates = list(self._candidates(run, role))
+            candidates = self._phase_candidates(run, role)
             planner_policy_rejections = 0
             implementer_policy_rejections = 0
             phase_budget_retries = 0
