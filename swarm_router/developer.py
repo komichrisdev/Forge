@@ -4440,12 +4440,19 @@ class DeveloperCoordinator:
                                     "role": "user",
                                     "content": (
                                         f"Your prior {role} tool call was rejected and not executed. "
-                                        "Issue one command per tool call; do not chain commands. "
+                                        f"Rejected command: `{rejected_command}`. "
+                                        "Issue exactly one command in the next tool call; do not chain "
+                                        "commands. Do not use a shell pipeline. "
                                         f"Retry once using {retry_equivalent}. "
-                                        "Do not use a shell pipeline. For a bounded source search, "
-                                        "replace `grep PATTERN PATH | head -N` with "
-                                        "`rg -n -m N 'PATTERN' PATH`. For repository status, use "
-                                        "exactly `git status --short`; plain `git status` is not allowed."
+                                        "The `grep` executable is never approved for this role, including "
+                                        "plain `grep -n PATTERN PATH`. For a bounded source search, use "
+                                        "`rg -n -m N 'PATTERN' PATH`. Therefore replace plain "
+                                        "`grep -n PATTERN PATH` with "
+                                        "`rg -n -m 200 'PATTERN' PATH`, and replace "
+                                        "`grep PATTERN PATH | head -N` with "
+                                        "`rg -n -m N 'PATTERN' PATH`. "
+                                        "Do not repeat the rejected executable. For repository status, "
+                                        "use exactly `git status --short`; plain `git status` is not allowed."
                                     ),
                                 },
                             ]
