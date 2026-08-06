@@ -9,6 +9,7 @@ import unittest
 
 from swarm_router.solo_autopilot import (
     OpenWebUIGateway,
+    PROCESS_TOOL_SCHEMAS,
     Runner,
     Store,
     Task,
@@ -57,12 +58,30 @@ class FakeTerminal:
 
 
 class AllowPolicy:
-    def validate(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+    def __init__(self) -> None:
+        self.active_processes: list[dict[str, Any] | None] = []
+
+    def validate(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        active_process: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.active_processes.append(
+            dict(active_process)
+            if active_process
+            else None
+        )
         return tool_call
 
 
 class RejectSed:
-    def validate(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+    def validate(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        active_process: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         command = json.loads(tool_call["function"]["arguments"]).get("command", "")
         if command.startswith("sed "):
             raise RuntimeError("Command sed is not allowed for implementer.")
@@ -116,6 +135,24 @@ class SoloTest(unittest.TestCase):
         self.assertEqual(payload["model"], MODEL)
         self.assertFalse(payload["parallel_tool_calls"])
 
+    def test_process_tools_are_mapped_for_developer_policy(self) -> None:
+        self.assertEqual(
+            set(PROCESS_TOOL_SCHEMAS),
+            {
+                "run_command",
+                "get_process_status",
+                "kill_process",
+            },
+        )
+        self.assertIn(
+            "command",
+            PROCESS_TOOL_SCHEMAS["run_command"]["properties"],
+        )
+        self.assertIn(
+            "process_id",
+            PROCESS_TOOL_SCHEMAS["get_process_status"]["properties"],
+        )
+
     def test_fresh_context_resumes_from_checkpoint(self) -> None:
         store = self.store()
         first = Runner(
@@ -148,6 +185,7 @@ class SoloTest(unittest.TestCase):
 
     def test_running_process_is_polled_on_next_tick(self) -> None:
         store = self.store()
+        policy = AllowPolicy()
         terminal = FakeTerminal(
             [
                 {"id": "p1", "status": "running", "output": "started", "next_offset": 1},
@@ -159,7 +197,7 @@ class SoloTest(unittest.TestCase):
             store,
             FakeGateway([response(call=call("c1", "run_command", {"command": "python3 -m unittest"}))]),
             terminal,
-            AllowPolicy(),
+            policy,
             self.repo,
             2,
             20,
@@ -171,13 +209,17 @@ class SoloTest(unittest.TestCase):
             store,
             FakeGateway([response("Tests passed.\nREADY_FOR_REVIEW")]),
             terminal,
-            AllowPolicy(),
+            policy,
             self.repo,
             2,
             20,
         ).tick()
         self.assertEqual(second["status"], "ready_for_review")
         self.assertEqual(terminal.calls[1]["function"]["name"], "get_process_status")
+        self.assertEqual(
+            policy.active_processes[-1]["process_id"],
+            "p1",
+        )
 
     def test_same_sed_rejection_blocks_after_three(self) -> None:
         rejected = call("sed-call", "run_command", {"command": "sed -n '1,20p' README.md"})

@@ -67,7 +67,12 @@ class Terminal(Protocol):
 
 
 class Policy(Protocol):
-    def validate(self, call: dict[str, Any]) -> dict[str, Any]: ...
+    def validate(
+        self,
+        call: dict[str, Any],
+        *,
+        active_process: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -320,14 +325,68 @@ class OpenWebUIGateway:
         )
 
 
+def process_tool_schemas(
+    tools: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    # Convert OpenAI tool definitions to DeveloperCoordinator schemas.
+
+    schemas: dict[str, dict[str, Any]] = {}
+
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+
+        if not isinstance(function, dict):
+            raise SoloError("Malformed Open Terminal tool definition.")
+
+        name = function.get("name")
+        parameters = function.get("parameters")
+
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(parameters, dict)
+        ):
+            raise SoloError("Malformed Open Terminal function schema.")
+
+        if name in schemas:
+            raise SoloError(f"Duplicate Open Terminal tool schema: {name}.")
+
+        schemas[name] = parameters
+
+    return schemas
+
+
+PROCESS_TOOL_SCHEMAS = process_tool_schemas(PROCESS_TOOLS)
+
+
 class ForgePolicy:
     def __init__(self, config: AppConfig) -> None:
         self.coordinator = DeveloperCoordinator(config)
 
-    def validate(self, call: dict[str, Any]) -> dict[str, Any]:
-        result = self.coordinator._validate_tool_calls([call], PROCESS_TOOLS, "implementer")
-        if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], dict):
+    def validate(
+        self,
+        call: dict[str, Any],
+        *,
+        active_process: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = self.coordinator._validate_tool_calls(
+            [call],
+            PROCESS_TOOL_SCHEMAS,
+            "implementer",
+            active_process=(
+                dict(active_process)
+                if active_process
+                else None
+            ),
+        )
+
+        if (
+            not isinstance(result, list)
+            or len(result) != 1
+            or not isinstance(result[0], dict)
+        ):
             raise SoloError("Forge policy returned an invalid result.")
+
         return result[0]
 
 
@@ -405,9 +464,13 @@ class Runner:
             "Plan, inspect, implement, test, and self-review the task from start to finish. "
             "There are no planner, implementer, reviewer, verifier, manager, judge, handoff, "
             "or fallback agents. Never request another model.\n\n"
-            "Use only the supplied Open Terminal tools. Start no more than one process per "
-            "model turn and poll a running process before starting another. Follow the Forge "
-            "implementer command policy exactly.\n\n"
+            "Use only the supplied Open Terminal tools. The terminal workspace is exactly "
+            "/workspace/forge. Do not invent another repository path, do not cd into a guessed "
+            "path, and normally omit cwd. Start no more than one process per model turn and poll "
+            "a running process before starting another. Follow the Forge implementer command "
+            "policy exactly. Approved Git inspection forms include git status --short, "
+            "git branch --show-current, git rev-parse HEAD, git diff --check, git diff --stat, "
+            "and git log -n N --oneline with N from 1 to 100.\n\n"
             "Do not use sed. For inspection prefer cat, head, tail, rg, or bounded grep such "
             "as grep -n -m 30 PATTERN PATH. Do not use recursive grep, pipelines, compound "
             "commands, command substitution, or arbitrary inline Python. After a policy "
@@ -496,7 +559,10 @@ class Runner:
                 ),
             },
         }
-        valid = self.policy.validate(call)
+        valid = self.policy.validate(
+            call,
+            active_process=active,
+        )
         self.store.beat(state, "process_poll_started", process_id=active["process_id"])
         result = self.terminal.execute_tool_call(valid)
         self.record_result(state, valid, result)
