@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import uuid
@@ -827,27 +828,156 @@ def call_args(call: Mapping[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-SAFE_FIND_PIPELINE_RE = re.compile(
-    r"^\s*find\s+"
-    r"(?P<path>/workspace/forge(?:/[A-Za-z0-9._/-]+)?)"
-    r"\s+-type\s+f"
-    r"\s+-name\s+"
-    r"(?P<quote>[\"'])"
-    r"(?P<glob>\*\.(?:py|js|ts|vue|svelte|html))"
-    r"(?P=quote)"
-    r"\s*\|\s*head\s+-?(?P<limit>[1-9]\d{0,2})"
-    r"\s*$",
-    re.I,
-)
+SAFE_INVENTORY_GLOBS = {
+    "*.py",
+    "*.js",
+    "*.ts",
+    "*.tsx",
+    "*.vue",
+    "*.svelte",
+    "*.html",
+}
 
 
-def safe_inspection_replacement(command: str) -> str:
-    match = SAFE_FIND_PIPELINE_RE.fullmatch(command)
-    if not match:
+def safe_inspection_replacement(
+    command: str,
+) -> str:
+    try:
+        tokens = shlex.split(
+            command,
+            posix=True,
+        )
+    except ValueError:
         return ""
-    path = match.group("path")
-    relative = "." if path == "/workspace/forge" else path[len("/workspace/forge/"):]
-    return "rg --files -g '" + match.group("glob") + "' " + relative
+
+    if (
+        len(tokens) < 8
+        or tokens[0] != "find"
+    ):
+        return ""
+
+    path = tokens[1]
+    root = "/workspace/forge"
+
+    if not (
+        path == root
+        or path.startswith(root + "/")
+    ):
+        return ""
+
+    relative_path = (
+        "."
+        if path == root
+        else path[len(root) + 1:]
+    )
+
+    if (
+        not relative_path
+        or relative_path.startswith("/")
+        or ".." in Path(relative_path).parts
+    ):
+        return ""
+
+    index = 2
+
+    if (
+        index < len(tokens)
+        and tokens[index] == "-maxdepth"
+    ):
+        if index + 1 >= len(tokens):
+            return ""
+
+        try:
+            depth = int(tokens[index + 1])
+        except ValueError:
+            return ""
+
+        if depth < 1 or depth > 20:
+            return ""
+
+        index += 2
+
+    if tokens[index:index + 2] != [
+        "-type",
+        "f",
+    ]:
+        return ""
+
+    index += 2
+    patterns: list[str] = []
+
+    while index < len(tokens):
+        if tokens[index] == "|":
+            break
+
+        if patterns:
+            if tokens[index] != "-o":
+                return ""
+            index += 1
+
+        if (
+            index + 1 >= len(tokens)
+            or tokens[index] != "-name"
+        ):
+            return ""
+
+        pattern = tokens[index + 1]
+
+        if pattern not in SAFE_INVENTORY_GLOBS:
+            return ""
+
+        if pattern not in patterns:
+            patterns.append(pattern)
+
+        index += 2
+
+    if (
+        not patterns
+        or index >= len(tokens)
+        or tokens[index] != "|"
+    ):
+        return ""
+
+    tail = tokens[index + 1:]
+
+    if not tail or tail[0] != "head":
+        return ""
+
+    if len(tail) == 2:
+        raw_limit = tail[1]
+        if raw_limit.startswith("-"):
+            raw_limit = raw_limit[1:]
+    elif (
+        len(tail) == 3
+        and tail[1] == "-n"
+    ):
+        raw_limit = tail[2]
+    else:
+        return ""
+
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        return ""
+
+    if limit < 1 or limit > 200:
+        return ""
+
+    parts = ["rg", "--files"]
+
+    for pattern in patterns:
+        parts.extend(
+            [
+                "-g",
+                shlex.quote(pattern),
+            ]
+        )
+
+    parts.append(
+        shlex.quote(relative_path)
+    )
+
+    return " ".join(parts)
 
 
 def normalized_solo_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
@@ -1136,7 +1266,8 @@ class Runner:
             "Use only the supplied Open Terminal tools. Start no more than one process per "
             "model turn and poll a running process before starting another. Follow the Forge "
             "implementer command policy exactly.\n\n"
-            "Do not use sed. For inspection prefer cat, head, tail, rg, or bounded grep such "
+            "Do not use sed. For file inventory use rg --files with optional -g globs and "
+            "no pipeline. For text inspection prefer cat, head, tail, rg, or bounded grep such "
             "as grep -n -m 30 PATTERN PATH. Do not use recursive grep, pipelines, compound "
             "commands, command substitution, or arbitrary inline Python. After a policy "
             "rejection, choose a supported equivalent and continue with the same model.\n\n"

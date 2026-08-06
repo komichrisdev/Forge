@@ -664,6 +664,154 @@ class SoloTest(unittest.TestCase):
         self.assertIn("rg --files -g '*.py' swarm_router", instruction)
         self.assertIn("cwd='/workspace/forge'", instruction)
 
+    def test_safe_find_pipeline_accepts_maxdepth_variant(
+        self,
+    ) -> None:
+        command = (
+            'find /workspace/forge -maxdepth 3 '
+            '-type f -name "*.py" | head -60'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(command),
+            "rg --files -g '*.py' .",
+        )
+
+    def test_safe_find_pipeline_accepts_multiple_glob_variant(
+        self,
+    ) -> None:
+        command = (
+            'find /workspace/forge -type f '
+            '-name "*.py" -o -name "*.js" '
+            '-o -name "*.ts" -o -name "*.tsx" '
+            '-o -name "*.vue" -o -name "*.html" '
+            '| head -80'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(command),
+            (
+                "rg --files -g '*.py' -g '*.js' "
+                "-g '*.ts' -g '*.tsx' -g '*.vue' "
+                "-g '*.html' ."
+            ),
+        )
+
+    def test_forge_policy_accepts_observed_v8_inventory_variants(
+        self,
+    ) -> None:
+        policy = ForgePolicy.__new__(
+            ForgePolicy
+        )
+        policy.coordinator = (
+            DeveloperCoordinator.__new__(
+                DeveloperCoordinator
+            )
+        )
+        policy.tool_schemas = (
+            PROCESS_TOOL_SCHEMAS
+        )
+
+        commands = (
+            (
+                'find /workspace/forge '
+                '-maxdepth 3 -type f '
+                '-name "*.py" | head -60'
+            ),
+            (
+                'find /workspace/forge -type f '
+                '-name "*.py" -o -name "*.js" '
+                '-o -name "*.ts" -o -name "*.tsx" '
+                '-o -name "*.vue" -o -name "*.html" '
+                '| head -80'
+            ),
+            (
+                'find /workspace/forge -type f '
+                '-name "*.py" -o -name "*.js" '
+                '-o -name "*.ts" -o -name "*.vue" '
+                '-o -name "*.svelte" -o -name "*.html" '
+                '| head -80'
+            ),
+        )
+
+        for index, command in enumerate(
+            commands,
+            start=1,
+        ):
+            with self.subTest(command=command):
+                valid = policy.validate(
+                    call(
+                        f"inventory-{index}",
+                        "run_command",
+                        {
+                            "command": command,
+                            "cwd": "/tmp",
+                            "wait": 30,
+                        },
+                    )
+                )
+                arguments = json.loads(
+                    valid["function"][
+                        "arguments"
+                    ]
+                )
+
+                self.assertTrue(
+                    arguments["command"].startswith(
+                        "rg --files "
+                    )
+                )
+                self.assertNotIn(
+                    "|",
+                    arguments["command"],
+                )
+                self.assertEqual(
+                    arguments["cwd"],
+                    "/workspace/forge",
+                )
+
+    def test_safe_find_pipeline_rejects_unrecognized_predicates(
+        self,
+    ) -> None:
+        rejected = (
+            "find /workspace/forge "
+            "-maxdepth 3 -type f "
+            '-name "*.py" -delete | head -60'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(
+                rejected
+            ),
+            "",
+        )
+
+        policy = ForgePolicy.__new__(
+            ForgePolicy
+        )
+        policy.coordinator = (
+            DeveloperCoordinator.__new__(
+                DeveloperCoordinator
+            )
+        )
+        policy.tool_schemas = (
+            PROCESS_TOOL_SCHEMAS
+        )
+
+        with self.assertRaises(
+            DeveloperError
+        ):
+            policy.validate(
+                call(
+                    "unsafe-inventory",
+                    "run_command",
+                    {
+                        "command": rejected,
+                        "cwd": "/tmp",
+                    },
+                )
+            )
+
     def test_fresh_context_resumes_from_checkpoint(self) -> None:
         store = self.store()
         first = Runner(
