@@ -9,6 +9,10 @@ import sqlite3
 import subprocess
 import unittest
 
+from swarm_router.developer import (
+    DeveloperCoordinator,
+    DeveloperError,
+)
 from swarm_router.solo_autopilot import (
     ForgePolicy,
     OpenWebUIGateway,
@@ -67,12 +71,22 @@ class FakeTerminal:
 
 
 class AllowPolicy:
-    def validate(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+    def validate(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        active_process: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return tool_call
 
 
 class RejectSed:
-    def validate(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+    def validate(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        active_process: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         command = json.loads(tool_call["function"]["arguments"]).get("command", "")
         if command.startswith("sed "):
             raise RuntimeError("Command sed is not allowed for implementer.")
@@ -103,15 +117,21 @@ class CapturingCoordinator:
     def __init__(self) -> None:
         self.tool_schemas: dict[str, dict[str, Any]] | None = None
         self.role = ""
+        self.active_process: dict[str, Any] | None = None
 
     def _validate_tool_calls(
         self,
         calls: list[dict[str, Any]],
         tool_schemas: dict[str, dict[str, Any]],
         role: str,
+        tool_choice: Any = "auto",
+        *,
+        active_process: dict[str, Any] | None = None,
+        cancellation_requested: bool = False,
     ) -> list[dict[str, Any]]:
         self.tool_schemas = tool_schemas
         self.role = role
+        self.active_process = active_process
         return calls
 
 
@@ -337,6 +357,141 @@ class SoloTest(unittest.TestCase):
         writer.release(
             lock["lease_id"],
             status="blocked",
+        )
+
+    def test_forge_policy_passes_active_process_to_real_poll_validation(
+        self,
+    ) -> None:
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = DeveloperCoordinator.__new__(
+            DeveloperCoordinator
+        )
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+
+        active = {
+            "process_id": "process-123",
+            "status": "running",
+            "next_offset": 7,
+        }
+        poll_call = call(
+            "poll-call",
+            "get_process_status",
+            {
+                "process_id": "process-123",
+                "wait": 60,
+                "offset": 7,
+            },
+        )
+
+        self.assertEqual(
+            policy.validate(
+                poll_call,
+                active_process=active,
+            ),
+            poll_call,
+        )
+
+        mismatched = call(
+            "wrong-poll",
+            "get_process_status",
+            {
+                "process_id": "other-process",
+                "wait": 60,
+                "offset": 7,
+            },
+        )
+
+        with self.assertRaisesRegex(
+            DeveloperError,
+            "does not match the active process",
+        ):
+            policy.validate(
+                mismatched,
+                active_process=active,
+            )
+
+    def test_runner_poll_forwards_exact_active_process_context(
+        self,
+    ) -> None:
+        class RecordingPolicy:
+            def __init__(self) -> None:
+                self.active_process = None
+
+            def validate(
+                self,
+                tool_call,
+                *,
+                active_process=None,
+            ):
+                self.active_process = json.loads(
+                    json.dumps(active_process)
+                )
+                return tool_call
+
+        store = self.store()
+        state = Runner(
+            self.task,
+            store,
+            FakeGateway([]),
+            FakeTerminal([]),
+            AllowPolicy(),
+            self.repo,
+            2,
+            20,
+        ).initial_state(snapshot(self.repo))
+
+        state["active_process"] = {
+            "process_id": "process-456",
+            "status": "running",
+            "next_offset": 3,
+            "command": "ls -la /workspace/forge/",
+            "evidence_kind": "",
+        }
+
+        policy = RecordingPolicy()
+        terminal = FakeTerminal(
+            [
+                {
+                    "id": "process-456",
+                    "status": "done",
+                    "exit_code": 0,
+                    "output": "listing",
+                    "next_offset": 4,
+                }
+            ]
+        )
+        runner = Runner(
+            self.task,
+            store,
+            FakeGateway([]),
+            terminal,
+            policy,
+            self.repo,
+            2,
+            20,
+        )
+
+        self.assertFalse(
+            runner.poll(state)
+        )
+        self.assertEqual(
+            policy.active_process["process_id"],
+            "process-456",
+        )
+        self.assertEqual(
+            policy.active_process["next_offset"],
+            3,
+        )
+        arguments = json.loads(
+            terminal.calls[0]["function"]["arguments"]
+        )
+        self.assertEqual(
+            arguments["process_id"],
+            "process-456",
+        )
+        self.assertEqual(
+            arguments["offset"],
+            3,
         )
 
     def test_fresh_context_resumes_from_checkpoint(self) -> None:

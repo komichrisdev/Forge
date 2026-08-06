@@ -477,7 +477,12 @@ class Terminal(Protocol):
 
 
 class Policy(Protocol):
-    def validate(self, call: dict[str, Any]) -> dict[str, Any]: ...
+    def validate(
+        self,
+        call: dict[str, Any],
+        *,
+        active_process: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -958,11 +963,21 @@ class ForgePolicy:
         self.coordinator = DeveloperCoordinator(config)
         self.tool_schemas = PROCESS_TOOL_SCHEMAS
 
-    def validate(self, call: dict[str, Any]) -> dict[str, Any]:
+    def validate(
+        self,
+        call: dict[str, Any],
+        *,
+        active_process: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         result = self.coordinator._validate_tool_calls(
             [call],
             self.tool_schemas,
             "implementer",
+            active_process=(
+                dict(active_process)
+                if active_process
+                else None
+            ),
         )
         if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], dict):
             raise SoloError("Forge policy returned an invalid result.")
@@ -1182,7 +1197,10 @@ class Runner:
                 ),
             },
         }
-        valid = self.policy.validate(call)
+        valid = self.policy.validate(
+            call,
+            active_process=active,
+        )
         self.renew_writer(state)
         self.store.beat(state, "process_poll_started", process_id=active["process_id"])
         result = self.terminal.execute_tool_call(valid)
