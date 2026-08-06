@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 import argparse
@@ -19,7 +20,7 @@ import uuid
 from .autopilot_adapter import OpenTerminalClient, PROCESS_TOOLS
 from .client import OpenWebUIClient
 from .config import AppConfig, load_config
-from .developer import DeveloperCoordinator
+from .developer import DeveloperCoordinator, LOCK_SECONDS, STALE_SECONDS
 
 
 DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
@@ -55,6 +56,188 @@ SECRET_RE = re.compile(
 
 class SoloError(RuntimeError):
     pass
+
+
+class WriterBusy(SoloError):
+    pass
+
+
+class WriterLeaseLost(SoloError):
+    pass
+
+
+class WriterLease(Protocol):
+    def acquire(self, lease_id: str = "") -> dict[str, Any]: ...
+    def release(self, lease_id: str) -> None: ...
+
+
+class NoopWriterLease:
+    def acquire(self, lease_id: str = "") -> dict[str, Any]:
+        return {
+            "workspace": "/workspace/forge",
+            "task_id": "noop",
+            "lease_id": lease_id or "noop",
+            "state": "locked",
+        }
+
+    def release(self, lease_id: str) -> None:
+        return None
+
+
+class SharedWriterLease:
+    # Shares the established Forge writer-lock table without a fake run.
+
+    workspace = "/workspace/forge"
+
+    def __init__(self, database: Path, owner: str) -> None:
+        self.database = database.expanduser()
+        self.owner = owner
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.database, timeout=30)
+        db.row_factory = sqlite3.Row
+        return db
+
+    @staticmethod
+    def _expired(value: Any, current: datetime) -> bool:
+        try:
+            return datetime.fromisoformat(str(value)) <= current
+        except ValueError:
+            return True
+
+    def acquire(self, lease_id: str = "") -> dict[str, Any]:
+        current = datetime.now(timezone.utc)
+        expires = current + timedelta(seconds=LOCK_SECONDS)
+        selected_lease = lease_id or uuid.uuid4().hex
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM forge_developer_writer_lock WHERE workspace=?",
+                (self.workspace,),
+            ).fetchone()
+
+            if lease_id and (
+                not row
+                or str(row["task_id"]) != self.owner
+                or str(row["lease_id"]) != lease_id
+            ):
+                raise WriterLeaseLost(
+                    "DeepSeek Solo no longer owns the exact Forge writer lease."
+                )
+
+            if row:
+                expired = self._expired(row["expires_at"], current)
+                row_owner = str(row["task_id"])
+
+                if row_owner == self.owner:
+                    selected_lease = str(row["lease_id"]) or selected_lease
+                else:
+                    owner = db.execute(
+                        """
+                        SELECT status, updated_at, active_process
+                        FROM forge_developer_runs
+                        WHERE task_id=?
+                        """,
+                        (row_owner,),
+                    ).fetchone()
+                    pending = db.execute(
+                        """
+                        SELECT 1
+                        FROM forge_developer_pending_calls
+                        WHERE task_id=?
+                        LIMIT 1
+                        """,
+                        (row_owner,),
+                    ).fetchone()
+                    try:
+                        active = bool(
+                            owner
+                            and json.loads(str(owner["active_process"] or "{}"))
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        active = True
+                    owner_terminal = (
+                        not owner
+                        or str(owner["status"])
+                        in {"completed", "failed", "cancelled", "blocked"}
+                    )
+                    try:
+                        inactive = (
+                            not owner
+                            or datetime.fromisoformat(str(owner["updated_at"]))
+                            <= current - timedelta(seconds=STALE_SECONDS)
+                        )
+                    except ValueError:
+                        inactive = True
+                    if pending or active or not (
+                        expired and (owner_terminal or inactive)
+                    ):
+                        raise WriterBusy(
+                            f"Forge writer is busy with run {row_owner}."
+                        )
+                    selected_lease = uuid.uuid4().hex
+
+            db.execute(
+                """
+                INSERT INTO forge_developer_writer_lock(
+                    workspace, task_id, acquired_at, expires_at, lease_id
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(workspace) DO UPDATE SET
+                    task_id=excluded.task_id,
+                    acquired_at=excluded.acquired_at,
+                    expires_at=excluded.expires_at,
+                    lease_id=excluded.lease_id
+                """,
+                (
+                    self.workspace,
+                    self.owner,
+                    current.isoformat(),
+                    expires.isoformat(),
+                    selected_lease,
+                ),
+            )
+
+        return {
+            "workspace": self.workspace,
+            "task_id": self.owner,
+            "lease_id": selected_lease,
+            "expires_at": expires.isoformat(),
+            "state": "locked",
+        }
+
+    def release(self, lease_id: str) -> None:
+        if not lease_id:
+            return
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """
+                SELECT task_id, lease_id
+                FROM forge_developer_writer_lock
+                WHERE workspace=?
+                """,
+                (self.workspace,),
+            ).fetchone()
+            if not row:
+                raise WriterLeaseLost(
+                    "DeepSeek Solo writer lease disappeared before release."
+                )
+            if (
+                str(row["task_id"]) != self.owner
+                or str(row["lease_id"]) != lease_id
+            ):
+                raise WriterLeaseLost(
+                    "DeepSeek Solo writer lease token no longer matches."
+                )
+            db.execute(
+                """
+                DELETE FROM forge_developer_writer_lock
+                WHERE workspace=? AND task_id=? AND lease_id=?
+                """,
+                (self.workspace, self.owner, lease_id),
+            )
 
 
 class Gateway(Protocol):
@@ -179,6 +362,89 @@ def snapshot(repo: Path) -> dict[str, Any]:
         "diff_check_rc": check.returncode,
         "diff_check": bounded(check.stdout + check.stderr, 2000),
     }
+
+
+def normalized_task_path(value: str) -> str:
+    text = value.strip().replace("\\", "/")
+    if text.startswith("/workspace/forge/"):
+        text = text[len("/workspace/forge/"):]
+    elif text == "/workspace/forge":
+        text = "."
+    while text.startswith("./"):
+        text = text[2:]
+    text = text.rstrip("/") or "."
+    if text.startswith("/") or ".." in Path(text).parts:
+        raise SoloError(f"Unsafe allowed path: {value}")
+    return text
+
+
+def repository_changed_paths(repo: Path) -> list[str]:
+    commands = (
+        ("--no-pager", "diff", "--name-only"),
+        ("--no-pager", "diff", "--cached", "--name-only"),
+        ("ls-files", "--others", "--exclude-standard"),
+    )
+    paths: set[str] = set()
+    for arguments in commands:
+        result = git(repo, *arguments, check=False)
+        if result.returncode != 0:
+            raise SoloError(
+                "Could not determine repository changed paths: "
+                + bounded(result.stdout + result.stderr, 1000)
+            )
+        paths.update(
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip()
+        )
+    return sorted(paths)
+
+
+def path_is_allowed(path: str, allowed_paths: tuple[str, ...]) -> bool:
+    normalized = normalized_task_path(path)
+    for raw in allowed_paths:
+        allowed = normalized_task_path(raw)
+        if allowed == ".":
+            return True
+        if (
+            normalized == allowed
+            or normalized.startswith(allowed + "/")
+            or fnmatch(normalized, allowed)
+        ):
+            return True
+    return False
+
+
+TEST_RE = re.compile(
+    r"\b(?:unittest|pytest|npm\s+(?:test|run\s+test))\b",
+    re.I,
+)
+FULL_TEST_RE = re.compile(
+    r"(?:\bunittest\s+discover\b|"
+    r"\b(?:python\d*(?:\.\d+)?\s+-m\s+)?pytest"
+    r"(?:\s+-[\w=-]+)*\s*$|"
+    r"\bnpm\s+(?:test|run\s+test)\b)",
+    re.I,
+)
+DIFF_EVIDENCE_RE = re.compile(r"\bgit\b[^\n]*\bdiff\b", re.I)
+STATUS_EVIDENCE_RE = re.compile(
+    r"^\s*git\s+status\s+--short\s*$",
+    re.I,
+)
+SUCCESS_STATES = {"completed", "done", "passed", "success", "succeeded"}
+
+
+def evidence_kind(command: str) -> str:
+    normalized = " ".join(command.split())
+    if FULL_TEST_RE.search(normalized):
+        return "full_test"
+    if TEST_RE.search(normalized):
+        return "focused_test"
+    if DIFF_EVIDENCE_RE.search(normalized):
+        return "diff"
+    if STATUS_EVIDENCE_RE.fullmatch(normalized):
+        return "status"
+    return ""
 
 
 def catalog_context(path: Path, model: str) -> int | None:
@@ -343,6 +609,7 @@ class Runner:
         epoch_rounds: int = 10,
         max_rounds: int = 240,
         capacity_pause: int = 300,
+        writer: WriterLease | None = None,
     ) -> None:
         self.task = task
         self.store = store
@@ -353,6 +620,7 @@ class Runner:
         self.epoch_rounds = epoch_rounds
         self.max_rounds = max_rounds
         self.capacity_pause = capacity_pause
+        self.writer = writer or NoopWriterLease()
 
     def initial_state(self, snap: Mapping[str, Any]) -> dict[str, Any]:
         stamp = now()
@@ -370,6 +638,9 @@ class Runner:
             "total_tool_calls": 0,
             "consecutive_failures": 0,
             "policy_rejections": {},
+            "readiness_rejections": 0,
+            "evidence": [],
+            "writer_lease_id": "",
             "retry_after": "",
             "baseline_head": snap["head"],
             "baseline_branch": snap["branch"],
@@ -429,6 +700,9 @@ class Runner:
             "last_response": bounded(state.get("last_response"), 2500),
             "active_process": state.get("active_process", {}),
             "recent_results": list(state.get("recent_results", []))[-10:],
+            "evidence": list(state.get("evidence", []))[-20:],
+            "last_error": bounded(state.get("last_error"), 2000),
+            "writer_lease": {"owned": bool(state.get("writer_lease_id"))},
             "repository": {
                 "head": snap["head"],
                 "branch": snap["branch"],
@@ -445,13 +719,28 @@ class Runner:
         )
 
     def record_result(self, state: dict[str, Any], call: Mapping[str, Any], text: str) -> None:
+        prior_active = dict(state.get("active_process") or {})
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
             payload = {"output": text}
         if not isinstance(payload, dict):
             payload = {"value": payload}
-        preview = payload.get("output") or payload.get("stdout") or payload.get("message") or ""
+        arguments = call_args(call)
+        command = str(
+            arguments.get("command")
+            or prior_active.get("command")
+            or ""
+        )
+        kind = evidence_kind(command)
+        status = str(payload.get("status", "")).lower()
+        exit_code = payload.get("exit_code")
+        preview = (
+            payload.get("output")
+            or payload.get("stdout")
+            or payload.get("message")
+            or ""
+        )
         recent = list(state.get("recent_results", []))
         recent.append(
             {
@@ -459,11 +748,13 @@ class Runner:
                 "tool": call_name(call),
                 "arguments": {
                     key: bounded(value, 500)
-                    for key, value in call_args(call).items()
+                    for key, value in arguments.items()
                     if key not in {"env", "environment"}
                 },
-                "status": str(payload.get("status", "")),
-                "exit_code": payload.get("exit_code"),
+                "command": bounded(command, 1000),
+                "evidence_kind": kind,
+                "status": status,
+                "exit_code": exit_code,
                 "result_digest": digest(text),
                 "output_preview": bounded(preview, 1800),
             }
@@ -472,9 +763,26 @@ class Runner:
         state["total_tool_calls"] = int(state.get("total_tool_calls", 0)) + 1
         active = active_from(text)
         if active:
+            active["command"] = command
+            active["evidence_kind"] = kind
             state["active_process"] = active
-        elif str(payload.get("status", "")).lower() in TERMINAL:
+            return
+        if status in TERMINAL:
             state["active_process"] = {}
+            if kind:
+                evidence = list(state.get("evidence", []))
+                evidence.append(
+                    {
+                        "timestamp": now(),
+                        "kind": kind,
+                        "command": bounded(command, 1200),
+                        "status": status,
+                        "exit_code": exit_code,
+                        "success": exit_code == 0 and status in SUCCESS_STATES,
+                        "result_digest": digest(text),
+                    }
+                )
+                state["evidence"] = evidence[-100:]
 
     def poll(self, state: dict[str, Any]) -> bool:
         active = state.get("active_process")
@@ -497,9 +805,11 @@ class Runner:
             },
         }
         valid = self.policy.validate(call)
+        self.renew_writer(state)
         self.store.beat(state, "process_poll_started", process_id=active["process_id"])
         result = self.terminal.execute_tool_call(valid)
         self.record_result(state, valid, result)
+        self.renew_writer(state)
         self.store.beat(state, "process_poll_finished", still_active=bool(state.get("active_process")))
         return bool(state.get("active_process"))
 
@@ -533,6 +843,89 @@ class Runner:
             },
         )
         return count
+
+    def renew_writer(self, state: dict[str, Any]) -> None:
+        lock = self.writer.acquire(str(state.get("writer_lease_id", "")))
+        state["writer_lease_id"] = str(lock.get("lease_id", ""))
+        if not state["writer_lease_id"]:
+            raise WriterLeaseLost(
+                "Forge writer acquisition returned no lease token."
+            )
+
+    def release_writer(self, state: dict[str, Any]) -> None:
+        lease_id = str(state.get("writer_lease_id", ""))
+        if not lease_id:
+            return
+        try:
+            self.writer.release(lease_id)
+        finally:
+            state["writer_lease_id"] = ""
+
+    def scope_issues(self) -> list[str]:
+        changed = repository_changed_paths(self.repo)
+        if not changed:
+            return []
+        if not self.task.allowed_paths:
+            return ["Task manifest has no allowed_paths for repository changes."]
+        outside = [
+            path
+            for path in changed
+            if not path_is_allowed(path, self.task.allowed_paths)
+        ]
+        if not outside:
+            return []
+        return ["Changed paths outside task scope: " + ", ".join(outside)]
+
+    @staticmethod
+    def latest_evidence(
+        state: Mapping[str, Any],
+        kind: str,
+    ) -> Mapping[str, Any] | None:
+        matches = [
+            item
+            for item in state.get("evidence", [])
+            if isinstance(item, dict) and item.get("kind") == kind
+        ]
+        return matches[-1] if matches else None
+
+    def readiness_issues(
+        self,
+        state: Mapping[str, Any],
+        snap: Mapping[str, Any],
+    ) -> list[str]:
+        issues: list[str] = []
+        if state.get("active_process"):
+            issues.append("A terminal process is still active.")
+        if not repository_changed_paths(self.repo):
+            issues.append("No repository changes are present.")
+        issues.extend(self.scope_issues())
+        if int(snap.get("diff_check_rc", 1)) != 0:
+            issues.append("git diff --check is not clean.")
+        requirements = (
+            ("focused_test", "No successful focused test is recorded."),
+            ("full_test", "No successful full relevant test suite is recorded."),
+            ("diff", "No successful final Git diff inspection is recorded."),
+            ("status", "No successful final git status --short inspection is recorded."),
+        )
+        for kind, message in requirements:
+            item = self.latest_evidence(state, kind)
+            if not item or not item.get("success"):
+                issues.append(message)
+        return issues
+
+    def block_for_scope(
+        self,
+        state: dict[str, Any],
+        event: str,
+    ) -> dict[str, Any] | None:
+        issues = self.scope_issues()
+        if not issues:
+            return None
+        state["status"] = "blocked"
+        state["last_error"] = "; ".join(issues)
+        self.release_writer(state)
+        self.store.beat(state, event, issues=issues)
+        return dict(state)
 
     def review_bundle(self, state: dict[str, Any], snap: Mapping[str, Any]) -> None:
         self.store.review.mkdir(parents=True, exist_ok=True)
@@ -576,7 +969,35 @@ class Runner:
     def _tick(self) -> dict[str, Any]:
         state = self.load_state()
         if state.get("status") in {"ready_for_review", "blocked"}:
+            try:
+                self.release_writer(state)
+            except WriterLeaseLost as error:
+                state["last_error"] = (
+                    bounded(state.get("last_error"), 1400)
+                    + " "
+                    + bounded(error, 500)
+                ).strip()
+            self.store.save(state)
             return dict(state)
+        try:
+            self.renew_writer(state)
+        except WriterBusy as error:
+            state["status"] = "paused_writer"
+            state["last_error"] = bounded(error, 1200)
+            self.store.beat(state, "writer_busy")
+            return dict(state)
+        except WriterLeaseLost as error:
+            state["status"] = "blocked"
+            state["last_error"] = bounded(error, 1200)
+            state["writer_lease_id"] = ""
+            self.store.beat(state, "writer_lease_lost")
+            return dict(state)
+        scope_block = self.block_for_scope(
+            state,
+            "preexisting_scope_violation",
+        )
+        if scope_block is not None:
+            return scope_block
 
         retry_after = str(state.get("retry_after", ""))
         if retry_after:
@@ -591,6 +1012,7 @@ class Runner:
         if int(state.get("total_rounds", 0)) >= self.max_rounds:
             state["status"] = "blocked"
             state["last_error"] = "Maximum total model rounds reached."
+            self.release_writer(state)
             self.store.beat(state, "max_rounds")
             return dict(state)
 
@@ -610,6 +1032,7 @@ class Runner:
             ]
 
             for _ in range(self.epoch_rounds):
+                self.renew_writer(state)
                 state["total_rounds"] = int(state.get("total_rounds", 0)) + 1
                 self.store.beat(
                     state,
@@ -668,13 +1091,22 @@ class Runner:
                         if repeated >= 3:
                             state["status"] = "blocked"
                             state["last_error"] = "The same rejected command was repeated three times."
+                            self.release_writer(state)
                             self.store.beat(state, "repeated_policy_rejection")
                             return dict(state)
                         continue
 
+                    self.renew_writer(state)
                     self.store.beat(state, "tool_started", tool=call_name(valid))
                     result = self.terminal.execute_tool_call(valid)
                     self.record_result(state, valid, result)
+                    self.renew_writer(state)
+                    scope_block = self.block_for_scope(
+                        state,
+                        "tool_scope_violation",
+                    )
+                    if scope_block is not None:
+                        return scope_block
                     messages.extend(
                         [
                             assistant,
@@ -691,10 +1123,49 @@ class Runner:
                 state["checkpoint"] = bounded(content, 5000) or state.get("checkpoint", "")
 
                 if marker == "READY_FOR_REVIEW":
+                    snap = snapshot(self.repo)
+                    issues = self.readiness_issues(state, snap)
+                    if issues:
+                        state["readiness_rejections"] = int(
+                            state.get("readiness_rejections", 0)
+                        ) + 1
+                        state["last_error"] = (
+                            "READY_FOR_REVIEW rejected: " + "; ".join(issues)
+                        )
+                        self.store.beat(
+                            state,
+                            "readiness_rejected",
+                            issues=issues,
+                            rejection=state["readiness_rejections"],
+                        )
+                        if state["readiness_rejections"] >= 5:
+                            state["status"] = "blocked"
+                            self.release_writer(state)
+                            self.store.beat(
+                                state,
+                                "repeated_readiness_rejection",
+                                issues=issues,
+                            )
+                            return dict(state)
+                        messages.extend(
+                            [
+                                {"role": "assistant", "content": content},
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "The server-side review gate rejected "
+                                        "READY_FOR_REVIEW. Resolve every item "
+                                        "with terminal evidence, then continue. "
+                                        "Unmet items: " + "; ".join(issues)
+                                    ),
+                                },
+                            ]
+                        )
+                        continue
                     state["status"] = "ready_for_review"
                     state["final_report"] = bounded(content, 16000)
                     state["consecutive_failures"] = 0
-                    snap = snapshot(self.repo)
+                    self.release_writer(state)
                     self.review_bundle(state, snap)
                     self.store.beat(state, "ready_for_review", bundle=state["review_bundle"])
                     return dict(state)
@@ -703,6 +1174,7 @@ class Runner:
                     state["status"] = "blocked"
                     state["final_report"] = bounded(content, 16000)
                     state["last_error"] = "DeepSeek reported a blocker."
+                    self.release_writer(state)
                     self.store.beat(state, "model_blocked")
                     return dict(state)
 
@@ -746,6 +1218,7 @@ class Runner:
             state["consecutive_failures"] = failures
             if failures >= 3:
                 state["status"] = "blocked"
+                self.release_writer(state)
                 self.store.beat(state, "repeated_failure", error=state["last_error"])
                 return dict(state)
 
@@ -817,6 +1290,10 @@ def main(argv: list[str] | None = None) -> int:
         args.repository,
         args.epoch_rounds,
         args.max_total_rounds,
+        writer=SharedWriterLease(
+            args.catalog,
+            f"solo:{task.task_id}",
+        ),
     )
     print(json.dumps(runner.tick(), indent=2, ensure_ascii=False, default=str))
     return 0

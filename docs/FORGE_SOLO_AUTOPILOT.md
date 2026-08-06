@@ -32,3 +32,21 @@ rejected command block the task.
 
 The service and timer files in this repository are templates only. This build
 does not install, enable, or start them.
+
+
+## Server-side completion gates
+
+`READY_FOR_REVIEW` is advisory until the runner verifies all of the following:
+
+- the repository contains at least one change;
+- every changed path is within the task manifest's `allowed_paths`;
+- `git diff --check` is clean;
+- a successful focused test is recorded;
+- a successful full relevant test suite is recorded;
+- successful final `git diff` and exact `git status --short` inspections are recorded;
+- no terminal process remains active.
+
+The runner also participates in the existing
+`forge_developer_writer_lock` table. It renews the exact 30-minute lease before
+model requests and terminal work, stops if the lease token is lost, and releases
+the lease only on a terminal review or blocked state.

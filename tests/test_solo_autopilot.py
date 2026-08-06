@@ -4,15 +4,20 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 import json
+import sqlite3
 import subprocess
 import unittest
 
 from swarm_router.solo_autopilot import (
     OpenWebUIGateway,
     Runner,
+    SharedWriterLease,
     Store,
     Task,
+    WriterBusy,
+    WriterLeaseLost,
     final_marker,
+    snapshot,
 )
 
 
@@ -67,6 +72,17 @@ class RejectSed:
         if command.startswith("sed "):
             raise RuntimeError("Command sed is not allowed for implementer.")
         return tool_call
+
+
+class MutatingTerminal:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def execute_tool_call(self, tool_call: dict[str, Any]) -> str:
+        self.path.write_text("changed\n", encoding="utf-8")
+        return json.dumps(
+            {"status": "passed", "exit_code": 0, "output": ""}
+        )
 
 
 class FakeClient:
@@ -130,7 +146,7 @@ class SoloTest(unittest.TestCase):
         ).tick()
         self.assertEqual(first["context_epoch"], 1)
 
-        gateway = FakeGateway([response("Finished.\nREADY_FOR_REVIEW")])
+        gateway = FakeGateway([response("Continue from the checkpoint.\nCONTINUE")])
         second = Runner(
             self.task,
             store,
@@ -141,7 +157,7 @@ class SoloTest(unittest.TestCase):
             2,
             20,
         ).tick()
-        self.assertEqual(second["status"], "ready_for_review")
+        self.assertEqual(second["status"], "continue")
         prompt = gateway.messages[0][1]["content"]
         self.assertIn('"context_epoch": 1', prompt)
         self.assertIn("Inspected repository", prompt)
@@ -169,14 +185,14 @@ class SoloTest(unittest.TestCase):
         second = Runner(
             self.task,
             store,
-            FakeGateway([response("Tests passed.\nREADY_FOR_REVIEW")]),
+            FakeGateway([response("Tests passed.\nCONTINUE")]),
             terminal,
             AllowPolicy(),
             self.repo,
             2,
             20,
         ).tick()
-        self.assertEqual(second["status"], "ready_for_review")
+        self.assertEqual(second["status"], "continue")
         self.assertEqual(terminal.calls[1]["function"]["name"], "get_process_status")
 
     def test_same_sed_rejection_blocks_after_three(self) -> None:
@@ -193,6 +209,128 @@ class SoloTest(unittest.TestCase):
         ).tick()
         self.assertEqual(result["status"], "blocked")
         self.assertIn("three times", result["last_error"])
+
+    def test_ready_gate_rejects_missing_changes_and_evidence(self) -> None:
+        result = Runner(
+            self.task,
+            self.store(),
+            FakeGateway(
+                [
+                    response("Claiming completion.\nREADY_FOR_REVIEW"),
+                    response("More work is required.\nCONTINUE"),
+                ]
+            ),
+            FakeTerminal([]),
+            AllowPolicy(),
+            self.repo,
+            2,
+            20,
+        ).tick()
+        self.assertEqual(result["status"], "continue")
+        self.assertIn("No repository changes are present.", result["last_error"])
+
+    def test_ready_gate_accepts_scoped_change_and_evidence(self) -> None:
+        task = Task(
+            "FG-060",
+            "Unified Agents and Models view",
+            "Build the view.",
+            ("Identity remains stable.",),
+            ("Do not deploy.",),
+            ("allowed",),
+        )
+        store = self.store()
+        runner = Runner(
+            task,
+            store,
+            FakeGateway(
+                [
+                    response(
+                        "Implementation, tests, diff inspection, "
+                        "and self-review are complete.\nREADY_FOR_REVIEW"
+                    )
+                ]
+            ),
+            FakeTerminal([]),
+            AllowPolicy(),
+            self.repo,
+            2,
+            20,
+        )
+        state = runner.initial_state(snapshot(self.repo))
+        state["evidence"] = [
+            {"kind": "focused_test", "success": True},
+            {"kind": "full_test", "success": True},
+            {"kind": "diff", "success": True},
+            {"kind": "status", "success": True},
+        ]
+        store.save(state)
+        allowed = self.repo / "allowed"
+        allowed.mkdir()
+        (allowed / "feature.py").write_text("value = 1\n", encoding="utf-8")
+        result = runner.tick()
+        self.assertEqual(result["status"], "ready_for_review")
+        self.assertEqual(result["writer_lease_id"], "")
+        self.assertTrue(Path(result["review_bundle"]).joinpath("review.md").is_file())
+
+    def test_out_of_scope_edit_blocks_immediately(self) -> None:
+        result = Runner(
+            self.task,
+            self.store(),
+            FakeGateway(
+                [
+                    response(
+                        call=call(
+                            "write-call",
+                            "run_command",
+                            {"command": "printf 'changed\\n' > README.md"},
+                        )
+                    )
+                ]
+            ),
+            MutatingTerminal(self.repo / "README.md"),
+            AllowPolicy(),
+            self.repo,
+            2,
+            20,
+        ).tick()
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("outside task scope", result["last_error"])
+        self.assertEqual(result["writer_lease_id"], "")
+
+    def test_shared_writer_lease_fences_and_detects_loss(self) -> None:
+        database = self.root / "catalog.sqlite3"
+        with sqlite3.connect(database) as db:
+            db.executescript(
+                """
+                CREATE TABLE forge_developer_writer_lock (
+                    workspace TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    lease_id TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE forge_developer_pending_calls (
+                    tool_call_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL
+                );
+                CREATE TABLE forge_developer_runs (
+                    task_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    active_process TEXT NOT NULL DEFAULT '{}'
+                );
+                """
+            )
+        first = SharedWriterLease(database, "solo:FG-060")
+        second = SharedWriterLease(database, "developer:other")
+        first_lock = first.acquire()
+        with self.assertRaises(WriterBusy):
+            second.acquire()
+        first.release(first_lock["lease_id"])
+        second_lock = second.acquire()
+        with self.assertRaises(WriterLeaseLost):
+            first.acquire(first_lock["lease_id"])
+        second.release(second_lock["lease_id"])
 
     def test_dirty_start_blocks(self) -> None:
         (self.repo / "README.md").write_text("dirty\n", encoding="utf-8")
