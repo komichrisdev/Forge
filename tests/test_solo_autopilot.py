@@ -1086,6 +1086,114 @@ class SoloTest(unittest.TestCase):
                 )
             )
 
+    def test_safe_find_pipeline_accepts_relative_root(
+        self,
+    ) -> None:
+        command = (
+            'find . -type f -name "*.py" | head -50'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(command),
+            "rg --files -g '*.py' .",
+        )
+
+    def test_safe_find_pipeline_accepts_relative_json_inventory(
+        self,
+    ) -> None:
+        command = (
+            'find . -type f '
+            '-name "*.py" -o -name "*.js" '
+            '-o -name "*.ts" -o -name "*.tsx" '
+            '-o -name "*.vue" -o -name "*.html" '
+            '-o -name "*.json" | head -80'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(command),
+            (
+                "rg --files -g '*.py' -g '*.js' "
+                "-g '*.ts' -g '*.tsx' -g '*.vue' "
+                "-g '*.html' -g '*.json' ."
+            ),
+        )
+
+    def test_forge_policy_normalizes_observed_v10_relative_variants(
+        self,
+    ) -> None:
+        policy = ForgePolicy.__new__(
+            ForgePolicy
+        )
+        policy.coordinator = (
+            DeveloperCoordinator.__new__(
+                DeveloperCoordinator
+            )
+        )
+        policy.tool_schemas = (
+            PROCESS_TOOL_SCHEMAS
+        )
+
+        commands = (
+            (
+                'find . -type f '
+                '-name "*.py" | head -50'
+            ),
+            (
+                'find . -type f '
+                '-name "*.py" -o -name "*.js" '
+                '-o -name "*.ts" -o -name "*.tsx" '
+                '-o -name "*.vue" -o -name "*.html" '
+                '-o -name "*.json" | head -80'
+            ),
+        )
+
+        for index, command in enumerate(
+            commands,
+            start=1,
+        ):
+            with self.subTest(command=command):
+                valid = policy.validate(
+                    call(
+                        f"relative-inventory-{index}",
+                        "run_command",
+                        {
+                            "command": command,
+                            "cwd": "/tmp",
+                            "wait": 30,
+                        },
+                    )
+                )
+                arguments = json.loads(
+                    valid["function"]["arguments"]
+                )
+
+                self.assertTrue(
+                    arguments["command"].startswith(
+                        "rg --files "
+                    )
+                )
+                self.assertNotIn(
+                    "|",
+                    arguments["command"],
+                )
+                self.assertEqual(
+                    arguments["cwd"],
+                    "/workspace/forge",
+                )
+
+    def test_safe_find_pipeline_rejects_relative_escape(
+        self,
+    ) -> None:
+        command = (
+            'find ../outside -type f '
+            '-name "*.py" | head -50'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(command),
+            "",
+        )
+
     def test_fresh_context_resumes_from_checkpoint(self) -> None:
         store = self.store()
         first = Runner(

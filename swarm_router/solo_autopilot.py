@@ -836,6 +836,7 @@ SAFE_INVENTORY_GLOBS = {
     "*.vue",
     "*.svelte",
     "*.html",
+    "*.json",
 }
 
 
@@ -859,17 +860,16 @@ def safe_inspection_replacement(
     path = tokens[1]
     root = "/workspace/forge"
 
-    if not (
-        path == root
-        or path.startswith(root + "/")
-    ):
+    if path in {".", "./"}:
+        relative_path = "."
+    elif path.startswith("./"):
+        relative_path = path[2:]
+    elif path == root:
+        relative_path = "."
+    elif path.startswith(root + "/"):
+        relative_path = path[len(root) + 1:]
+    else:
         return ""
-
-    relative_path = (
-        "."
-        if path == root
-        else path[len(root) + 1:]
-    )
 
     if (
         not relative_path
