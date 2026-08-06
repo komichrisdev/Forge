@@ -28,6 +28,7 @@ from swarm_router.solo_autopilot import (
     normalized_solo_tool_call,
     policy_recovery_instruction,
     repository_state_digest,
+    safe_git_log_replacement,
     safe_inspection_replacement,
     select_serial_tool_call,
     snapshot,
@@ -1233,6 +1234,213 @@ class SoloTest(unittest.TestCase):
         self.assertEqual(
             safe_inspection_replacement(command),
             "",
+        )
+
+    def test_safe_git_log_normalizes_observed_v12_form(
+        self,
+    ) -> None:
+        self.assertEqual(
+            safe_git_log_replacement(
+                "git log --oneline -5"
+            ),
+            "git log -n 5 --oneline",
+        )
+
+    def test_safe_git_log_accepts_only_bounded_equivalent_forms(
+        self,
+    ) -> None:
+        variants = (
+            "git log -5 --oneline",
+            "git log --oneline -n 5",
+            "git log -n5 --oneline",
+            "git log --oneline --max-count 5",
+            "git log --max-count=5 --oneline",
+            "git --no-pager log --oneline -5",
+            "git log -n 5 --oneline",
+        )
+
+        for command in variants:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    safe_git_log_replacement(command),
+                    "git log -n 5 --oneline",
+                )
+
+    def test_safe_git_log_rejects_unbounded_or_scoped_forms(
+        self,
+    ) -> None:
+        rejected = (
+            "git log --oneline",
+            "git log --oneline -0",
+            "git log --oneline -101",
+            "git log --oneline -5 README.md",
+            "git log --format=%H -5",
+            "git log --oneline -5 -- README.md",
+            "git -C /workspace/forge log --oneline -5",
+        )
+
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    safe_git_log_replacement(command),
+                    "",
+                )
+
+    def test_forge_policy_normalizes_observed_v12_git_log(
+        self,
+    ) -> None:
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = DeveloperCoordinator.__new__(
+            DeveloperCoordinator
+        )
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+
+        valid = policy.validate(
+            call(
+                "observed-v12-log",
+                "run_command",
+                {
+                    "command": "git log --oneline -5",
+                    "cwd": "/tmp",
+                    "wait": 30,
+                },
+            )
+        )
+        arguments = json.loads(
+            valid["function"]["arguments"]
+        )
+
+        self.assertEqual(
+            arguments["command"],
+            "git log -n 5 --oneline",
+        )
+        self.assertEqual(
+            arguments["cwd"],
+            "/workspace/forge",
+        )
+        self.assertEqual(arguments["wait"], 30)
+
+    def test_serial_selection_executes_normalized_v12_git_log(
+        self,
+    ) -> None:
+        first_status = call(
+            "initial-status",
+            "run_command",
+            {
+                "command": "git status --short",
+                "cwd": "/workspace/forge",
+            },
+        )
+        repeated_status = call(
+            "repeated-status",
+            "run_command",
+            {
+                "command": "git status --short",
+                "cwd": "/workspace/forge",
+            },
+        )
+        observed_log = call(
+            "observed-v12-log",
+            "run_command",
+            {
+                "command": "git log --oneline -5",
+                "cwd": "/workspace/forge",
+                "wait": 30,
+            },
+        )
+        gateway = FakeGateway(
+            [
+                response(None, first_status),
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    repeated_status,
+                                    observed_log,
+                                ],
+                            }
+                        }
+                    ],
+                },
+                response(
+                    "Continue after history inspection.\nCONTINUE"
+                ),
+            ]
+        )
+        terminal = FakeTerminal(
+            [
+                {
+                    "status": "done",
+                    "exit_code": 0,
+                    "output": "",
+                },
+                {
+                    "status": "done",
+                    "exit_code": 0,
+                    "output": "abc1234 prior commit",
+                },
+            ]
+        )
+        store = self.store()
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = DeveloperCoordinator.__new__(
+            DeveloperCoordinator
+        )
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+
+        result = Runner(
+            self.task,
+            store,
+            gateway,
+            terminal,
+            policy,
+            self.repo,
+            3,
+            20,
+        ).tick()
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(
+            [item["id"] for item in terminal.calls],
+            ["initial-status", "observed-v12-log"],
+        )
+
+        executed = json.loads(
+            terminal.calls[1]["function"]["arguments"]
+        )
+        self.assertEqual(
+            executed["command"],
+            "git log -n 5 --oneline",
+        )
+
+        events = [
+            json.loads(line)
+            for line in store.events.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(
+            any(
+                event.get("event")
+                == "serial_tool_calls_trimmed"
+                and event.get("selection_reason")
+                == "skipped_redundant_status"
+                for event in events
+            )
+        )
+        self.assertTrue(
+            any(
+                event.get("event")
+                == "tool_call_normalized"
+                and event.get("normalized_command")
+                == "git log -n 5 --oneline"
+                for event in events
+            )
         )
 
     def test_fresh_context_resumes_from_checkpoint(self) -> None:

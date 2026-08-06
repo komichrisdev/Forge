@@ -987,6 +987,100 @@ def safe_inspection_replacement(
     return " ".join(parts)
 
 
+
+def safe_git_log_replacement(
+    command: str,
+) -> str:
+    try:
+        tokens = shlex.split(
+            command,
+            posix=True,
+        )
+    except ValueError:
+        return ""
+
+    if not tokens or tokens[0] != "git":
+        return ""
+
+    index = 1
+
+    if (
+        index < len(tokens)
+        and tokens[index] == "--no-pager"
+    ):
+        index += 1
+
+    if (
+        index >= len(tokens)
+        or tokens[index] != "log"
+    ):
+        return ""
+
+    arguments = tokens[index + 1:]
+
+    if not arguments:
+        return ""
+
+    count: int | None = None
+    oneline = False
+    position = 0
+
+    while position < len(arguments):
+        token = arguments[position]
+
+        if token == "--oneline":
+            if oneline:
+                return ""
+
+            oneline = True
+            position += 1
+            continue
+
+        raw_count = ""
+
+        if token == "-n":
+            if position + 1 >= len(arguments):
+                return ""
+
+            raw_count = arguments[position + 1]
+            position += 2
+        elif (
+            token.startswith("-n")
+            and len(token) > 2
+        ):
+            raw_count = token[2:]
+            position += 1
+        elif re.fullmatch(r"-[1-9]\d*", token):
+            raw_count = token[1:]
+            position += 1
+        elif token == "--max-count":
+            if position + 1 >= len(arguments):
+                return ""
+
+            raw_count = arguments[position + 1]
+            position += 2
+        elif token.startswith("--max-count="):
+            raw_count = token.split("=", 1)[1]
+            position += 1
+        else:
+            return ""
+
+        if count is not None or not raw_count.isdigit():
+            return ""
+
+        count = int(raw_count)
+
+    if (
+        not oneline
+        or count is None
+        or count < 1
+        or count > 100
+    ):
+        return ""
+
+    return f"git log -n {count} --oneline"
+
+
 def normalized_solo_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
     normalized = json.loads(json.dumps(call))
     if call_name(normalized) != "run_command":
@@ -1004,7 +1098,11 @@ def normalized_solo_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
         else ""
     )
     if key:
-        replacement = safe_inspection_replacement(str(arguments[key]))
+        command = str(arguments[key])
+        replacement = (
+            safe_inspection_replacement(command)
+            or safe_git_log_replacement(command)
+        )
         if replacement:
             arguments[key] = replacement
     function["arguments"] = json.dumps(arguments, separators=(",", ":"))
@@ -1117,6 +1215,7 @@ def policy_recovery_instruction(
         "Use exactly one supported command with cwd='/workspace/forge'. "
         "For file inventory, use git ls-files --cached --others "
         "--exclude-standard -- followed by quoted globs and no pipeline. "
+        "For recent history, use git log -n N --oneline with N from 1 to 100. "
         "For text search, use grep -n -m N PATTERN PATH."
     )
 
@@ -1363,7 +1462,8 @@ class Runner:
             "process before starting another. Follow the Forge "
             "implementer command policy exactly.\n\n"
             "Do not use sed or rg. For file inventory use git ls-files --cached --others "
-            "--exclude-standard -- followed by quoted globs and no pipeline. For text "
+            "--exclude-standard -- followed by quoted globs and no pipeline. For recent "
+            "history use exactly git log -n N --oneline with N from 1 to 100. For text "
             "inspection prefer cat, head, tail, or bounded grep such as "
             "grep -n -m 30 PATTERN PATH. Do not use recursive grep, pipelines, compound "
             "commands, command substitution, or arbitrary inline Python. After a policy "
