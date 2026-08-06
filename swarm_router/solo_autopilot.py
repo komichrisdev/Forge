@@ -67,12 +67,30 @@ class WriterLeaseLost(SoloError):
 
 
 class WriterLease(Protocol):
-    def acquire(self, lease_id: str = "") -> dict[str, Any]: ...
-    def release(self, lease_id: str) -> None: ...
+    def acquire(
+        self,
+        lease_id: str = "",
+        *,
+        status: str = "running",
+        active_process: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
+
+    def release(
+        self,
+        lease_id: str,
+        *,
+        status: str = "completed",
+    ) -> None: ...
 
 
 class NoopWriterLease:
-    def acquire(self, lease_id: str = "") -> dict[str, Any]:
+    def acquire(
+        self,
+        lease_id: str = "",
+        *,
+        status: str = "running",
+        active_process: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         return {
             "workspace": "/workspace/forge",
             "task_id": "noop",
@@ -80,7 +98,12 @@ class NoopWriterLease:
             "state": "locked",
         }
 
-    def release(self, lease_id: str) -> None:
+    def release(
+        self,
+        lease_id: str,
+        *,
+        status: str = "completed",
+    ) -> None:
         return None
 
 
@@ -105,7 +128,126 @@ class SharedWriterLease:
         except ValueError:
             return True
 
-    def acquire(self, lease_id: str = "") -> dict[str, Any]:
+    @staticmethod
+    def _run_columns(db: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[1])
+            for row in db.execute(
+                "PRAGMA table_info(forge_developer_runs)"
+            )
+        }
+
+    def _sync_run(
+        self,
+        db: sqlite3.Connection,
+        *,
+        status: str,
+        active_process: Mapping[str, Any] | None,
+        lease_id: str,
+    ) -> None:
+        columns = self._run_columns(db)
+
+        if not columns:
+            raise WriterLeaseLost(
+                "forge_developer_runs is unavailable for Solo fencing."
+            )
+
+        stamp = now()
+        values: dict[str, Any] = {
+            "task_id": self.owner,
+            "status": status,
+            "phase": "solo",
+            "instruction": (
+                "Durable DeepSeek Solo engineering task."
+            ),
+            "instruction_digest": digest(self.owner),
+            "selected_model": DEFAULT_MODEL,
+            "selected_provider": "openwebui",
+            "attempts": "[]",
+            "pending_tool_calls": "[]",
+            "last_tool_summary": "",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "role_models": "{}",
+            "role_outputs": "{}",
+            "changed_files": "[]",
+            "test_state": "not_started",
+            "review_state": (
+                "completed"
+                if status == "ready_for_review"
+                else "not_started"
+            ),
+            "failure_summary": "",
+            "request_shape": "{}",
+            "phase_evidence": "{}",
+            "active_process": json.dumps(
+                dict(active_process or {}),
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            "writer_lease_id": lease_id,
+            "resume_call_id": "",
+            "resume_tool_results": "{}",
+        }
+
+        insert_columns = [
+            name
+            for name in values
+            if name in columns
+        ]
+
+        required = {
+            "task_id",
+            "status",
+            "updated_at",
+            "active_process",
+        }
+
+        if not required.issubset(insert_columns):
+            raise WriterLeaseLost(
+                "forge_developer_runs lacks required Solo fencing columns."
+            )
+
+        update_columns = [
+            name
+            for name in insert_columns
+            if name not in {
+                "task_id",
+                "created_at",
+            }
+        ]
+
+        placeholders = ", ".join(
+            "?"
+            for _ in insert_columns
+        )
+        assignments = ", ".join(
+            f"{name}=excluded.{name}"
+            for name in update_columns
+        )
+
+        db.execute(
+            f"""
+            INSERT INTO forge_developer_runs(
+                {", ".join(insert_columns)}
+            )
+            VALUES ({placeholders})
+            ON CONFLICT(task_id) DO UPDATE SET
+                {assignments}
+            """,
+            tuple(
+                values[name]
+                for name in insert_columns
+            ),
+        )
+
+    def acquire(
+        self,
+        lease_id: str = "",
+        *,
+        status: str = "running",
+        active_process: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         current = datetime.now(timezone.utc)
         expires = current + timedelta(seconds=LOCK_SECONDS)
         selected_lease = lease_id or uuid.uuid4().hex
@@ -178,6 +320,13 @@ class SharedWriterLease:
                         )
                     selected_lease = uuid.uuid4().hex
 
+            self._sync_run(
+                db,
+                status=status,
+                active_process=active_process,
+                lease_id=selected_lease,
+            )
+
             db.execute(
                 """
                 INSERT INTO forge_developer_writer_lock(
@@ -207,11 +356,18 @@ class SharedWriterLease:
             "state": "locked",
         }
 
-    def release(self, lease_id: str) -> None:
+    def release(
+        self,
+        lease_id: str,
+        *,
+        status: str = "completed",
+    ) -> None:
         if not lease_id:
             return
+
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+
             row = db.execute(
                 """
                 SELECT task_id, lease_id
@@ -220,23 +376,88 @@ class SharedWriterLease:
                 """,
                 (self.workspace,),
             ).fetchone()
+
             if not row:
                 raise WriterLeaseLost(
-                    "DeepSeek Solo writer lease disappeared before release."
+                    "DeepSeek Solo writer lease disappeared "
+                    "before release."
                 )
+
             if (
                 str(row["task_id"]) != self.owner
                 or str(row["lease_id"]) != lease_id
             ):
                 raise WriterLeaseLost(
-                    "DeepSeek Solo writer lease token no longer matches."
+                    "DeepSeek Solo writer lease token no "
+                    "longer matches."
                 )
-            db.execute(
+
+            pending = db.execute(
+                """
+                SELECT 1
+                FROM forge_developer_pending_calls
+                WHERE task_id=?
+                LIMIT 1
+                """,
+                (self.owner,),
+            ).fetchone()
+
+            run = db.execute(
+                """
+                SELECT active_process
+                FROM forge_developer_runs
+                WHERE task_id=?
+                """,
+                (self.owner,),
+            ).fetchone()
+
+            try:
+                active = bool(
+                    run
+                    and json.loads(
+                        str(
+                            run["active_process"]
+                            or "{}"
+                        )
+                    )
+                )
+            except (
+                json.JSONDecodeError,
+                TypeError,
+            ):
+                active = True
+
+            if pending or active:
+                raise WriterBusy(
+                    "DeepSeek Solo writer cannot be "
+                    "released with in-flight work."
+                )
+
+            removed = db.execute(
                 """
                 DELETE FROM forge_developer_writer_lock
-                WHERE workspace=? AND task_id=? AND lease_id=?
+                WHERE workspace=?
+                  AND task_id=?
+                  AND lease_id=?
                 """,
-                (self.workspace, self.owner, lease_id),
+                (
+                    self.workspace,
+                    self.owner,
+                    lease_id,
+                ),
+            ).rowcount
+
+            if removed != 1:
+                raise WriterLeaseLost(
+                    "DeepSeek Solo writer lease could not "
+                    "be released by exact token."
+                )
+
+            self._sync_run(
+                db,
+                status=status,
+                active_process={},
+                lease_id="",
             )
 
 
@@ -415,6 +636,84 @@ def path_is_allowed(path: str, allowed_paths: tuple[str, ...]) -> bool:
     return False
 
 
+def repository_state_digest(repo: Path) -> str:
+    hasher = hashlib.sha256()
+
+    for arguments in (
+        ("rev-parse", "HEAD"),
+        ("--no-pager", "diff", "--binary"),
+        ("--no-pager", "diff", "--cached", "--binary"),
+    ):
+        result = git(
+            repo,
+            *arguments,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            raise SoloError(
+                "Could not compute repository state digest: "
+                + bounded(
+                    result.stdout + result.stderr,
+                    1200,
+                )
+            )
+
+        hasher.update(
+            "\0".join(arguments).encode(
+                "utf-8"
+            )
+        )
+        hasher.update(b"\0")
+        hasher.update(
+            result.stdout.encode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+        hasher.update(b"\0")
+
+    untracked = git(
+        repo,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        check=False,
+    )
+
+    if untracked.returncode != 0:
+        raise SoloError(
+            "Could not inspect untracked files for state digest."
+        )
+
+    for relative in sorted(
+        line.strip()
+        for line in untracked.stdout.splitlines()
+        if line.strip()
+    ):
+        hasher.update(
+            relative.encode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+        hasher.update(b"\0")
+
+        path = repo / relative
+
+        if path.is_file():
+            with path.open("rb") as handle:
+                for chunk in iter(
+                    lambda: handle.read(1024 * 1024),
+                    b"",
+                ):
+                    hasher.update(chunk)
+
+        hasher.update(b"\0")
+
+    return hasher.hexdigest()
+
+
 TEST_RE = re.compile(
     r"\b(?:unittest|pytest|npm\s+(?:test|run\s+test))\b",
     re.I,
@@ -426,7 +725,14 @@ FULL_TEST_RE = re.compile(
     r"\bnpm\s+(?:test|run\s+test)\b)",
     re.I,
 )
-DIFF_EVIDENCE_RE = re.compile(r"\bgit\b[^\n]*\bdiff\b", re.I)
+DIFF_EVIDENCE_RE = re.compile(
+    r"\bgit\b[^\n]*\bdiff\b",
+    re.I,
+)
+DIFF_CHECK_RE = re.compile(
+    r"\bgit\b[^\n]*\bdiff\b[^\n]*--check\b",
+    re.I,
+)
 STATUS_EVIDENCE_RE = re.compile(
     r"^\s*git\s+status\s+--short\s*$",
     re.I,
@@ -436,14 +742,22 @@ SUCCESS_STATES = {"completed", "done", "passed", "success", "succeeded"}
 
 def evidence_kind(command: str) -> str:
     normalized = " ".join(command.split())
+
     if FULL_TEST_RE.search(normalized):
         return "full_test"
+
     if TEST_RE.search(normalized):
         return "focused_test"
+
+    if DIFF_CHECK_RE.search(normalized):
+        return "diff_check"
+
     if DIFF_EVIDENCE_RE.search(normalized):
         return "diff"
+
     if STATUS_EVIDENCE_RE.fullmatch(normalized):
         return "status"
+
     return ""
 
 
@@ -685,6 +999,9 @@ class Runner:
             "rejection, choose a supported equivalent and continue with the same model.\n\n"
             "Do not commit, push, deploy, restart services, change systemd state, use sudo, "
             "access credentials, or change tasks. Leave changes uncommitted for external review.\n\n"
+            "Any edit invalidates prior test and review evidence. After the final edit, rerun a "
+            "focused test, the full relevant suite, a real Git diff inspection that is not only "
+            "git diff --check, and exactly git status --short.\n\n"
             "Every response must end with exactly one final line: CONTINUE, READY_FOR_REVIEW, "
             "or BLOCKED. READY_FOR_REVIEW requires implementation, focused tests, relevant full "
             "tests, final diff inspection, and self-review."
@@ -780,6 +1097,9 @@ class Runner:
                         "exit_code": exit_code,
                         "success": exit_code == 0 and status in SUCCESS_STATES,
                         "result_digest": digest(text),
+                        "repository_state_digest": (
+                            repository_state_digest(self.repo)
+                        ),
                     }
                 )
                 state["evidence"] = evidence[-100:]
@@ -845,21 +1165,54 @@ class Runner:
         return count
 
     def renew_writer(self, state: dict[str, Any]) -> None:
-        lock = self.writer.acquire(str(state.get("writer_lease_id", "")))
+        lock = self.writer.acquire(
+            str(state.get("writer_lease_id", "")),
+            status=str(
+                state.get(
+                    "status",
+                    "running",
+                )
+            ),
+            active_process=(
+                state.get("active_process")
+                if isinstance(
+                    state.get("active_process"),
+                    dict,
+                )
+                else {}
+            ),
+        )
         state["writer_lease_id"] = str(lock.get("lease_id", ""))
         if not state["writer_lease_id"]:
             raise WriterLeaseLost(
                 "Forge writer acquisition returned no lease token."
             )
 
-    def release_writer(self, state: dict[str, Any]) -> None:
-        lease_id = str(state.get("writer_lease_id", ""))
+    def release_writer(
+        self,
+        state: dict[str, Any],
+    ) -> None:
+        lease_id = str(
+            state.get(
+                "writer_lease_id",
+                "",
+            )
+        )
+
         if not lease_id:
             return
-        try:
-            self.writer.release(lease_id)
-        finally:
-            state["writer_lease_id"] = ""
+
+        self.writer.release(
+            lease_id,
+            status=str(
+                state.get(
+                    "status",
+                    "completed",
+                )
+            ),
+        )
+
+        state["writer_lease_id"] = ""
 
     def scope_issues(self) -> list[str]:
         changed = repository_changed_paths(self.repo)
@@ -901,16 +1254,29 @@ class Runner:
         issues.extend(self.scope_issues())
         if int(snap.get("diff_check_rc", 1)) != 0:
             issues.append("git diff --check is not clean.")
-        requirements = (
-            ("focused_test", "No successful focused test is recorded."),
-            ("full_test", "No successful full relevant test suite is recorded."),
-            ("diff", "No successful final Git diff inspection is recorded."),
-            ("status", "No successful final git status --short inspection is recorded."),
+        current_digest = repository_state_digest(
+            self.repo
         )
+        requirements = (
+            ("focused_test", "No successful focused test is recorded for the current repository state."),
+            ("full_test", "No successful full relevant test suite is recorded for the current repository state."),
+            ("diff", "No successful final Git diff inspection is recorded for the current repository state."),
+            ("status", "No successful final git status --short inspection is recorded for the current repository state."),
+        )
+
         for kind, message in requirements:
             item = self.latest_evidence(state, kind)
-            if not item or not item.get("success"):
+
+            if (
+                not item
+                or not item.get("success")
+                or item.get(
+                    "repository_state_digest"
+                )
+                != current_digest
+            ):
                 issues.append(message)
+
         return issues
 
     def block_for_scope(
@@ -919,12 +1285,33 @@ class Runner:
         event: str,
     ) -> dict[str, Any] | None:
         issues = self.scope_issues()
+
         if not issues:
             return None
+
+        state["last_error"] = "; ".join(
+            issues
+        )
+
+        if state.get("active_process"):
+            state["status"] = "continue"
+            self.store.beat(
+                state,
+                event,
+                issues=issues,
+                writer_retained=True,
+                active_process=True,
+            )
+            return dict(state)
+
         state["status"] = "blocked"
-        state["last_error"] = "; ".join(issues)
         self.release_writer(state)
-        self.store.beat(state, event, issues=issues)
+        self.store.beat(
+            state,
+            event,
+            issues=issues,
+            writer_retained=False,
+        )
         return dict(state)
 
     def review_bundle(self, state: dict[str, Any], snap: Mapping[str, Any]) -> None:
@@ -992,29 +1379,8 @@ class Runner:
             state["writer_lease_id"] = ""
             self.store.beat(state, "writer_lease_lost")
             return dict(state)
-        scope_block = self.block_for_scope(
-            state,
-            "preexisting_scope_violation",
-        )
-        if scope_block is not None:
-            return scope_block
 
-        retry_after = str(state.get("retry_after", ""))
-        if retry_after:
-            try:
-                retry_time = datetime.fromisoformat(retry_after)
-            except ValueError:
-                retry_time = None
-            if retry_time and retry_time > datetime.now(timezone.utc):
-                return dict(state)
-            state["retry_after"] = ""
 
-        if int(state.get("total_rounds", 0)) >= self.max_rounds:
-            state["status"] = "blocked"
-            state["last_error"] = "Maximum total model rounds reached."
-            self.release_writer(state)
-            self.store.beat(state, "max_rounds")
-            return dict(state)
 
         state["status"] = "running"
         self.store.beat(state, "tick_started", model=self.gateway.model_id)
@@ -1023,6 +1389,30 @@ class Runner:
             if state.get("active_process") and self.poll(state):
                 state["status"] = "continue"
                 self.store.beat(state, "waiting_for_process")
+                return dict(state)
+
+            scope_block = self.block_for_scope(
+                state,
+                "preexisting_scope_violation",
+            )
+            if scope_block is not None:
+                return scope_block
+
+            retry_after = str(state.get("retry_after", ""))
+            if retry_after:
+                try:
+                    retry_time = datetime.fromisoformat(retry_after)
+                except ValueError:
+                    retry_time = None
+                if retry_time and retry_time > datetime.now(timezone.utc):
+                    return dict(state)
+                state["retry_after"] = ""
+
+            if int(state.get("total_rounds", 0)) >= self.max_rounds:
+                state["status"] = "blocked"
+                state["last_error"] = "Maximum total model rounds reached."
+                self.release_writer(state)
+                self.store.beat(state, "max_rounds")
                 return dict(state)
 
             snap = snapshot(self.repo)

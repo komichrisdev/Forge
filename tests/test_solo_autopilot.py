@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -16,7 +17,9 @@ from swarm_router.solo_autopilot import (
     Task,
     WriterBusy,
     WriterLeaseLost,
+    evidence_kind,
     final_marker,
+    repository_state_digest,
     snapshot,
 )
 
@@ -231,46 +234,41 @@ class SoloTest(unittest.TestCase):
 
     def test_ready_gate_accepts_scoped_change_and_evidence(self) -> None:
         task = Task(
-            "FG-060",
-            "Unified Agents and Models view",
-            "Build the view.",
-            ("Identity remains stable.",),
-            ("Do not deploy.",),
-            ("allowed",),
+            "FG-060", "Unified Agents and Models view", "Build the view.",
+            ("Identity remains stable.",), ("Do not deploy.",), ("allowed",),
         )
         store = self.store()
         runner = Runner(
             task,
             store,
-            FakeGateway(
-                [
-                    response(
-                        "Implementation, tests, diff inspection, "
-                        "and self-review are complete.\nREADY_FOR_REVIEW"
-                    )
-                ]
-            ),
-            FakeTerminal([]),
-            AllowPolicy(),
-            self.repo,
-            2,
-            20,
+            FakeGateway([
+                response(
+                    "Implementation, tests, diff inspection, and self-review "
+                    "are complete.\nREADY_FOR_REVIEW"
+                )
+            ]),
+            FakeTerminal([]), AllowPolicy(), self.repo, 2, 20,
         )
         state = runner.initial_state(snapshot(self.repo))
-        state["evidence"] = [
-            {"kind": "focused_test", "success": True},
-            {"kind": "full_test", "success": True},
-            {"kind": "diff", "success": True},
-            {"kind": "status", "success": True},
-        ]
-        store.save(state)
         allowed = self.repo / "allowed"
         allowed.mkdir()
         (allowed / "feature.py").write_text("value = 1\n", encoding="utf-8")
+        state_digest = repository_state_digest(self.repo)
+        state["evidence"] = [
+            {
+                "kind": kind,
+                "success": True,
+                "repository_state_digest": state_digest,
+            }
+            for kind in ("focused_test", "full_test", "diff", "status")
+        ]
+        store.save(state)
         result = runner.tick()
         self.assertEqual(result["status"], "ready_for_review")
         self.assertEqual(result["writer_lease_id"], "")
-        self.assertTrue(Path(result["review_bundle"]).joinpath("review.md").is_file())
+        self.assertTrue(
+            Path(result["review_bundle"]).joinpath("review.md").is_file()
+        )
 
     def test_out_of_scope_edit_blocks_immediately(self) -> None:
         result = Runner(
@@ -297,9 +295,17 @@ class SoloTest(unittest.TestCase):
         self.assertIn("outside task scope", result["last_error"])
         self.assertEqual(result["writer_lease_id"], "")
 
-    def test_shared_writer_lease_fences_and_detects_loss(self) -> None:
-        database = self.root / "catalog.sqlite3"
-        with sqlite3.connect(database) as db:
+    def test_shared_writer_lease_fences_and_detects_loss(
+        self,
+    ) -> None:
+        database = (
+            self.root
+            / "catalog.sqlite3"
+        )
+
+        with sqlite3.connect(
+            database
+        ) as db:
             db.executescript(
                 """
                 CREATE TABLE forge_developer_writer_lock (
@@ -309,31 +315,337 @@ class SoloTest(unittest.TestCase):
                     expires_at TEXT NOT NULL,
                     lease_id TEXT NOT NULL DEFAULT ''
                 );
+
                 CREATE TABLE forge_developer_pending_calls (
                     tool_call_id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL
                 );
+
                 CREATE TABLE forge_developer_runs (
                     task_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    active_process TEXT NOT NULL DEFAULT '{}'
+                    active_process TEXT NOT NULL DEFAULT '{}',
+                    writer_lease_id TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
-        first = SharedWriterLease(database, "solo:FG-060")
-        second = SharedWriterLease(database, "developer:other")
-        first_lock = first.acquire()
-        with self.assertRaises(WriterBusy):
+
+        first = SharedWriterLease(
+            database,
+            "solo:FG-060",
+        )
+        second = SharedWriterLease(
+            database,
+            "developer:other",
+        )
+
+        first_lock = first.acquire(
+            status="running",
+            active_process={
+                "process_id": "process-1",
+                "status": "running",
+            },
+        )
+
+        with sqlite3.connect(
+            database
+        ) as db:
+            db.execute(
+                """
+                UPDATE forge_developer_writer_lock
+                SET expires_at=?
+                WHERE workspace='/workspace/forge'
+                """,
+                (
+                    (
+                        datetime.now(
+                            timezone.utc
+                        )
+                        - timedelta(
+                            seconds=1
+                        )
+                    ).isoformat(),
+                ),
+            )
+
+        with self.assertRaises(
+            WriterBusy
+        ):
             second.acquire()
-        first.release(first_lock["lease_id"])
+
+        with self.assertRaises(
+            WriterBusy
+        ):
+            first.release(
+                first_lock["lease_id"],
+                status="blocked",
+            )
+
+        with sqlite3.connect(
+            database
+        ) as db:
+            lock_row = db.execute(
+                """
+                SELECT task_id, lease_id
+                FROM forge_developer_writer_lock
+                WHERE workspace='/workspace/forge'
+                """
+            ).fetchone()
+
+            run_row = db.execute(
+                """
+                SELECT
+                    active_process,
+                    writer_lease_id
+                FROM forge_developer_runs
+                WHERE task_id='solo:FG-060'
+                """
+            ).fetchone()
+
+        self.assertEqual(
+            lock_row,
+            (
+                "solo:FG-060",
+                first_lock["lease_id"],
+            ),
+        )
+        self.assertEqual(
+            json.loads(run_row[0])["process_id"],
+            "process-1",
+        )
+        self.assertEqual(
+            run_row[1],
+            first_lock["lease_id"],
+        )
+
+        first.acquire(
+            first_lock["lease_id"],
+            status="running",
+            active_process={},
+        )
+        first.release(
+            first_lock["lease_id"],
+            status="blocked",
+        )
+
         second_lock = second.acquire()
-        with self.assertRaises(WriterLeaseLost):
-            first.acquire(first_lock["lease_id"])
-        second.release(second_lock["lease_id"])
+
+        with self.assertRaises(
+            WriterLeaseLost
+        ):
+            first.acquire(
+                first_lock["lease_id"]
+            )
+
+        second.release(
+            second_lock["lease_id"]
+        )
+
+    def test_diff_check_is_not_final_diff_evidence(self) -> None:
+        self.assertEqual(
+            evidence_kind("git --no-pager diff --check"),
+            "diff_check",
+        )
+        self.assertEqual(
+            evidence_kind("git --no-pager diff --stat"),
+            "diff",
+        )
+
+
+    def test_later_edit_invalidates_prior_evidence(self) -> None:
+        task = Task(
+            "FG-060", "Unified Agents and Models view", "Build the view.",
+            ("Identity remains stable.",), ("Do not deploy.",), ("allowed",),
+        )
+        runner = Runner(
+            task, self.store(), FakeGateway([]), FakeTerminal([]),
+            AllowPolicy(), self.repo, 2, 20,
+        )
+        allowed = self.repo / "allowed"
+        allowed.mkdir()
+        feature = allowed / "feature.py"
+        feature.write_text("value = 1\n", encoding="utf-8")
+        state_digest = repository_state_digest(self.repo)
+        state = runner.initial_state(snapshot(self.repo))
+        state["evidence"] = [
+            {
+                "kind": kind,
+                "success": True,
+                "repository_state_digest": state_digest,
+            }
+            for kind in ("focused_test", "full_test", "diff", "status")
+        ]
+        self.assertEqual(runner.readiness_issues(state, snapshot(self.repo)), [])
+        feature.write_text("value = 2\n", encoding="utf-8")
+        issues = runner.readiness_issues(state, snapshot(self.repo))
+        self.assertTrue(issues)
+        self.assertTrue(
+            all("current repository state" in issue for issue in issues)
+        )
+
+
+    def test_scope_block_retains_writer_while_process_active(
+        self,
+    ) -> None:
+        task = Task(
+            "FG-060",
+            "Unified Agents and Models view",
+            "Build the view.",
+            ("Identity remains stable.",),
+            ("Do not deploy.",),
+            ("allowed",),
+        )
+
+        runner = Runner(
+            task,
+            self.store(),
+            FakeGateway([]),
+            FakeTerminal([]),
+            AllowPolicy(),
+            self.repo,
+            2,
+            20,
+        )
+
+        state = runner.initial_state(
+            snapshot(self.repo)
+        )
+        state["writer_lease_id"] = "noop"
+        state["active_process"] = {
+            "process_id": "process-1",
+            "status": "running",
+        }
+
+        (
+            self.repo
+            / "README.md"
+        ).write_text(
+            "out of scope\n",
+            encoding="utf-8",
+        )
+
+        result = runner.block_for_scope(
+            state,
+            "scope_probe",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result["status"],
+            "continue",
+        )
+        self.assertEqual(
+            result["writer_lease_id"],
+            "noop",
+        )
+        self.assertEqual(
+            result["active_process"]["process_id"],
+            "process-1",
+        )
+
+
+    def test_release_writer_preserves_token_on_failure(
+        self,
+    ) -> None:
+        class RejectRelease:
+            def release(
+                self,
+                lease_id: str,
+                *,
+                status: str = "completed",
+            ) -> None:
+                raise WriterLeaseLost(
+                    "simulated exact-token mismatch"
+                )
+
+        runner = Runner.__new__(Runner)
+        runner.writer = RejectRelease()
+
+        state = {
+            "status": "blocked",
+            "writer_lease_id": "exact-token",
+        }
+
+        with self.assertRaises(
+            WriterLeaseLost
+        ):
+            runner.release_writer(state)
+
+        self.assertEqual(
+            state["writer_lease_id"],
+            "exact-token",
+        )
+
+
+    def test_max_rounds_polls_active_process_before_blocking(
+        self,
+    ) -> None:
+        store = self.store()
+        terminal = FakeTerminal(
+            [
+                {
+                    "id": "process-1",
+                    "status": "passed",
+                    "exit_code": 0,
+                    "output": "done",
+                    "next_offset": 1,
+                }
+            ]
+        )
+
+        runner = Runner(
+            self.task,
+            store,
+            FakeGateway([]),
+            terminal,
+            AllowPolicy(),
+            self.repo,
+            2,
+            1,
+        )
+
+        state = runner.initial_state(
+            snapshot(self.repo)
+        )
+        state["total_rounds"] = 1
+        state["active_process"] = {
+            "process_id": "process-1",
+            "status": "running",
+            "next_offset": 0,
+            "command": "python3 -m unittest",
+        }
+        store.save(state)
+
+        result = runner.tick()
+
+        self.assertEqual(
+            terminal.calls[0]["function"]["name"],
+            "get_process_status",
+        )
+        self.assertEqual(
+            result["active_process"],
+            {},
+        )
+        self.assertEqual(
+            result["status"],
+            "blocked",
+        )
+        self.assertIn(
+            "Maximum total model rounds",
+            result["last_error"],
+        )
+
 
     def test_dirty_start_blocks(self) -> None:
-        (self.repo / "README.md").write_text("dirty\n", encoding="utf-8")
+        (
+            self.repo
+            / "README.md"
+        ).write_text(
+            "dirty\n",
+            encoding="utf-8",
+        )
+
         result = Runner(
             self.task,
             self.store(),
@@ -344,7 +656,11 @@ class SoloTest(unittest.TestCase):
             2,
             20,
         ).tick()
-        self.assertEqual(result["status"], "blocked")
+
+        self.assertEqual(
+            result["status"],
+            "blocked",
+        )
 
 
 if __name__ == "__main__":

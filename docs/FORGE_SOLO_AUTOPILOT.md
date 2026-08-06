@@ -50,3 +50,31 @@ The runner also participates in the existing
 `forge_developer_writer_lock` table. It renews the exact 30-minute lease before
 model requests and terminal work, stops if the lease token is lost, and releases
 the lease only on a terminal review or blocked state.
+
+
+## Evidence freshness and orphan fencing
+
+Every successful test, diff inspection, and status inspection is bound to a
+digest of the current `HEAD`, tracked diff, staged diff, and untracked file
+contents. Any later repository edit invalidates earlier evidence.
+
+`git diff --check` is recorded separately and cannot satisfy the final diff
+inspection requirement.
+
+While Solo owns the shared writer lease, it also maintains a legitimate
+`forge_developer_runs` row containing its exact lease token and durable active
+process state. Existing developer stale-lock recovery therefore remains fenced
+when an expired Solo lease still has an unresolved process.
+
+
+## Active-process release fencing
+
+Solo never releases the shared writer while its durable run row reports an
+active process or while a pending callback exists. Scope violations retain the
+exact lease until the process reaches a terminal result. Process polling also
+precedes maximum-round handling, so context limits cannot orphan an active
+writer.
+
+The durable lease token is cleared only after an exact-token release succeeds.
+A busy or mismatched release leaves the token intact for diagnosis and safe
+recovery.
