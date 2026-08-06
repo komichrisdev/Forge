@@ -195,6 +195,150 @@ class SoloTest(unittest.TestCase):
             "object",
         )
 
+    def test_multiple_tool_calls_execute_only_first_and_continue_serially(
+        self,
+    ) -> None:
+        first = call(
+            "first-call",
+            "run_command",
+            {"command": "pwd"},
+        )
+        second = call(
+            "second-call",
+            "run_command",
+            {"command": "git status --short"},
+        )
+        gateway = FakeGateway(
+            [
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    first,
+                                    second,
+                                ],
+                            }
+                        }
+                    ],
+                },
+                response(
+                    "Continue after the accepted first call.\nCONTINUE"
+                ),
+            ]
+        )
+        terminal = FakeTerminal(
+            [
+                {
+                    "status": "passed",
+                    "exit_code": 0,
+                    "output": "/workspace/forge",
+                }
+            ]
+        )
+        store = self.store()
+
+        result = Runner(
+            self.task,
+            store,
+            gateway,
+            terminal,
+            AllowPolicy(),
+            self.repo,
+            2,
+            20,
+        ).tick()
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(result["total_tool_calls"], 1)
+        self.assertEqual(len(terminal.calls), 1)
+        self.assertEqual(terminal.calls[0]["id"], "first-call")
+        self.assertEqual(
+            len(gateway.messages[1][2]["tool_calls"]),
+            1,
+        )
+        self.assertEqual(
+            gateway.messages[1][2]["tool_calls"][0]["id"],
+            "first-call",
+        )
+        self.assertEqual(
+            gateway.messages[1][3]["tool_call_id"],
+            "first-call",
+        )
+        self.assertIn(
+            "accepted and executed only the first tool call",
+            gateway.messages[1][4]["content"],
+        )
+
+        events = [
+            json.loads(line)
+            for line in store.events.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        trimmed = [
+            event
+            for event in events
+            if event.get("event")
+            == "serial_tool_calls_trimmed"
+        ]
+        self.assertEqual(len(trimmed), 1)
+        self.assertEqual(trimmed[0]["ignored_calls"], 1)
+
+    def test_shared_writer_lease_records_actual_pinned_model(
+        self,
+    ) -> None:
+        database = self.root / "model-ledger.sqlite3"
+
+        with sqlite3.connect(database) as db:
+            db.executescript(
+                "CREATE TABLE forge_developer_writer_lock ("
+                "workspace TEXT PRIMARY KEY,"
+                "task_id TEXT NOT NULL,"
+                "acquired_at TEXT NOT NULL,"
+                "expires_at TEXT NOT NULL,"
+                "lease_id TEXT NOT NULL DEFAULT ''"
+                ");"
+                "CREATE TABLE forge_developer_pending_calls ("
+                "tool_call_id TEXT PRIMARY KEY,"
+                "task_id TEXT NOT NULL"
+                ");"
+                "CREATE TABLE forge_developer_runs ("
+                "task_id TEXT PRIMARY KEY,"
+                "status TEXT NOT NULL,"
+                "selected_model TEXT NOT NULL DEFAULT '',"
+                "updated_at TEXT NOT NULL,"
+                "active_process TEXT NOT NULL DEFAULT '{}',"
+                "writer_lease_id TEXT NOT NULL DEFAULT ''"
+                ");"
+            )
+
+        model = "deepseek-ai/deepseek-v4-flash"
+        writer = SharedWriterLease(
+            database,
+            "solo:FG-060",
+            model,
+        )
+        lock = writer.acquire()
+
+        with sqlite3.connect(database) as db:
+            selected_model = db.execute(
+                "SELECT selected_model "
+                "FROM forge_developer_runs "
+                "WHERE task_id='solo:FG-060'"
+            ).fetchone()[0]
+
+        self.assertEqual(selected_model, model)
+
+        writer.release(
+            lock["lease_id"],
+            status="blocked",
+        )
+
     def test_fresh_context_resumes_from_checkpoint(self) -> None:
         store = self.store()
         first = Runner(

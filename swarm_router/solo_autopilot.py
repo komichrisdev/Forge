@@ -112,9 +112,15 @@ class SharedWriterLease:
 
     workspace = "/workspace/forge"
 
-    def __init__(self, database: Path, owner: str) -> None:
+    def __init__(
+        self,
+        database: Path,
+        owner: str,
+        model_id: str = DEFAULT_MODEL,
+    ) -> None:
         self.database = database.expanduser()
         self.owner = owner
+        self.model_id = model_id
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.database, timeout=30)
@@ -161,7 +167,7 @@ class SharedWriterLease:
                 "Durable DeepSeek Solo engineering task."
             ),
             "instruction_digest": digest(self.owner),
-            "selected_model": DEFAULT_MODEL,
+            "selected_model": self.model_id,
             "selected_provider": "openwebui",
             "attempts": "[]",
             "pending_tool_calls": "[]",
@@ -1490,19 +1496,38 @@ class Runner:
                 state["last_response"] = bounded(content, 5000)
 
                 if calls:
-                    if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
-                        state["status"] = "continue"
-                        state["context_epoch"] = int(state.get("context_epoch", 0)) + 1
-                        state["last_error"] = "DeepSeek requested multiple tool calls in one turn."
-                        self.store.beat(state, "serial_tool_retry")
-                        return dict(state)
+                    if (
+                        not isinstance(calls, list)
+                        or not calls
+                        or not all(
+                            isinstance(item, dict)
+                            for item in calls
+                        )
+                    ):
+                        raise SoloError(
+                            "Provider returned malformed tool calls."
+                        )
 
+                    ignored_calls = len(calls) - 1
                     call = calls[0]
                     call_id = str(call.get("id", "")).strip()
                     if not call_id:
                         raise SoloError("Tool call has no ID.")
 
-                    assistant = {"role": "assistant", "content": content, "tool_calls": calls}
+                    assistant = {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": [call],
+                    }
+
+                    if ignored_calls:
+                        self.store.beat(
+                            state,
+                            "serial_tool_calls_trimmed",
+                            accepted_call_id=call_id,
+                            accepted_tool=call_name(call),
+                            ignored_calls=ignored_calls,
+                        )
 
                     try:
                         valid = self.policy.validate(call)
@@ -1552,10 +1577,35 @@ class Runner:
                     messages.extend(
                         [
                             assistant,
-                            {"role": "tool", "tool_call_id": call_id, "content": result},
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": result,
+                            },
                         ]
                     )
-                    self.store.beat(state, "tool_finished", tool=call_name(valid))
+
+                    if ignored_calls:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The server accepted and executed only "
+                                    "the first tool call from your previous "
+                                    "response. Request at most one tool call "
+                                    "per turn. Continue with the next required "
+                                    "operation only after reviewing the tool "
+                                    "result."
+                                ),
+                            }
+                        )
+
+                    self.store.beat(
+                        state,
+                        "tool_finished",
+                        tool=call_name(valid),
+                        ignored_calls=ignored_calls,
+                    )
                     if state.get("active_process"):
                         state["status"] = "continue"
                         self.store.beat(state, "process_persisted")
@@ -1735,6 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
         writer=SharedWriterLease(
             args.catalog,
             f"solo:{task.task_id}",
+            args.model,
         ),
     )
     print(json.dumps(runner.tick(), indent=2, ensure_ascii=False, default=str))
