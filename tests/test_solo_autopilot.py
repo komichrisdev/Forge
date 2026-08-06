@@ -354,7 +354,7 @@ class SoloTest(unittest.TestCase):
             "inventory-call",
             "run_command",
             {
-                "command": "rg --files -g '*.py' .",
+                "command": "git ls-files --cached --others --exclude-standard -- '*.py'",
                 "cwd": "/workspace/forge",
             },
         )
@@ -465,7 +465,7 @@ class SoloTest(unittest.TestCase):
         inventory = call(
             "inventory",
             "run_command",
-            {"command": "rg --files ."},
+            {"command": "git ls-files --cached --others --exclude-standard -- '*'"},
         )
 
         selected, index, reason = select_serial_tool_call(
@@ -506,7 +506,7 @@ class SoloTest(unittest.TestCase):
         inventory = call(
             "inventory",
             "run_command",
-            {"command": "rg --files ."},
+            {"command": "git ls-files --cached --others --exclude-standard -- '*'"},
         )
 
         selected, index, reason = select_serial_tool_call(
@@ -789,14 +789,14 @@ class SoloTest(unittest.TestCase):
             3,
         )
 
-    def test_safe_find_pipeline_has_exact_rg_replacement(self) -> None:
+    def test_safe_find_pipeline_has_exact_git_replacement(self) -> None:
         command = (
             'find /workspace/forge/swarm_router '
             '-type f -name "*.py" | head -30'
         )
         self.assertEqual(
             safe_inspection_replacement(command),
-            "rg --files -g '*.py' swarm_router",
+            "git ls-files --cached --others --exclude-standard -- 'swarm_router/*.py'",
         )
 
     def test_forge_policy_forces_workspace_and_normalizes_safe_find(self) -> None:
@@ -817,7 +817,7 @@ class SoloTest(unittest.TestCase):
         )
         valid = policy.validate(original)
         arguments = json.loads(valid["function"]["arguments"])
-        self.assertEqual(arguments["command"], "rg --files -g '*.py' swarm_router")
+        self.assertEqual(arguments["command"], "git ls-files --cached --others --exclude-standard -- 'swarm_router/*.py'")
         self.assertEqual(arguments["cwd"], "/workspace/forge")
         self.assertEqual(arguments["wait"], 30)
         self.assertEqual(json.loads(original["function"]["arguments"])["cwd"], "/tmp")
@@ -897,7 +897,7 @@ class SoloTest(unittest.TestCase):
             gateway.messages[1][2]["tool_calls"][0]["function"]["arguments"]
         )
         expected = {
-            "command": "rg --files -g '*.py' swarm_router",
+            "command": "git ls-files --cached --others --exclude-standard -- 'swarm_router/*.py'",
             "cwd": "/workspace/forge",
             "wait": 30,
         }
@@ -915,7 +915,7 @@ class SoloTest(unittest.TestCase):
         self.assertEqual(len(normalized_events), 1)
         self.assertEqual(
             normalized_events[0]["normalized_command"],
-            "rg --files -g '*.py' swarm_router",
+            "git ls-files --cached --others --exclude-standard -- 'swarm_router/*.py'",
         )
 
     def test_policy_recovery_names_exact_supported_equivalent(self) -> None:
@@ -935,7 +935,7 @@ class SoloTest(unittest.TestCase):
             RuntimeError("policy rejected"),
         )
         self.assertIn("Do not repeat the rejected command", instruction)
-        self.assertIn("rg --files -g '*.py' swarm_router", instruction)
+        self.assertIn("git ls-files --cached --others --exclude-standard -- 'swarm_router/*.py'", instruction)
         self.assertIn("cwd='/workspace/forge'", instruction)
 
     def test_safe_find_pipeline_accepts_maxdepth_variant(
@@ -948,7 +948,7 @@ class SoloTest(unittest.TestCase):
 
         self.assertEqual(
             safe_inspection_replacement(command),
-            "rg --files -g '*.py' .",
+            "git ls-files --cached --others --exclude-standard -- '*.py'",
         )
 
     def test_safe_find_pipeline_accepts_multiple_glob_variant(
@@ -965,9 +965,10 @@ class SoloTest(unittest.TestCase):
         self.assertEqual(
             safe_inspection_replacement(command),
             (
-                "rg --files -g '*.py' -g '*.js' "
-                "-g '*.ts' -g '*.tsx' -g '*.vue' "
-                "-g '*.html' ."
+                "git ls-files --cached --others "
+                "--exclude-standard -- '*.py' '*.js' "
+                "'*.ts' '*.tsx' '*.vue' "
+                "'*.html'"
             ),
         )
 
@@ -1032,7 +1033,7 @@ class SoloTest(unittest.TestCase):
 
                 self.assertTrue(
                     arguments["command"].startswith(
-                        "rg --files "
+                        "git ls-files "
                     )
                 )
                 self.assertNotIn(
@@ -1095,7 +1096,7 @@ class SoloTest(unittest.TestCase):
 
         self.assertEqual(
             safe_inspection_replacement(command),
-            "rg --files -g '*.py' .",
+            "git ls-files --cached --others --exclude-standard -- '*.py'",
         )
 
     def test_safe_find_pipeline_accepts_relative_json_inventory(
@@ -1112,10 +1113,50 @@ class SoloTest(unittest.TestCase):
         self.assertEqual(
             safe_inspection_replacement(command),
             (
-                "rg --files -g '*.py' -g '*.js' "
-                "-g '*.ts' -g '*.tsx' -g '*.vue' "
-                "-g '*.html' -g '*.json' ."
+                "git ls-files --cached --others "
+                "--exclude-standard -- '*.py' '*.js' "
+                "'*.ts' '*.tsx' '*.vue' "
+                "'*.html' '*.json'"
             ),
+        )
+
+    def test_safe_find_pipeline_accepts_observed_metadata_globs(
+        self,
+    ) -> None:
+        command = (
+            'find /workspace/forge -maxdepth 1 -type f '
+            '-name "*.py" -o -name "*.json" '
+            '-o -name "*.toml" -o -name "*.md" '
+            '| head -30'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(command),
+            (
+                "git ls-files --cached --others "
+                "--exclude-standard -- '*.py' '*.json' "
+                "'*.toml' '*.md'"
+            ),
+        )
+
+    def test_inventory_replacement_uses_git_without_rg(
+        self,
+    ) -> None:
+        replacement = safe_inspection_replacement(
+            (
+                'find . -type f -name "*.py" '
+                '| head -50'
+            )
+        )
+
+        self.assertTrue(
+            replacement.startswith(
+                "git ls-files "
+            )
+        )
+        self.assertNotIn(
+            "rg",
+            replacement.split(),
         )
 
     def test_forge_policy_normalizes_observed_v10_relative_variants(
@@ -1169,7 +1210,7 @@ class SoloTest(unittest.TestCase):
 
                 self.assertTrue(
                     arguments["command"].startswith(
-                        "rg --files "
+                        "git ls-files "
                     )
                 )
                 self.assertNotIn(

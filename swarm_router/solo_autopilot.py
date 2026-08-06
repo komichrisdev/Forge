@@ -837,6 +837,8 @@ SAFE_INVENTORY_GLOBS = {
     "*.svelte",
     "*.html",
     "*.json",
+    "*.toml",
+    "*.md",
 }
 
 
@@ -963,19 +965,24 @@ def safe_inspection_replacement(
     if limit < 1 or limit > 200:
         return ""
 
-    parts = ["rg", "--files"]
+    parts = [
+        "git",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "--",
+    ]
 
     for pattern in patterns:
-        parts.extend(
-            [
-                "-g",
-                shlex.quote(pattern),
-            ]
+        pathspec = (
+            pattern
+            if relative_path == "."
+            else f"{relative_path.rstrip('/')}/{pattern}"
         )
-
-    parts.append(
-        shlex.quote(relative_path)
-    )
+        parts.append(
+            shlex.quote(pathspec)
+        )
 
     return " ".join(parts)
 
@@ -1108,8 +1115,9 @@ def policy_recovery_instruction(
         "Do not repeat the rejected command. "
         f"The policy error was: {bounded(error, 500)}. "
         "Use exactly one supported command with cwd='/workspace/forge'. "
-        "For file inventory, use rg --files with an optional -g glob and no pipeline. "
-        "For text search, use rg or grep -n -m N PATTERN PATH."
+        "For file inventory, use git ls-files --cached --others "
+        "--exclude-standard -- followed by quoted globs and no pipeline. "
+        "For text search, use grep -n -m N PATTERN PATH."
     )
 
 
@@ -1354,9 +1362,10 @@ class Runner:
             "model turn. Start no more than one process per model turn and poll a running "
             "process before starting another. Follow the Forge "
             "implementer command policy exactly.\n\n"
-            "Do not use sed. For file inventory use rg --files with optional -g globs and "
-            "no pipeline. For text inspection prefer cat, head, tail, rg, or bounded grep such "
-            "as grep -n -m 30 PATTERN PATH. Do not use recursive grep, pipelines, compound "
+            "Do not use sed or rg. For file inventory use git ls-files --cached --others "
+            "--exclude-standard -- followed by quoted globs and no pipeline. For text "
+            "inspection prefer cat, head, tail, or bounded grep such as "
+            "grep -n -m 30 PATTERN PATH. Do not use recursive grep, pipelines, compound "
             "commands, command substitution, or arbitrary inline Python. After a policy "
             "rejection, choose a supported equivalent and continue with the same model.\n\n"
             "Do not commit, push, deploy, restart services, change systemd state, use sudo, "
