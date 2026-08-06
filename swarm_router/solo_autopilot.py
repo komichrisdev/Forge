@@ -1004,6 +1004,93 @@ def normalized_solo_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+
+def exact_status_call(
+    call: Mapping[str, Any],
+) -> bool:
+    normalized = normalized_solo_tool_call(
+        call
+    )
+    arguments = call_args(normalized)
+    command = str(
+        arguments.get("command")
+        or arguments.get("cmd")
+        or ""
+    )
+
+    return (
+        call_name(normalized) == "run_command"
+        and evidence_kind(command) == "status"
+    )
+
+
+def current_status_is_recorded(
+    state: Mapping[str, Any],
+    repo: Path,
+) -> bool:
+    current_digest = repository_state_digest(
+        repo
+    )
+
+    for item in reversed(
+        list(state.get("evidence", []))
+    ):
+        if (
+            not isinstance(item, dict)
+            or item.get("kind") != "status"
+        ):
+            continue
+
+        return bool(
+            item.get("success")
+            and item.get(
+                "repository_state_digest"
+            )
+            == current_digest
+        )
+
+    return False
+
+
+def select_serial_tool_call(
+    calls: list[dict[str, Any]],
+    state: Mapping[str, Any],
+    repo: Path,
+) -> tuple[dict[str, Any], int, str]:
+    if not calls:
+        raise SoloError(
+            "Cannot select from an empty tool-call list."
+        )
+
+    selected_index = 0
+    reason = "first_call"
+
+    if (
+        len(calls) > 1
+        and exact_status_call(calls[0])
+        and current_status_is_recorded(
+            state,
+            repo,
+        )
+    ):
+        for index, candidate in enumerate(
+            calls[1:],
+            start=1,
+        ):
+            if exact_status_call(candidate):
+                continue
+
+            selected_index = index
+            reason = "skipped_redundant_status"
+            break
+
+    return (
+        calls[selected_index],
+        selected_index,
+        reason,
+    )
+
+
 def policy_recovery_instruction(
     call: Mapping[str, Any],
     error: BaseException,
@@ -1263,8 +1350,9 @@ class Runner:
             "Plan, inspect, implement, test, and self-review the task from start to finish. "
             "There are no planner, implementer, reviewer, verifier, manager, judge, handoff, "
             "or fallback agents. Never request another model.\n\n"
-            "Use only the supplied Open Terminal tools. Start no more than one process per "
-            "model turn and poll a running process before starting another. Follow the Forge "
+            "Use only the supplied Open Terminal tools. Request at most one tool call per "
+            "model turn. Start no more than one process per model turn and poll a running "
+            "process before starting another. Follow the Forge "
             "implementer command policy exactly.\n\n"
             "Do not use sed. For file inventory use rg --files with optional -g globs and "
             "no pipeline. For text inspection prefer cat, head, tail, rg, or bounded grep such "
@@ -1727,8 +1815,16 @@ class Runner:
                             "Provider returned malformed tool calls."
                         )
 
+                    (
+                        call,
+                        selected_index,
+                        selection_reason,
+                    ) = select_serial_tool_call(
+                        calls,
+                        state,
+                        self.repo,
+                    )
                     ignored_calls = len(calls) - 1
-                    call = calls[0]
                     call_id = str(call.get("id", "")).strip()
                     if not call_id:
                         raise SoloError("Tool call has no ID.")
@@ -1745,6 +1841,8 @@ class Runner:
                             "serial_tool_calls_trimmed",
                             accepted_call_id=call_id,
                             accepted_tool=call_name(call),
+                            selected_index=selected_index,
+                            selection_reason=selection_reason,
                             ignored_calls=ignored_calls,
                         )
 
@@ -1829,12 +1927,25 @@ class Runner:
                             {
                                 "role": "user",
                                 "content": (
-                                    "The server accepted and executed only "
-                                    "the first tool call from your previous "
-                                    "response. Request at most one tool call "
-                                    "per turn. Continue with the next required "
-                                    "operation only after reviewing the tool "
-                                    "result."
+                                    (
+                                        "The server accepted and executed only "
+                                        "the first tool call from your previous "
+                                        "response. Request at most one tool call "
+                                        "per turn. Continue with the next required "
+                                        "operation only after reviewing the tool "
+                                        "result."
+                                    )
+                                    if selected_index == 0
+                                    else (
+                                        "The server accepted and executed only "
+                                        "one tool call from your previous response. "
+                                        "It skipped a redundant leading "
+                                        "git status --short because current status "
+                                        "evidence already existed, then selected "
+                                        "the first later non-status call. Request "
+                                        "at most one tool call per turn and continue "
+                                        "from the executed result."
+                                    )
                                 ),
                             }
                         )

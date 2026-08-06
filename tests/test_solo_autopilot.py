@@ -29,6 +29,7 @@ from swarm_router.solo_autopilot import (
     policy_recovery_instruction,
     repository_state_digest,
     safe_inspection_replacement,
+    select_serial_tool_call,
     snapshot,
 )
 
@@ -329,6 +330,279 @@ class SoloTest(unittest.TestCase):
         ]
         self.assertEqual(len(trimmed), 1)
         self.assertEqual(trimmed[0]["ignored_calls"], 1)
+
+    def test_multi_call_skips_current_status_for_next_operation(
+        self,
+    ) -> None:
+        first_status = call(
+            "initial-status",
+            "run_command",
+            {
+                "command": "git status --short",
+                "cwd": "/workspace/forge",
+            },
+        )
+        repeated_status = call(
+            "repeated-status",
+            "run_command",
+            {
+                "command": "git status --short",
+                "cwd": "/workspace/forge",
+            },
+        )
+        inventory = call(
+            "inventory-call",
+            "run_command",
+            {
+                "command": "rg --files -g '*.py' .",
+                "cwd": "/workspace/forge",
+            },
+        )
+        gateway = FakeGateway(
+            [
+                response(None, first_status),
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    repeated_status,
+                                    inventory,
+                                ],
+                            }
+                        }
+                    ],
+                },
+                response(
+                    "Continue after useful inventory.\nCONTINUE"
+                ),
+            ]
+        )
+        terminal = FakeTerminal(
+            [
+                {
+                    "status": "done",
+                    "exit_code": 0,
+                    "output": "",
+                },
+                {
+                    "status": "done",
+                    "exit_code": 0,
+                    "output": "swarm_router/solo_autopilot.py",
+                },
+            ]
+        )
+        store = self.store()
+
+        result = Runner(
+            self.task,
+            store,
+            gateway,
+            terminal,
+            AllowPolicy(),
+            self.repo,
+            3,
+            20,
+        ).tick()
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(
+            [item["id"] for item in terminal.calls],
+            ["initial-status", "inventory-call"],
+        )
+
+        transcript = gateway.messages[2]
+        assistant_messages = [
+            item
+            for item in transcript
+            if item.get("role") == "assistant"
+            and item.get("tool_calls")
+        ]
+        self.assertEqual(
+            assistant_messages[-1]["tool_calls"][0]["id"],
+            "inventory-call",
+        )
+        self.assertTrue(
+            any(
+                item.get("role") == "user"
+                and "skipped a redundant leading"
+                in str(item.get("content", ""))
+                for item in transcript
+            )
+        )
+
+        events = [
+            json.loads(line)
+            for line in store.events.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        selected = [
+            event
+            for event in events
+            if event.get("event")
+            == "serial_tool_calls_trimmed"
+            and event.get("selected_index") == 1
+        ]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(
+            selected[0]["selection_reason"],
+            "skipped_redundant_status",
+        )
+
+    def test_serial_selection_keeps_status_without_current_evidence(
+        self,
+    ) -> None:
+        status = call(
+            "status",
+            "run_command",
+            {"command": "git status --short"},
+        )
+        inventory = call(
+            "inventory",
+            "run_command",
+            {"command": "rg --files ."},
+        )
+
+        selected, index, reason = select_serial_tool_call(
+            [status, inventory],
+            {"evidence": []},
+            self.repo,
+        )
+
+        self.assertEqual(selected["id"], "status")
+        self.assertEqual(index, 0)
+        self.assertEqual(reason, "first_call")
+
+    def test_serial_selection_keeps_status_when_repository_changed(
+        self,
+    ) -> None:
+        state = {
+            "evidence": [
+                {
+                    "kind": "status",
+                    "success": True,
+                    "repository_state_digest": (
+                        repository_state_digest(
+                            self.repo
+                        )
+                    ),
+                }
+            ]
+        }
+        (self.repo / "README.md").write_text(
+            "changed\n",
+            encoding="utf-8",
+        )
+        status = call(
+            "status",
+            "run_command",
+            {"command": "git status --short"},
+        )
+        inventory = call(
+            "inventory",
+            "run_command",
+            {"command": "rg --files ."},
+        )
+
+        selected, index, reason = select_serial_tool_call(
+            [status, inventory],
+            state,
+            self.repo,
+        )
+
+        self.assertEqual(selected["id"], "status")
+        self.assertEqual(index, 0)
+        self.assertEqual(reason, "first_call")
+
+    def test_selected_later_call_still_passes_through_policy(
+        self,
+    ) -> None:
+        first_status = call(
+            "initial-status",
+            "run_command",
+            {"command": "git status --short"},
+        )
+        repeated_status = call(
+            "repeated-status",
+            "run_command",
+            {"command": "git status --short"},
+        )
+        rejected = call(
+            "rejected-sed",
+            "run_command",
+            {"command": "sed -n '1,20p' README.md"},
+        )
+        gateway = FakeGateway(
+            [
+                response(None, first_status),
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    repeated_status,
+                                    rejected,
+                                ],
+                            }
+                        }
+                    ],
+                },
+                response(
+                    "Continue after policy recovery.\nCONTINUE"
+                ),
+            ]
+        )
+        terminal = FakeTerminal(
+            [
+                {
+                    "status": "done",
+                    "exit_code": 0,
+                    "output": "",
+                },
+            ]
+        )
+        store = self.store()
+
+        result = Runner(
+            self.task,
+            store,
+            gateway,
+            terminal,
+            RejectSed(),
+            self.repo,
+            3,
+            20,
+        ).tick()
+
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(len(terminal.calls), 1)
+        self.assertEqual(
+            terminal.calls[0]["id"],
+            "initial-status",
+        )
+
+        events = [
+            json.loads(line)
+            for line in store.events.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(
+            any(
+                event.get("event") == "policy_rejected"
+                and event.get("command", "").startswith("sed ")
+                for event in events
+            )
+        )
 
     def test_shared_writer_lease_records_actual_pinned_model(
         self,
