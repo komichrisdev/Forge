@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${FORGE_ROOT:-$HOME/openwebui-codex-swarm}"
+cd "$ROOT"
+exec "$ROOT/.venv/bin/python" -m swarm_router.solo_autopilot "$@"

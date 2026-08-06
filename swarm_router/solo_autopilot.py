@@ -1,0 +1,826 @@
+"""Durable single-model engineering autopilot for Forge."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Mapping, Protocol
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import uuid
+
+from .autopilot_adapter import OpenTerminalClient, PROCESS_TOOLS
+from .client import OpenWebUIClient
+from .config import AppConfig, load_config
+from .developer import DeveloperCoordinator
+
+
+DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
+DEFAULT_CONFIG = Path.home() / ".config/owui-swarm/config.toml"
+DEFAULT_ENV = Path.home() / ".config/owui-swarm/environment"
+DEFAULT_DB = Path.home() / ".local/share/owui-swarm/catalog.sqlite3"
+DEFAULT_STATE = Path.home() / ".local/share/forge-solo"
+DEFAULT_REPO = Path.home() / "openwebui-codex-swarm"
+DEFAULT_MANIFEST = Path.home() / "qwen-forge-autopilot/tasks/forge-planning.json"
+
+FINAL = {"CONTINUE", "READY_FOR_REVIEW", "BLOCKED"}
+ACTIVE = {"created", "pending", "queued", "running"}
+TERMINAL = {
+    "cancelled", "completed", "done", "error", "failed", "killed",
+    "passed", "success", "succeeded", "terminated", "timeout",
+}
+CONTEXT_MARKERS = (
+    "context length", "context size", "context window",
+    "context_length_exceeded", "maximum context",
+    "prompt is too long", "too many tokens",
+)
+CAPACITY_MARKERS = (
+    "capacity", "internal server error", "overloaded",
+    "provider unavailable", "quota", "rate limit",
+    "resource exhausted", "resourceexhausted",
+    "temporarily unavailable", "too many requests",
+)
+SECRET_RE = re.compile(
+    r"(?i)\b(api[_ -]?key|authorization|cookie|password|secret|token)"
+    r"\b\s*(?::|=|\bis\b)\s*\S+"
+)
+
+
+class SoloError(RuntimeError):
+    pass
+
+
+class Gateway(Protocol):
+    model_id: str
+    def complete(self, messages: list[dict[str, Any]]) -> dict[str, Any]: ...
+
+
+class Terminal(Protocol):
+    def execute_tool_call(self, call: dict[str, Any]) -> str: ...
+
+
+class Policy(Protocol):
+    def validate(self, call: dict[str, Any]) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class Task:
+    task_id: str
+    title: str
+    objective: str
+    acceptance_criteria: tuple[str, ...]
+    requirements: tuple[str, ...]
+    allowed_paths: tuple[str, ...]
+
+    @classmethod
+    def load(cls, path: Path, task_id: str) -> "Task":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("tasks", []) if isinstance(payload, dict) else payload
+        matches = [
+            row for row in rows
+            if isinstance(row, dict)
+            and str(row.get("id") or row.get("task_id") or "") == task_id
+        ]
+        if len(matches) != 1:
+            raise SoloError(f"Expected one {task_id} task; found {len(matches)}.")
+        row = matches[0]
+        return cls(
+            task_id=task_id,
+            title=str(row.get("title", task_id)),
+            objective=str(row.get("objective", "")),
+            acceptance_criteria=tuple(map(str, row.get("acceptance_criteria", []))),
+            requirements=tuple(map(str, row.get("requirements", []))),
+            allowed_paths=tuple(map(str, row.get("allowed_paths", []))),
+        )
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def redact(value: Any) -> str:
+    return SECRET_RE.sub(
+        lambda match: match.group(1) + "=[REDACTED]",
+        str(value or ""),
+    )
+
+
+def bounded(value: Any, limit: int = 1800) -> str:
+    text = redact(value)
+    if len(text) <= limit:
+        return text
+    half = max(1, (limit - 80) // 2)
+    return text[:half] + "\n...[bounded middle omitted]...\n" + text[-half:]
+
+
+def digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, ensure_ascii=False, default=str)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+def append_event(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def load_env(path: Path) -> None:
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        capture_output=True,
+        check=check,
+        timeout=120,
+        env={**os.environ, "GIT_PAGER": "cat", "PAGER": "cat", "GIT_TERMINAL_PROMPT": "0"},
+    )
+
+
+def snapshot(repo: Path) -> dict[str, Any]:
+    status = git(repo, "status", "--porcelain=v1", "--branch").stdout.rstrip()
+    changes = [line for line in status.splitlines() if line and not line.startswith("##")]
+    check = git(repo, "--no-pager", "diff", "--check", check=False)
+    return {
+        "head": git(repo, "rev-parse", "HEAD").stdout.strip(),
+        "branch": git(repo, "branch", "--show-current").stdout.strip(),
+        "status": status,
+        "dirty": bool(changes),
+        "changes": changes,
+        "diff_stat": git(repo, "--no-pager", "diff", "--stat").stdout.rstrip(),
+        "diff_check_rc": check.returncode,
+        "diff_check": bounded(check.stdout + check.stderr, 2000),
+    }
+
+
+def catalog_context(path: Path, model: str) -> int | None:
+    if not path.is_file():
+        return None
+    queries = (
+        "SELECT context_length FROM models WHERE model_id=?",
+        "SELECT context_length FROM model_catalog WHERE model_id=?",
+    )
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+            for query in queries:
+                try:
+                    row = db.execute(query, (model,)).fetchone()
+                except sqlite3.Error:
+                    continue
+                if row and isinstance(row[0], int) and not isinstance(row[0], bool) and row[0] > 0:
+                    return int(row[0])
+    except sqlite3.Error:
+        pass
+    return None
+
+
+def message_from(response: Mapping[str, Any]) -> dict[str, Any]:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise SoloError("Provider returned no completion choice.")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise SoloError("Provider returned no assistant message.")
+    return message
+
+
+def final_marker(content: Any) -> str | None:
+    if not isinstance(content, str):
+        return None
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    return lines[-1] if lines and lines[-1] in FINAL else None
+
+
+def call_name(call: Mapping[str, Any]) -> str:
+    function = call.get("function")
+    return str(function.get("name", "")).strip() if isinstance(function, dict) else ""
+
+
+def call_args(call: Mapping[str, Any]) -> dict[str, Any]:
+    function = call.get("function")
+    raw = function.get("arguments") if isinstance(function, dict) else None
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def active_from(result_text: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(result_text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    status = str(payload.get("status", "")).lower()
+    process_id = str(payload.get("id") or payload.get("process_id") or "").strip()
+    if status not in ACTIVE or not process_id:
+        return {}
+    try:
+        offset = max(0, int(payload.get("next_offset", 0) or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    return {"process_id": process_id, "status": status, "next_offset": offset, "updated_at": now()}
+
+
+class Store:
+    def __init__(self, root: Path, task_id: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task_id):
+            raise SoloError("Unsafe task ID.")
+        self.task_id = task_id
+        self.root = root.expanduser() / task_id
+        self.state = self.root / "state.json"
+        self.heartbeat = self.root / "heartbeat.json"
+        self.events = self.root / "events.jsonl"
+        self.lock = self.root / "runner.lock"
+        self.review = self.root / "review"
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> dict[str, Any] | None:
+        if not self.state.is_file():
+            return None
+        payload = json.loads(self.state.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise SoloError("State is not a JSON object.")
+        return payload
+
+    def save(self, state: dict[str, Any]) -> None:
+        state["updated_at"] = now()
+        atomic_json(self.state, state)
+
+    def beat(self, state: dict[str, Any], event: str, **meta: Any) -> None:
+        stamp = now()
+        state["last_heartbeat"] = stamp
+        atomic_json(
+            self.heartbeat,
+            {
+                "timestamp": stamp,
+                "task_id": self.task_id,
+                "status": state.get("status"),
+                "context_epoch": state.get("context_epoch"),
+                "total_rounds": state.get("total_rounds"),
+                "active_process": state.get("active_process", {}),
+                "event": event,
+                **meta,
+            },
+        )
+        self.save(state)
+        append_event(self.events, {"timestamp": stamp, "event": event, "task_id": self.task_id, **meta})
+
+
+class OpenWebUIGateway:
+    def __init__(self, client: OpenWebUIClient, model_id: str, max_tokens: int = 4096) -> None:
+        self.client = client
+        self.model_id = model_id
+        self.max_tokens = max_tokens
+
+    def complete(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.client.completion(
+            {
+                "model": self.model_id,
+                "messages": messages,
+                "tools": PROCESS_TOOLS,
+                "tool_choice": "auto",
+                "parallel_tool_calls": False,
+                "stream": False,
+                "temperature": 0,
+                "max_tokens": self.max_tokens,
+            }
+        )
+
+
+class ForgePolicy:
+    def __init__(self, config: AppConfig) -> None:
+        self.coordinator = DeveloperCoordinator(config)
+
+    def validate(self, call: dict[str, Any]) -> dict[str, Any]:
+        result = self.coordinator._validate_tool_calls([call], PROCESS_TOOLS, "implementer")
+        if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], dict):
+            raise SoloError("Forge policy returned an invalid result.")
+        return result[0]
+
+
+class Runner:
+    def __init__(
+        self,
+        task: Task,
+        store: Store,
+        gateway: Gateway,
+        terminal: Terminal,
+        policy: Policy,
+        repo: Path,
+        epoch_rounds: int = 10,
+        max_rounds: int = 240,
+        capacity_pause: int = 300,
+    ) -> None:
+        self.task = task
+        self.store = store
+        self.gateway = gateway
+        self.terminal = terminal
+        self.policy = policy
+        self.repo = repo.expanduser().resolve()
+        self.epoch_rounds = epoch_rounds
+        self.max_rounds = max_rounds
+        self.capacity_pause = capacity_pause
+
+    def initial_state(self, snap: Mapping[str, Any]) -> dict[str, Any]:
+        stamp = now()
+        return {
+            "schema_version": 1,
+            "task_id": self.task.task_id,
+            "title": self.task.title,
+            "model_id": self.gateway.model_id,
+            "status": "queued",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "last_heartbeat": "",
+            "context_epoch": 0,
+            "total_rounds": 0,
+            "total_tool_calls": 0,
+            "consecutive_failures": 0,
+            "policy_rejections": {},
+            "retry_after": "",
+            "baseline_head": snap["head"],
+            "baseline_branch": snap["branch"],
+            "active_process": {},
+            "checkpoint": "Inspect, plan, implement, test, self-review, then stop for external review.",
+            "recent_results": [],
+            "last_response": "",
+            "last_error": "",
+            "final_report": "",
+            "review_bundle": "",
+        }
+
+    def load_state(self) -> dict[str, Any]:
+        snap = snapshot(self.repo)
+        state = self.store.load()
+        if state is None:
+            state = self.initial_state(snap)
+            if snap["dirty"]:
+                state["status"] = "blocked"
+                state["last_error"] = "Repository was dirty before DeepSeek Solo started."
+            self.store.save(state)
+        if state.get("model_id") != self.gateway.model_id:
+            raise SoloError("Pinned model changed; rotation is prohibited.")
+        if snap["head"] != state.get("baseline_head"):
+            state["status"] = "blocked"
+            state["last_error"] = "Repository HEAD changed during the solo task."
+            self.store.save(state)
+        return state
+
+    def system_prompt(self) -> str:
+        return (
+            f"You are DeepSeek Solo, sole engineering owner of {self.task.task_id}. "
+            "Plan, inspect, implement, test, and self-review the task from start to finish. "
+            "There are no planner, implementer, reviewer, verifier, manager, judge, handoff, "
+            "or fallback agents. Never request another model.\n\n"
+            "Use only the supplied Open Terminal tools. Start no more than one process per "
+            "model turn and poll a running process before starting another. Follow the Forge "
+            "implementer command policy exactly.\n\n"
+            "Do not use sed. For inspection prefer cat, head, tail, rg, or bounded grep such "
+            "as grep -n -m 30 PATTERN PATH. Do not use recursive grep, pipelines, compound "
+            "commands, command substitution, or arbitrary inline Python. After a policy "
+            "rejection, choose a supported equivalent and continue with the same model.\n\n"
+            "Do not commit, push, deploy, restart services, change systemd state, use sudo, "
+            "access credentials, or change tasks. Leave changes uncommitted for external review.\n\n"
+            "Every response must end with exactly one final line: CONTINUE, READY_FOR_REVIEW, "
+            "or BLOCKED. READY_FOR_REVIEW requires implementation, focused tests, relevant full "
+            "tests, final diff inspection, and self-review."
+        )
+
+    def prompt(self, state: Mapping[str, Any], snap: Mapping[str, Any]) -> str:
+        payload = {
+            "task": asdict(self.task),
+            "pinned_model": self.gateway.model_id,
+            "context_epoch": state.get("context_epoch", 0),
+            "total_rounds": state.get("total_rounds", 0),
+            "checkpoint": bounded(state.get("checkpoint"), 4500),
+            "last_response": bounded(state.get("last_response"), 2500),
+            "active_process": state.get("active_process", {}),
+            "recent_results": list(state.get("recent_results", []))[-10:],
+            "repository": {
+                "head": snap["head"],
+                "branch": snap["branch"],
+                "status": bounded(snap["status"], 3000),
+                "diff_stat": bounded(snap["diff_stat"], 2500),
+                "diff_check_rc": snap["diff_check_rc"],
+                "diff_check": snap["diff_check"],
+            },
+        }
+        return (
+            "Continue the same durable task from this authoritative checkpoint. "
+            "Do not repeat completed work. Choose the next smallest useful action.\n\n"
+            + json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+        )
+
+    def record_result(self, state: dict[str, Any], call: Mapping[str, Any], text: str) -> None:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = {"output": text}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        preview = payload.get("output") or payload.get("stdout") or payload.get("message") or ""
+        recent = list(state.get("recent_results", []))
+        recent.append(
+            {
+                "timestamp": now(),
+                "tool": call_name(call),
+                "arguments": {
+                    key: bounded(value, 500)
+                    for key, value in call_args(call).items()
+                    if key not in {"env", "environment"}
+                },
+                "status": str(payload.get("status", "")),
+                "exit_code": payload.get("exit_code"),
+                "result_digest": digest(text),
+                "output_preview": bounded(preview, 1800),
+            }
+        )
+        state["recent_results"] = recent[-16:]
+        state["total_tool_calls"] = int(state.get("total_tool_calls", 0)) + 1
+        active = active_from(text)
+        if active:
+            state["active_process"] = active
+        elif str(payload.get("status", "")).lower() in TERMINAL:
+            state["active_process"] = {}
+
+    def poll(self, state: dict[str, Any]) -> bool:
+        active = state.get("active_process")
+        if not isinstance(active, dict) or not active.get("process_id"):
+            state["active_process"] = {}
+            return False
+        call = {
+            "id": "solo-poll-" + uuid.uuid4().hex,
+            "type": "function",
+            "function": {
+                "name": "get_process_status",
+                "arguments": json.dumps(
+                    {
+                        "process_id": active["process_id"],
+                        "wait": 60,
+                        "offset": int(active.get("next_offset", 0) or 0),
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+        }
+        valid = self.policy.validate(call)
+        self.store.beat(state, "process_poll_started", process_id=active["process_id"])
+        result = self.terminal.execute_tool_call(valid)
+        self.record_result(state, valid, result)
+        self.store.beat(state, "process_poll_finished", still_active=bool(state.get("active_process")))
+        return bool(state.get("active_process"))
+
+    def classify(self, error: BaseException) -> str:
+        category = str(getattr(error, "category", "")).lower()
+        text = str(error).lower()
+        if category == "context_overflow" or any(marker in text for marker in CONTEXT_MARKERS):
+            return "context"
+        if category == "capacity" or any(marker in text for marker in CAPACITY_MARKERS):
+            return "capacity"
+        return "failure"
+
+    def reject(self, state: dict[str, Any], call: Mapping[str, Any], error: BaseException) -> int:
+        command = str(call_args(call).get("command", ""))
+        key = digest(call_name(call) + "\n" + command)[:24]
+        counters = dict(state.get("policy_rejections", {}))
+        count = int(counters.get(key, 0)) + 1
+        counters[key] = count
+        state["policy_rejections"] = counters
+        state["last_error"] = bounded(error, 1200)
+        append_event(
+            self.store.events,
+            {
+                "timestamp": now(),
+                "event": "policy_rejected",
+                "task_id": self.task.task_id,
+                "tool": call_name(call),
+                "command": bounded(command, 700),
+                "error": bounded(error, 1000),
+                "repeated": count,
+            },
+        )
+        return count
+
+    def review_bundle(self, state: dict[str, Any], snap: Mapping[str, Any]) -> None:
+        self.store.review.mkdir(parents=True, exist_ok=True)
+        diff = git(self.repo, "--no-pager", "diff", "--binary", check=False)
+        stat = git(self.repo, "--no-pager", "diff", "--stat", check=False)
+        check = git(self.repo, "--no-pager", "diff", "--check", check=False)
+        status = git(self.repo, "status", "--porcelain=v1", "--branch", check=False)
+        (self.store.review / "implementation.diff").write_text(diff.stdout, encoding="utf-8")
+        (self.store.review / "diff.stat").write_text(stat.stdout, encoding="utf-8")
+        (self.store.review / "diff-check.txt").write_text(check.stdout + check.stderr, encoding="utf-8")
+        (self.store.review / "git-status.txt").write_text(status.stdout, encoding="utf-8")
+        report = (
+            f"# DeepSeek Solo Review: {self.task.task_id}\n\n"
+            f"- Model: `{self.gateway.model_id}`\n"
+            f"- Baseline: `{state.get('baseline_head', '')}`\n"
+            f"- Current HEAD: `{snap.get('head', '')}`\n"
+            f"- Context epochs: `{state.get('context_epoch', 0)}`\n"
+            f"- Model rounds: `{state.get('total_rounds', 0)}`\n"
+            f"- Tool calls: `{state.get('total_tool_calls', 0)}`\n"
+            f"- Diff check exit: `{check.returncode}`\n\n"
+            "## Acceptance Criteria\n\n"
+            + "".join(f"- [ ] {item}\n" for item in self.task.acceptance_criteria)
+            + "\n## DeepSeek Final Report\n\n"
+            + bounded(state.get("final_report"), 12000)
+            + "\n\n## Git Status\n\n```text\n" + status.stdout
+            + "\n```\n\n## Diff Summary\n\n```text\n" + stat.stdout
+            + "\n```\n\nChanges remain uncommitted. No push, deployment, or service restart occurred.\n"
+        )
+        (self.store.review / "review.md").write_text(report, encoding="utf-8")
+        state["review_bundle"] = str(self.store.review)
+        atomic_json(self.store.review / "state.json", state)
+
+    def tick(self) -> dict[str, Any]:
+        with self.store.lock.open("a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {"task_id": self.task.task_id, "status": "busy"}
+            return self._tick()
+
+    def _tick(self) -> dict[str, Any]:
+        state = self.load_state()
+        if state.get("status") in {"ready_for_review", "blocked"}:
+            return dict(state)
+
+        retry_after = str(state.get("retry_after", ""))
+        if retry_after:
+            try:
+                retry_time = datetime.fromisoformat(retry_after)
+            except ValueError:
+                retry_time = None
+            if retry_time and retry_time > datetime.now(timezone.utc):
+                return dict(state)
+            state["retry_after"] = ""
+
+        if int(state.get("total_rounds", 0)) >= self.max_rounds:
+            state["status"] = "blocked"
+            state["last_error"] = "Maximum total model rounds reached."
+            self.store.beat(state, "max_rounds")
+            return dict(state)
+
+        state["status"] = "running"
+        self.store.beat(state, "tick_started", model=self.gateway.model_id)
+
+        try:
+            if state.get("active_process") and self.poll(state):
+                state["status"] = "continue"
+                self.store.beat(state, "waiting_for_process")
+                return dict(state)
+
+            snap = snapshot(self.repo)
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": self.system_prompt()},
+                {"role": "user", "content": self.prompt(state, snap)},
+            ]
+
+            for _ in range(self.epoch_rounds):
+                state["total_rounds"] = int(state.get("total_rounds", 0)) + 1
+                self.store.beat(
+                    state,
+                    "model_request",
+                    round=state["total_rounds"],
+                    epoch=state.get("context_epoch", 0),
+                )
+                response = self.gateway.complete(messages)
+                message = message_from(response)
+                content = message.get("content")
+                marker = final_marker(content)
+                calls = message.get("tool_calls")
+                state["last_response"] = bounded(content, 5000)
+
+                if calls:
+                    if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
+                        state["status"] = "continue"
+                        state["context_epoch"] = int(state.get("context_epoch", 0)) + 1
+                        state["last_error"] = "DeepSeek requested multiple tool calls in one turn."
+                        self.store.beat(state, "serial_tool_retry")
+                        return dict(state)
+
+                    call = calls[0]
+                    call_id = str(call.get("id", "")).strip()
+                    if not call_id:
+                        raise SoloError("Tool call has no ID.")
+
+                    assistant = {"role": "assistant", "content": content, "tool_calls": calls}
+
+                    try:
+                        valid = self.policy.validate(call)
+                    except BaseException as error:
+                        repeated = self.reject(state, call, error)
+                        messages.extend(
+                            [
+                                assistant,
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call_id,
+                                    "content": json.dumps(
+                                        {
+                                            "status": "rejected",
+                                            "error": bounded(error, 1000),
+                                            "rejected_command": bounded(call_args(call).get("command", ""), 800),
+                                            "instruction": (
+                                                "Use one supported equivalent and continue with the same model. "
+                                                "Do not use sed. Prefer cat, head, tail, rg, or bounded "
+                                                "grep -n -m N PATTERN PATH for inspection."
+                                            ),
+                                        },
+                                        separators=(",", ":"),
+                                    ),
+                                },
+                            ]
+                        )
+                        if repeated >= 3:
+                            state["status"] = "blocked"
+                            state["last_error"] = "The same rejected command was repeated three times."
+                            self.store.beat(state, "repeated_policy_rejection")
+                            return dict(state)
+                        continue
+
+                    self.store.beat(state, "tool_started", tool=call_name(valid))
+                    result = self.terminal.execute_tool_call(valid)
+                    self.record_result(state, valid, result)
+                    messages.extend(
+                        [
+                            assistant,
+                            {"role": "tool", "tool_call_id": call_id, "content": result},
+                        ]
+                    )
+                    self.store.beat(state, "tool_finished", tool=call_name(valid))
+                    if state.get("active_process"):
+                        state["status"] = "continue"
+                        self.store.beat(state, "process_persisted")
+                        return dict(state)
+                    continue
+
+                state["checkpoint"] = bounded(content, 5000) or state.get("checkpoint", "")
+
+                if marker == "READY_FOR_REVIEW":
+                    state["status"] = "ready_for_review"
+                    state["final_report"] = bounded(content, 16000)
+                    state["consecutive_failures"] = 0
+                    snap = snapshot(self.repo)
+                    self.review_bundle(state, snap)
+                    self.store.beat(state, "ready_for_review", bundle=state["review_bundle"])
+                    return dict(state)
+
+                if marker == "BLOCKED":
+                    state["status"] = "blocked"
+                    state["final_report"] = bounded(content, 16000)
+                    state["last_error"] = "DeepSeek reported a blocker."
+                    self.store.beat(state, "model_blocked")
+                    return dict(state)
+
+                state["context_epoch"] = int(state.get("context_epoch", 0)) + 1
+                state["status"] = "continue"
+                state["consecutive_failures"] = 0
+                self.store.beat(state, "context_rollover", marker=marker or "missing")
+                return dict(state)
+
+            state["context_epoch"] = int(state.get("context_epoch", 0)) + 1
+            state["status"] = "continue"
+            state["checkpoint"] = bounded(state.get("last_response"), 5000) or state.get("checkpoint", "")
+            self.store.beat(state, "epoch_round_limit")
+            return dict(state)
+
+        except BaseException as error:
+            kind = self.classify(error)
+            state["last_error"] = bounded(error, 2000)
+
+            if kind == "context":
+                state["context_epoch"] = int(state.get("context_epoch", 0)) + 1
+                state["status"] = "continue"
+                self.store.beat(state, "context_overflow", error=state["last_error"])
+                return dict(state)
+
+            if kind == "capacity":
+                state["status"] = "paused_capacity"
+                state["retry_after"] = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=self.capacity_pause)
+                ).isoformat()
+                self.store.beat(
+                    state,
+                    "capacity_pause",
+                    error=state["last_error"],
+                    retry_after=state["retry_after"],
+                )
+                return dict(state)
+
+            failures = int(state.get("consecutive_failures", 0)) + 1
+            state["consecutive_failures"] = failures
+            if failures >= 3:
+                state["status"] = "blocked"
+                self.store.beat(state, "repeated_failure", error=state["last_error"])
+                return dict(state)
+
+            state["status"] = "continue"
+            state["context_epoch"] = int(state.get("context_epoch", 0)) + 1
+            self.store.beat(state, "failure_retry", error=state["last_error"], failures=failures)
+            return dict(state)
+
+
+def build_gateway(config: AppConfig, model: str, db_path: Path) -> OpenWebUIGateway:
+    client = OpenWebUIClient(
+        config.openwebui.base_url,
+        config.openwebui.endpoint,
+        config.openwebui.api_key_env,
+        config.openwebui.timeout_seconds,
+        health_endpoint=config.openwebui.health_endpoint,
+        models_endpoint=config.openwebui.models_endpoint,
+        model_id=model,
+        catalog_context=catalog_context(db_path, model),
+    )
+    return OpenWebUIGateway(client, model)
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser()
+    value.add_argument("command", choices=("tick", "status"))
+    value.add_argument("--task-id", default="FG-060")
+    value.add_argument("--model", default=DEFAULT_MODEL)
+    value.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    value.add_argument("--repository", type=Path, default=DEFAULT_REPO)
+    value.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    value.add_argument("--environment", type=Path, default=DEFAULT_ENV)
+    value.add_argument("--catalog", type=Path, default=DEFAULT_DB)
+    value.add_argument("--state-root", type=Path, default=DEFAULT_STATE)
+    value.add_argument("--epoch-rounds", type=int, default=10)
+    value.add_argument("--max-total-rounds", type=int, default=240)
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    store = Store(args.state_root, args.task_id)
+
+    if args.command == "status":
+        state = store.load()
+        print(
+            json.dumps(
+                state or {
+                    "task_id": args.task_id,
+                    "status": "not_started",
+                    "state_directory": str(store.root),
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return 0
+
+    load_env(args.environment)
+    config = load_config(args.config, require_api_key=True)
+    task = Task.load(args.manifest, args.task_id)
+    runner = Runner(
+        task,
+        store,
+        build_gateway(config, args.model, args.catalog),
+        OpenTerminalClient(),
+        ForgePolicy(config),
+        args.repository,
+        args.epoch_rounds,
+        args.max_total_rounds,
+    )
+    print(json.dumps(runner.tick(), indent=2, ensure_ascii=False, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
