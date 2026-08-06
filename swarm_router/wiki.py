@@ -465,6 +465,37 @@ def serialize_source(source: SourceManifest) -> str:
     )
 
 
+def _git_repository_root(path: Path) -> Path | None:
+    """Return the exact Git worktree root, including linked worktrees."""
+
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "rev-parse",
+            "--show-toplevel",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+    )
+
+    if result.returncode != 0:
+        return None
+
+    value = result.stdout.strip()
+
+    if not value:
+        return None
+
+    return Path(value).resolve()
+
+
 class WikiRepository:
     def __init__(self, root: str | Path | None = None):
         self.root = wiki_root(root)
@@ -1061,7 +1092,7 @@ class WikiRepository:
         )
 
     def git_info(self) -> dict[str, Any]:
-        if not (self.root / ".git").is_dir():
+        if _git_repository_root(self.root) != self.root.resolve():
             return {"repository": False, "branch": None, "commit": None, "dirty": False, "changes": []}
         branch = self._git("branch", "--show-current").stdout.strip() or None
         commit_result = self._git("rev-parse", "HEAD", check=False)
@@ -1074,7 +1105,7 @@ class WikiRepository:
 
     def application_git_info(self) -> dict[str, Any]:
         repository_root = Path(__file__).resolve().parent.parent
-        if not (repository_root / ".git").is_dir():
+        if _git_repository_root(repository_root) != repository_root:
             return {"repository": False, "branch": None, "commit": None, "dirty": False, "changes": []}
         result = subprocess.run(
             ["git", "-C", str(repository_root), "branch", "--show-current"],

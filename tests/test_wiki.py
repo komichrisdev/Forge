@@ -325,6 +325,49 @@ class WikiStorageTest(unittest.TestCase):
             )),
         )
 
+    def test_git_repository_status_supports_linked_worktree(self) -> None:
+        commit = self.git_init()
+        linked = self.base / "linked-wiki"
+
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.root),
+                "worktree",
+                "add",
+                "--detach",
+                str(linked),
+                commit,
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
+        try:
+            info = WikiRepository(linked).git_info()
+
+            self.assertTrue(info["repository"])
+            self.assertEqual(info["commit"], commit)
+            self.assertIsNone(info["branch"])
+            self.assertFalse(info["dirty"])
+        finally:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.root),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(linked),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
     def test_git_repository_status_reporting(self) -> None:
         commit = self.git_init()
         status = self.repository.status(self.base / "backups")
