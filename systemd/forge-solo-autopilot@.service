@@ -1,0 +1,21 @@
+[Unit]
+Description=Forge DeepSeek Solo Autopilot for %i
+After=network-online.target owui-swarm-personal.service
+Wants=network-online.target
+ConditionPathExists=%h/openwebui-codex-swarm/swarm_router/solo_autopilot.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/openwebui-codex-swarm
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=GIT_PAGER=cat
+Environment=PAGER=cat
+Environment=GIT_TERMINAL_PROMPT=0
+EnvironmentFile=%h/.config/owui-swarm/environment
+ExecStart=%h/openwebui-codex-swarm/.venv/bin/python -m swarm_router.solo_autopilot tick --task-id %i --model deepseek-ai/deepseek-v4-pro
+TimeoutStartSec=50min
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=true
+PrivateTmp=true

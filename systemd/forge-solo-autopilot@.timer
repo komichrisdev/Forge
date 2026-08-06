@@ -1,0 +1,12 @@
+[Unit]
+Description=Resume Forge DeepSeek Solo Autopilot for %i
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=forge-solo-autopilot@%i.service
+
+[Install]
+WantedBy=timers.target
