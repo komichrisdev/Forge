@@ -25,7 +25,10 @@ from swarm_router.solo_autopilot import (
     WriterLeaseLost,
     evidence_kind,
     final_marker,
+    normalized_solo_tool_call,
+    policy_recovery_instruction,
     repository_state_digest,
+    safe_inspection_replacement,
     snapshot,
 )
 
@@ -188,9 +191,27 @@ class SoloTest(unittest.TestCase):
             },
         )
 
+        validated = policy.validate(tool_call)
+
         self.assertEqual(
-            policy.validate(tool_call),
-            tool_call,
+            validated["id"],
+            tool_call["id"],
+        )
+        self.assertEqual(
+            validated["type"],
+            tool_call["type"],
+        )
+        self.assertEqual(
+            validated["function"]["name"],
+            tool_call["function"]["name"],
+        )
+        self.assertEqual(
+            json.loads(
+                validated["function"]["arguments"]
+            ),
+            json.loads(
+                tool_call["function"]["arguments"]
+            ),
         )
         self.assertEqual(
             coordinator.role,
@@ -493,6 +514,155 @@ class SoloTest(unittest.TestCase):
             arguments["offset"],
             3,
         )
+
+    def test_safe_find_pipeline_has_exact_rg_replacement(self) -> None:
+        command = (
+            'find /workspace/forge/swarm_router '
+            '-type f -name "*.py" | head -30'
+        )
+        self.assertEqual(
+            safe_inspection_replacement(command),
+            "rg --files -g '*.py' swarm_router",
+        )
+
+    def test_forge_policy_forces_workspace_and_normalizes_safe_find(self) -> None:
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = DeveloperCoordinator.__new__(DeveloperCoordinator)
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+        original = call(
+            "inventory-call",
+            "run_command",
+            {
+                "command": (
+                    'find /workspace/forge/swarm_router '
+                    '-type f -name "*.py" | head -30'
+                ),
+                "cwd": "/tmp",
+                "wait": 30,
+            },
+        )
+        valid = policy.validate(original)
+        arguments = json.loads(valid["function"]["arguments"])
+        self.assertEqual(arguments["command"], "rg --files -g '*.py' swarm_router")
+        self.assertEqual(arguments["cwd"], "/workspace/forge")
+        self.assertEqual(arguments["wait"], 30)
+        self.assertEqual(json.loads(original["function"]["arguments"])["cwd"], "/tmp")
+
+    def test_forge_policy_forces_workspace_for_normal_command(self) -> None:
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = DeveloperCoordinator.__new__(DeveloperCoordinator)
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+        valid = policy.validate(
+            call(
+                "status-call",
+                "run_command",
+                {"command": "git status --short", "cwd": "/", "wait": 30},
+            )
+        )
+        arguments = json.loads(valid["function"]["arguments"])
+        self.assertEqual(arguments["command"], "git status --short")
+        self.assertEqual(arguments["cwd"], "/workspace/forge")
+
+    def test_unsafe_find_command_is_not_rewritten_or_allowed(self) -> None:
+        unsafe = call(
+            "unsafe-find",
+            "run_command",
+            {
+                "command": "find /workspace/forge -type f -delete",
+                "cwd": "/tmp",
+            },
+        )
+        normalized = normalized_solo_tool_call(unsafe)
+        arguments = json.loads(normalized["function"]["arguments"])
+        self.assertEqual(arguments["command"], "find /workspace/forge -type f -delete")
+        self.assertEqual(arguments["cwd"], "/workspace/forge")
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = DeveloperCoordinator.__new__(DeveloperCoordinator)
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+        with self.assertRaises(DeveloperError):
+            policy.validate(unsafe)
+
+    def test_runner_executes_and_replays_normalized_tool_call(self) -> None:
+        requested = call(
+            "inventory-call",
+            "run_command",
+            {
+                "command": (
+                    'find /workspace/forge/swarm_router '
+                    '-type f -name "*.py" | head -30'
+                ),
+                "cwd": "/tmp",
+                "wait": 30,
+            },
+        )
+        gateway = FakeGateway([
+            response(call=requested),
+            response("Inventory inspected.\nCONTINUE"),
+        ])
+        terminal = FakeTerminal([
+            {"status": "done", "exit_code": 0, "output": "swarm_router/solo_autopilot.py"}
+        ])
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = DeveloperCoordinator.__new__(DeveloperCoordinator)
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+        store = self.store()
+        result = Runner(
+            self.task,
+            store,
+            gateway,
+            terminal,
+            policy,
+            self.repo,
+            2,
+            20,
+        ).tick()
+        self.assertEqual(result["status"], "continue")
+        self.assertEqual(result["total_tool_calls"], 1)
+        executed = json.loads(terminal.calls[0]["function"]["arguments"])
+        replayed = json.loads(
+            gateway.messages[1][2]["tool_calls"][0]["function"]["arguments"]
+        )
+        expected = {
+            "command": "rg --files -g '*.py' swarm_router",
+            "cwd": "/workspace/forge",
+            "wait": 30,
+        }
+        self.assertEqual(executed, expected)
+        self.assertEqual(replayed, expected)
+        events = [
+            json.loads(line)
+            for line in store.events.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        normalized_events = [
+            event for event in events
+            if event.get("event") == "tool_call_normalized"
+        ]
+        self.assertEqual(len(normalized_events), 1)
+        self.assertEqual(
+            normalized_events[0]["normalized_command"],
+            "rg --files -g '*.py' swarm_router",
+        )
+
+    def test_policy_recovery_names_exact_supported_equivalent(self) -> None:
+        rejected = call(
+            "inventory-call",
+            "run_command",
+            {
+                "command": (
+                    'find /workspace/forge/swarm_router '
+                    '-type f -name "*.py" | head -30'
+                ),
+                "cwd": "/tmp",
+            },
+        )
+        instruction = policy_recovery_instruction(
+            rejected,
+            RuntimeError("policy rejected"),
+        )
+        self.assertIn("Do not repeat the rejected command", instruction)
+        self.assertIn("rg --files -g '*.py' swarm_router", instruction)
+        self.assertIn("cwd='/workspace/forge'", instruction)
 
     def test_fresh_context_resumes_from_checkpoint(self) -> None:
         store = self.store()

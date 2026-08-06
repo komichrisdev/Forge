@@ -827,6 +827,75 @@ def call_args(call: Mapping[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+SAFE_FIND_PIPELINE_RE = re.compile(
+    r"^\s*find\s+"
+    r"(?P<path>/workspace/forge(?:/[A-Za-z0-9._/-]+)?)"
+    r"\s+-type\s+f"
+    r"\s+-name\s+"
+    r"(?P<quote>[\"'])"
+    r"(?P<glob>\*\.(?:py|js|ts|vue|svelte|html))"
+    r"(?P=quote)"
+    r"\s*\|\s*head\s+-?(?P<limit>[1-9]\d{0,2})"
+    r"\s*$",
+    re.I,
+)
+
+
+def safe_inspection_replacement(command: str) -> str:
+    match = SAFE_FIND_PIPELINE_RE.fullmatch(command)
+    if not match:
+        return ""
+    path = match.group("path")
+    relative = "." if path == "/workspace/forge" else path[len("/workspace/forge/"):]
+    return "rg --files -g '" + match.group("glob") + "' " + relative
+
+
+def normalized_solo_tool_call(call: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(call))
+    if call_name(normalized) != "run_command":
+        return normalized
+    function = normalized.get("function")
+    if not isinstance(function, dict):
+        return normalized
+    arguments = call_args(normalized)
+    if not arguments:
+        return normalized
+    arguments["cwd"] = "/workspace/forge"
+    key = (
+        "command" if isinstance(arguments.get("command"), str)
+        else "cmd" if isinstance(arguments.get("cmd"), str)
+        else ""
+    )
+    if key:
+        replacement = safe_inspection_replacement(str(arguments[key]))
+        if replacement:
+            arguments[key] = replacement
+    function["arguments"] = json.dumps(arguments, separators=(",", ":"))
+    return normalized
+
+
+def policy_recovery_instruction(
+    call: Mapping[str, Any],
+    error: BaseException,
+) -> str:
+    original = call_args(call)
+    normalized = call_args(normalized_solo_tool_call(call))
+    original_command = str(original.get("command") or original.get("cmd") or "")
+    normalized_command = str(normalized.get("command") or normalized.get("cmd") or "")
+    if normalized_command and normalized_command != original_command:
+        return (
+            "Do not repeat the rejected command. Retry exactly one run_command with "
+            f"command={normalized_command!r} and cwd='/workspace/forge'."
+        )
+    return (
+        "Do not repeat the rejected command. "
+        f"The policy error was: {bounded(error, 500)}. "
+        "Use exactly one supported command with cwd='/workspace/forge'. "
+        "For file inventory, use rg --files with an optional -g glob and no pipeline. "
+        "For text search, use rg or grep -n -m N PATTERN PATH."
+    )
+
+
 def active_from(result_text: str) -> dict[str, Any]:
     try:
         payload = json.loads(result_text)
@@ -969,8 +1038,9 @@ class ForgePolicy:
         *,
         active_process: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        normalized = normalized_solo_tool_call(call)
         result = self.coordinator._validate_tool_calls(
-            [call],
+            [normalized],
             self.tool_schemas,
             "implementer",
             active_process=(
@@ -1549,6 +1619,27 @@ class Runner:
 
                     try:
                         valid = self.policy.validate(call)
+                        assistant["tool_calls"] = [valid]
+                        if call_args(valid) != call_args(call):
+                            self.store.beat(
+                                state,
+                                "tool_call_normalized",
+                                original_command=bounded(
+                                    call_args(call).get(
+                                        "command",
+                                        call_args(call).get("cmd", ""),
+                                    ),
+                                    800,
+                                ),
+                                normalized_command=bounded(
+                                    call_args(valid).get(
+                                        "command",
+                                        call_args(valid).get("cmd", ""),
+                                    ),
+                                    800,
+                                ),
+                                normalized_cwd=call_args(valid).get("cwd", ""),
+                            )
                     except BaseException as error:
                         repeated = self.reject(state, call, error)
                         messages.extend(
@@ -1562,10 +1653,9 @@ class Runner:
                                             "status": "rejected",
                                             "error": bounded(error, 1000),
                                             "rejected_command": bounded(call_args(call).get("command", ""), 800),
-                                            "instruction": (
-                                                "Use one supported equivalent and continue with the same model. "
-                                                "Do not use sed. Prefer cat, head, tail, rg, or bounded "
-                                                "grep -n -m N PATTERN PATH for inspection."
+                                            "instruction": policy_recovery_instruction(
+                                                call,
+                                                error,
                                             ),
                                         },
                                         separators=(",", ":"),
