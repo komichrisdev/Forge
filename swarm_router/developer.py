@@ -748,6 +748,9 @@ _GREP_LONG_BOOLEAN_FLAGS = frozenset(
 )
 
 _MAX_GREP_MATCHES = 200
+_MAX_GREP_AFTER_CONTEXT = 499
+_MAX_GREP_OUTPUT_LINES = 500
+
 
 
 def _is_bounded_grep_argv(
@@ -759,6 +762,7 @@ def _is_bounded_grep_argv(
         return False
 
     max_count: int | None = None
+    after_context: int | None = None
     positionals: list[str] = []
     options_enabled = True
     index = 1
@@ -771,8 +775,14 @@ def _is_bounded_grep_argv(
             index += 1
             continue
 
-        if options_enabled and token == "--max-count":
-            if max_count is not None or index + 1 >= len(tokens):
+        if (
+            options_enabled
+            and token == "--max-count"
+        ):
+            if (
+                max_count is not None
+                or index + 1 >= len(tokens)
+            ):
                 return False
 
             value = tokens[index + 1]
@@ -784,7 +794,10 @@ def _is_bounded_grep_argv(
             index += 2
             continue
 
-        if options_enabled and token.startswith("--max-count="):
+        if (
+            options_enabled
+            and token.startswith("--max-count=")
+        ):
             if max_count is not None:
                 return False
 
@@ -797,12 +810,53 @@ def _is_bounded_grep_argv(
             index += 1
             continue
 
-        if options_enabled and token in _GREP_LONG_BOOLEAN_FLAGS:
+        if (
+            options_enabled
+            and token == "--after-context"
+        ):
+            if (
+                after_context is not None
+                or index + 1 >= len(tokens)
+            ):
+                return False
+
+            value = tokens[index + 1]
+
+            if not value.isdigit():
+                return False
+
+            after_context = int(value)
+            index += 2
+            continue
+
+        if (
+            options_enabled
+            and token.startswith("--after-context=")
+        ):
+            if after_context is not None:
+                return False
+
+            value = token.split("=", 1)[1]
+
+            if not value.isdigit():
+                return False
+
+            after_context = int(value)
+            index += 1
+            continue
+
+        if (
+            options_enabled
+            and token in _GREP_LONG_BOOLEAN_FLAGS
+        ):
             index += 1
             continue
 
         if options_enabled and token == "-m":
-            if max_count is not None or index + 1 >= len(tokens):
+            if (
+                max_count is not None
+                or index + 1 >= len(tokens)
+            ):
                 return False
 
             value = tokens[index + 1]
@@ -831,6 +885,39 @@ def _is_bounded_grep_argv(
             index += 1
             continue
 
+        if options_enabled and token == "-A":
+            if (
+                after_context is not None
+                or index + 1 >= len(tokens)
+            ):
+                return False
+
+            value = tokens[index + 1]
+
+            if not value.isdigit():
+                return False
+
+            after_context = int(value)
+            index += 2
+            continue
+
+        if (
+            options_enabled
+            and token.startswith("-A")
+            and len(token) > 2
+        ):
+            if after_context is not None:
+                return False
+
+            value = token[2:]
+
+            if not value.isdigit():
+                return False
+
+            after_context = int(value)
+            index += 1
+            continue
+
         if (
             options_enabled
             and token.startswith("-")
@@ -853,10 +940,33 @@ def _is_bounded_grep_argv(
         positionals.append(token)
         index += 1
 
-    return bool(
-        max_count is not None
-        and 1 <= max_count <= _MAX_GREP_MATCHES
-        and len(positionals) >= 2
+    if (
+        max_count is None
+        or not 1 <= max_count <= _MAX_GREP_MATCHES
+        or len(positionals) < 2
+    ):
+        return False
+
+    if after_context is None:
+        return True
+
+    if (
+        not 0 <= after_context
+        <= _MAX_GREP_AFTER_CONTEXT
+        or len(positionals) != 2
+        or positionals[-1] == "-"
+    ):
+        return False
+
+    worst_case_lines = (
+        max_count
+        * (after_context + 1)
+        + max(0, max_count - 1)
+    )
+
+    return (
+        worst_case_lines
+        <= _MAX_GREP_OUTPUT_LINES
     )
 
 
@@ -2085,7 +2195,8 @@ class DeveloperCoordinator:
             if command == "grep" and not _is_bounded_grep_argv(tokens):
                 raise DeveloperError(
                     "grep requires a non-recursive max-count between "
-                    "1 and 200 and only approved read-only options.",
+                    "1 and 200, approved read-only options, and a "
+                    "bounded total output budget.",
                     code="policy_rejected",
                 )
             if command == "find" and any(token in {"-exec", "-execdir", "-delete"} for token in tokens):

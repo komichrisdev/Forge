@@ -842,9 +842,255 @@ SAFE_INVENTORY_GLOBS = {
 }
 
 
+
+def safe_bounded_grep_head_replacement(
+    command: str,
+) -> str:
+    """Normalize one tightly bounded grep/head inspection.
+
+    General pipelines remain forbidden. This accepts only one
+    single-file grep with line numbers, max-count, after-context,
+    and a numeric head cap. It emits a single grep whose worst-case
+    output does not exceed the original head limit.
+    """
+    try:
+        tokens = shlex.split(
+            command,
+            posix=True,
+        )
+    except ValueError:
+        return ""
+
+    if tokens.count("|") != 1:
+        return ""
+
+    pipe_index = tokens.index("|")
+    grep_tokens = tokens[:pipe_index]
+    tail = tokens[pipe_index + 1:]
+
+    raw_head_limit = ""
+
+    if (
+        len(tail) == 2
+        and tail[0] == "head"
+        and re.fullmatch(
+            r"-[1-9]\d*",
+            tail[1],
+        )
+    ):
+        raw_head_limit = tail[1][1:]
+    elif (
+        len(tail) == 3
+        and tail[:2] == ["head", "-n"]
+        and tail[2].isdigit()
+    ):
+        raw_head_limit = tail[2]
+    elif (
+        len(tail) == 2
+        and tail[0] == "head"
+        and tail[1].startswith("--lines=")
+    ):
+        raw_head_limit = tail[1].split(
+            "=",
+            1,
+        )[1]
+    else:
+        return ""
+
+    if not raw_head_limit.isdigit():
+        return ""
+
+    head_limit = int(raw_head_limit)
+
+    if not 1 <= head_limit <= 500:
+        return ""
+
+    if not grep_tokens or grep_tokens[0] != "grep":
+        return ""
+
+    line_numbers = False
+    max_count: int | None = None
+    after_context: int | None = None
+    positionals: list[str] = []
+    index = 1
+
+    while index < len(grep_tokens):
+        token = grep_tokens[index]
+
+        if token in {"-n", "--line-number"}:
+            if line_numbers:
+                return ""
+
+            line_numbers = True
+            index += 1
+            continue
+
+        raw_value = ""
+
+        if token in {
+            "-m",
+            "--max-count",
+            "-A",
+            "--after-context",
+        }:
+            if index + 1 >= len(grep_tokens):
+                return ""
+
+            option = token
+            raw_value = grep_tokens[index + 1]
+            index += 2
+        elif (
+            token.startswith("-m")
+            and len(token) > 2
+        ):
+            option = "-m"
+            raw_value = token[2:]
+            index += 1
+        elif token.startswith("--max-count="):
+            option = "--max-count"
+            raw_value = token.split("=", 1)[1]
+            index += 1
+        elif (
+            token.startswith("-A")
+            and len(token) > 2
+        ):
+            option = "-A"
+            raw_value = token[2:]
+            index += 1
+        elif token.startswith("--after-context="):
+            option = "--after-context"
+            raw_value = token.split("=", 1)[1]
+            index += 1
+        elif token.startswith("-"):
+            return ""
+        else:
+            positionals.append(token)
+            index += 1
+            continue
+
+        if not raw_value.isdigit():
+            return ""
+
+        value = int(raw_value)
+
+        if option in {
+            "-m",
+            "--max-count",
+        }:
+            if (
+                max_count is not None
+                or not 1 <= value <= 200
+            ):
+                return ""
+
+            max_count = value
+        else:
+            if (
+                after_context is not None
+                or not 0 <= value <= 499
+            ):
+                return ""
+
+            after_context = value
+
+    if (
+        not line_numbers
+        or max_count is None
+        or after_context is None
+        or len(positionals) != 2
+    ):
+        return ""
+
+    pattern, raw_path = positionals
+
+    if (
+        not pattern
+        or len(pattern) > 500
+        or pattern.startswith("-")
+    ):
+        return ""
+
+    try:
+        path = normalized_task_path(
+            raw_path
+        )
+    except SoloError:
+        return ""
+
+    if (
+        path == "."
+        or raw_path.endswith("/")
+        or any(
+            character in path
+            for character in "*?[]{}"
+        )
+        or not all(
+            re.fullmatch(
+                r"[A-Za-z0-9._-]+",
+                part,
+            )
+            for part in Path(path).parts
+        )
+    ):
+        return ""
+
+    effective_after_context = min(
+        after_context,
+        head_limit - 1,
+    )
+
+    max_matches_for_head = (
+        head_limit + 1
+    ) // (
+        effective_after_context + 2
+    )
+
+    if max_matches_for_head < 1:
+        return ""
+
+    effective_max_count = min(
+        max_count,
+        max_matches_for_head,
+    )
+
+    worst_case_lines = (
+        effective_max_count
+        * (effective_after_context + 1)
+        + max(
+            0,
+            effective_max_count - 1,
+        )
+    )
+
+    if worst_case_lines > head_limit:
+        return ""
+
+    return " ".join(
+        [
+            "grep",
+            "-n",
+            "-m",
+            str(effective_max_count),
+            "-A",
+            str(effective_after_context),
+            shlex.quote(pattern),
+            shlex.quote(path),
+        ]
+    )
+
+
 def safe_inspection_replacement(
     command: str,
 ) -> str:
+    grep_replacement = (
+        safe_bounded_grep_head_replacement(
+            command
+        )
+    )
+
+    if grep_replacement:
+        return grep_replacement
+
     try:
         tokens = shlex.split(
             command,
@@ -1216,7 +1462,8 @@ def policy_recovery_instruction(
         "For file inventory, use git ls-files --cached --others "
         "--exclude-standard -- followed by quoted globs and no pipeline. "
         "For recent history, use git log -n N --oneline with N from 1 to 100. "
-        "For text search, use grep -n -m N PATTERN PATH."
+        "For text search, use grep -n -m N PATTERN PATH. "
+        "For bounded after-context, use grep -n -m 1 -A N PATTERN PATH."
     )
 
 
@@ -1465,7 +1712,9 @@ class Runner:
             "--exclude-standard -- followed by quoted globs and no pipeline. For recent "
             "history use exactly git log -n N --oneline with N from 1 to 100. For text "
             "inspection prefer cat, head, tail, or bounded grep such as "
-            "grep -n -m 30 PATTERN PATH. Do not use recursive grep, pipelines, compound "
+            "grep -n -m 30 PATTERN PATH. For a bounded context read, use "
+            "grep -n -m 1 -A N PATTERN PATH and do not append head. Do not use "
+            "recursive grep, pipelines, compound "
             "commands, command substitution, or arbitrary inline Python. After a policy "
             "rejection, choose a supported equivalent and continue with the same model.\n\n"
             "Do not commit, push, deploy, restart services, change systemd state, use sudo, "

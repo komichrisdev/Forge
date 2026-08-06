@@ -790,6 +790,212 @@ class SoloTest(unittest.TestCase):
             3,
         )
 
+    def test_safe_bounded_grep_head_normalizes_observed_v13_form(
+        self,
+    ) -> None:
+        observed = (
+            'grep -n -m 100 "class DashboardApp" '
+            '-A 200 swarm_router/dashboard.py | head -250'
+        )
+
+        self.assertEqual(
+            safe_inspection_replacement(
+                observed
+            ),
+            (
+                "grep -n -m 1 -A 200 "
+                "'class DashboardApp' "
+                "swarm_router/dashboard.py"
+            ),
+        )
+
+    def test_safe_bounded_grep_head_preserves_output_cap(
+        self,
+    ) -> None:
+        variants = (
+            (
+                (
+                    "grep --line-number --max-count=30 "
+                    "--after-context=10 agent "
+                    "swarm_router/developer.py | head -50"
+                ),
+                (
+                    "grep -n -m 4 -A 10 agent "
+                    "swarm_router/developer.py"
+                ),
+            ),
+            (
+                (
+                    'grep -n -m 30 "class DashboardApp" '
+                    '-A 200 '
+                    '/workspace/forge/swarm_router/dashboard.py '
+                    '| head -n 100'
+                ),
+                (
+                    "grep -n -m 1 -A 99 "
+                    "'class DashboardApp' "
+                    "swarm_router/dashboard.py"
+                ),
+            ),
+        )
+
+        for command, expected in variants:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    safe_inspection_replacement(
+                        command
+                    ),
+                    expected,
+                )
+
+    def test_safe_bounded_grep_head_rejects_unsafe_forms(
+        self,
+    ) -> None:
+        rejected = (
+            (
+                'grep -n "DashboardApp" '
+                'swarm_router/dashboard.py | head -250'
+            ),
+            (
+                'grep -n -m 30 "DashboardApp" '
+                'swarm_router/dashboard.py | head -250'
+            ),
+            (
+                'grep -rn -m 30 "DashboardApp" '
+                '-A 20 swarm_router/dashboard.py | head -250'
+            ),
+            (
+                'grep -n -m 30 "DashboardApp" '
+                '-A 20 swarm_router/dashboard.py '
+                'swarm_router/agents.py | head -250'
+            ),
+            (
+                'grep -n -m 30 "DashboardApp" '
+                '-A 20 ../outside.py | head -250'
+            ),
+            (
+                'grep -n -m 30 "DashboardApp" '
+                '-A 20 swarm_router/*.py | head -250'
+            ),
+            (
+                'grep -n -m 30 "DashboardApp" '
+                '-A 20 swarm_router/dashboard.py | tail -250'
+            ),
+            (
+                'grep -n -m 30 "DashboardApp" '
+                '-A 20 swarm_router/dashboard.py '
+                '| head -250 | cat'
+            ),
+            (
+                'grep -n -m 30 "DashboardApp" '
+                '-A 20 swarm_router/dashboard.py | head -501'
+            ),
+        )
+
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    safe_inspection_replacement(
+                        command
+                    ),
+                    "",
+                )
+
+    def test_forge_policy_normalizes_observed_bounded_grep_head(
+        self,
+    ) -> None:
+        policy = ForgePolicy.__new__(
+            ForgePolicy
+        )
+        policy.coordinator = (
+            DeveloperCoordinator.__new__(
+                DeveloperCoordinator
+            )
+        )
+        policy.tool_schemas = (
+            PROCESS_TOOL_SCHEMAS
+        )
+
+        original = call(
+            "bounded-grep-call",
+            "run_command",
+            {
+                "command": (
+                    'grep -n -m 100 '
+                    '"class DashboardApp" '
+                    '-A 200 '
+                    'swarm_router/dashboard.py '
+                    '| head -250'
+                ),
+                "cwd": "/tmp",
+                "wait": 30,
+            },
+        )
+
+        valid = policy.validate(
+            original
+        )
+        arguments = json.loads(
+            valid["function"]["arguments"]
+        )
+
+        self.assertEqual(
+            arguments["command"],
+            (
+                "grep -n -m 1 -A 200 "
+                "'class DashboardApp' "
+                "swarm_router/dashboard.py"
+            ),
+        )
+        self.assertEqual(
+            arguments["cwd"],
+            "/workspace/forge",
+        )
+        self.assertEqual(
+            arguments["wait"],
+            30,
+        )
+
+    def test_policy_recovery_names_bounded_grep_equivalent(
+        self,
+    ) -> None:
+        rejected = call(
+            "bounded-grep-call",
+            "run_command",
+            {
+                "command": (
+                    'grep -n -m 100 '
+                    '"class DashboardApp" '
+                    '-A 200 '
+                    'swarm_router/dashboard.py '
+                    '| head -250'
+                ),
+                "cwd": "/tmp",
+            },
+        )
+
+        instruction = (
+            policy_recovery_instruction(
+                rejected,
+                RuntimeError(
+                    "policy rejected"
+                ),
+            )
+        )
+
+        self.assertIn(
+            (
+                "grep -n -m 1 -A 200 "
+                "'class DashboardApp' "
+                "swarm_router/dashboard.py"
+            ),
+            instruction,
+        )
+        self.assertIn(
+            "cwd='/workspace/forge'",
+            instruction,
+        )
+
     def test_safe_find_pipeline_has_exact_git_replacement(self) -> None:
         command = (
             'find /workspace/forge/swarm_router '

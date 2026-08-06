@@ -1435,6 +1435,88 @@ class DeveloperCoordinatorTest(unittest.TestCase):
                     "implementer",
                 )
 
+    def test_implementer_accepts_only_bounded_after_context(
+        self,
+    ) -> None:
+        accepted = (
+            (
+                "grep -n -m 1 -A 200 "
+                "'class DashboardApp' "
+                "/workspace/forge/swarm_router/dashboard.py"
+            ),
+            (
+                "grep --line-number --max-count=1 "
+                "--after-context=200 "
+                "'class DashboardApp' "
+                "/workspace/forge/swarm_router/dashboard.py"
+            ),
+            (
+                "grep -n -m 4 -A 10 agent "
+                "/workspace/forge/swarm_router/developer.py"
+            ),
+        )
+
+        for index, command in enumerate(
+            accepted,
+            start=1,
+        ):
+            with self.subTest(command=command):
+                self.coordinator._validate_tool_calls(
+                    [
+                        tool_call(
+                            f"bounded-context-{index}",
+                            command,
+                        )
+                    ],
+                    TOOL_SCHEMAS,
+                    "implementer",
+                )
+
+        rejected = (
+            (
+                "grep -n -m 2 -A 249 agent "
+                "/workspace/forge/swarm_router/developer.py"
+            ),
+            (
+                "grep -n -m 1 -A 500 agent "
+                "/workspace/forge/swarm_router/developer.py"
+            ),
+            (
+                "grep -n -m 1 -A 200 agent "
+                "/workspace/forge/swarm_router/developer.py "
+                "/workspace/forge/swarm_router/dashboard.py"
+            ),
+            (
+                "grep -n -m 1 -B 20 agent "
+                "/workspace/forge/swarm_router/developer.py"
+            ),
+            (
+                "grep -n -m 1 -A -1 agent "
+                "/workspace/forge/swarm_router/developer.py"
+            ),
+        )
+
+        for index, command in enumerate(
+            rejected,
+            start=1,
+        ):
+            with (
+                self.subTest(command=command),
+                self.assertRaises(
+                    DeveloperError
+                ),
+            ):
+                self.coordinator._validate_tool_calls(
+                    [
+                        tool_call(
+                            f"rejected-context-{index}",
+                            command,
+                        )
+                    ],
+                    TOOL_SCHEMAS,
+                    "implementer",
+                )
+
     def test_only_implementer_may_write_and_destructive_commands_always_fail(self) -> None:
         write = [
             {
