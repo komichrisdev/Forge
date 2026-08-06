@@ -900,12 +900,64 @@ class OpenWebUIGateway:
         )
 
 
+def terminal_tool_schemas(
+    tools: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    schemas: dict[str, dict[str, Any]] = {}
+
+    for tool in tools:
+        function = (
+            tool.get("function")
+            if isinstance(tool, dict)
+            else None
+        )
+        name = (
+            function.get("name")
+            if isinstance(function, dict)
+            else None
+        )
+        parameters = (
+            function.get("parameters")
+            if isinstance(function, dict)
+            else None
+        )
+
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(parameters, dict)
+        ):
+            raise SoloError(
+                "Open Terminal tool schema is malformed."
+            )
+
+        if name in schemas:
+            raise SoloError(
+                "Open Terminal tool schema name is duplicated: "
+                + name
+            )
+
+        schemas[name] = parameters
+
+    return schemas
+
+
+PROCESS_TOOL_SCHEMAS = terminal_tool_schemas(
+    PROCESS_TOOLS
+)
+
+
 class ForgePolicy:
     def __init__(self, config: AppConfig) -> None:
         self.coordinator = DeveloperCoordinator(config)
+        self.tool_schemas = PROCESS_TOOL_SCHEMAS
 
     def validate(self, call: dict[str, Any]) -> dict[str, Any]:
-        result = self.coordinator._validate_tool_calls([call], PROCESS_TOOLS, "implementer")
+        result = self.coordinator._validate_tool_calls(
+            [call],
+            self.tool_schemas,
+            "implementer",
+        )
         if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], dict):
             raise SoloError("Forge policy returned an invalid result.")
         return result[0]

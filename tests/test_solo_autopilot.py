@@ -10,7 +10,9 @@ import subprocess
 import unittest
 
 from swarm_router.solo_autopilot import (
+    ForgePolicy,
     OpenWebUIGateway,
+    PROCESS_TOOL_SCHEMAS,
     Runner,
     SharedWriterLease,
     Store,
@@ -97,6 +99,22 @@ class FakeClient:
         return response("CONTINUE")
 
 
+class CapturingCoordinator:
+    def __init__(self) -> None:
+        self.tool_schemas: dict[str, dict[str, Any]] | None = None
+        self.role = ""
+
+    def _validate_tool_calls(
+        self,
+        calls: list[dict[str, Any]],
+        tool_schemas: dict[str, dict[str, Any]],
+        role: str,
+    ) -> list[dict[str, Any]]:
+        self.tool_schemas = tool_schemas
+        self.role = role
+        return calls
+
+
 class SoloTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = TemporaryDirectory()
@@ -134,6 +152,48 @@ class SoloTest(unittest.TestCase):
         payload = client.payloads[0]
         self.assertEqual(payload["model"], MODEL)
         self.assertFalse(payload["parallel_tool_calls"])
+
+    def test_forge_policy_registers_terminal_tools_by_name(self) -> None:
+        coordinator = CapturingCoordinator()
+        policy = ForgePolicy.__new__(ForgePolicy)
+        policy.coordinator = coordinator
+        policy.tool_schemas = PROCESS_TOOL_SCHEMAS
+        tool_call = call(
+            "status-call",
+            "run_command",
+            {
+                "command": "git status --short",
+                "cwd": "/workspace/forge",
+                "wait": 30,
+            },
+        )
+
+        self.assertEqual(
+            policy.validate(tool_call),
+            tool_call,
+        )
+        self.assertEqual(
+            coordinator.role,
+            "implementer",
+        )
+        self.assertEqual(
+            set(
+                coordinator.tool_schemas
+                or {}
+            ),
+            {
+                "run_command",
+                "get_process_status",
+                "kill_process",
+            },
+        )
+        self.assertEqual(
+            (
+                coordinator.tool_schemas
+                or {}
+            )["run_command"]["type"],
+            "object",
+        )
 
     def test_fresh_context_resumes_from_checkpoint(self) -> None:
         store = self.store()
