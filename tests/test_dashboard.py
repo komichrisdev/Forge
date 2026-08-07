@@ -218,7 +218,7 @@ class DashboardTest(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(overview["forge_version"], "0.12-dev")
             self.assertEqual(overview["night_owl"]["schedule_id"], "FS-20260728-000001")
-        for path in ("/api/tasks", f"/api/tasks/{forge_task_id}", "/api/developer-runs", "/api/schedules", "/api/night-owl", "/api/notifications", "/api/agents", "/api/providers"):
+        for path in ("/api/tasks", f"/api/tasks/{forge_task_id}", "/api/developer-runs", "/api/schedules", "/api/night-owl", "/api/notifications", "/api/agents", "/api/agents-models", "/api/providers"):
             status, data, _ = self.call(path, cookie=cookie)
             self.assertEqual(status, 200, path)
             self.assertIsInstance(data, dict)
@@ -232,6 +232,228 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("confirm:'generate image'", FORGE_HTML)
         self.assertIn("/api/tasks/", FORGE_HTML)
         self.assertIn("Developer Runs", FORGE_HTML)
+        self.assertIn('data-view="agents-models"', FORGE_HTML)
+        self.assertIn('data-view="providers"', FORGE_HTML)
+
+
+    def test_agents_models_view_preserves_identity_and_reports_runtime_evidence(
+        self,
+    ) -> None:
+        self.assertEqual(
+            self.call(
+                "/api/agents-models"
+            )[0],
+            401,
+        )
+
+        self.app.catalog.reconcile_inventory(
+            "nvidia",
+            provider_items(
+                [
+                    ProviderModel(
+                        "nvidia",
+                        "nvidia/model-a",
+                        "Model A",
+                        {
+                            "capabilities": [
+                                "reasoning.fast"
+                            ],
+                            "supports_streaming": True,
+                        },
+                    ),
+                    ProviderModel(
+                        "nvidia",
+                        "nvidia/model-b",
+                        "Model B",
+                        {
+                            "capabilities": [
+                                "reasoning.fast"
+                            ],
+                            "supports_streaming": True,
+                        },
+                    ),
+                ]
+            ),
+            mode="live",
+        )
+
+        self.app.catalog.record_probe(
+            "nvidia/model-a",
+            "healthy",
+            10,
+        )
+
+        self.app.catalog.record_probe(
+            "nvidia/model-b",
+            "healthy",
+            12,
+        )
+
+        self.app.catalog.record_task_attempt(
+            "fixture-capacity",
+            "nvidia/model-b",
+            "planner",
+            "code",
+            "capacity",
+            25,
+        )
+
+        def agent_state(
+            model_id: str,
+        ) -> dict[str, Any]:
+            state = self.app.registry.status()
+
+            for agent in state["agents"]:
+                if agent["agent_id"] == "planner":
+                    agent.update(
+                        {
+                            "model_id": model_id,
+                            "provider": "nvidia",
+                            "routing": "dynamic",
+                        }
+                    )
+
+            return state
+
+        with patch.object(
+            self.app,
+            "agents_status",
+            return_value=agent_state(
+                "nvidia/model-a"
+            ),
+        ):
+            before = (
+                self.app.agents_models_status()
+            )
+
+        with patch.object(
+            self.app,
+            "agents_status",
+            return_value=agent_state(
+                "nvidia/model-b"
+            ),
+        ):
+            after = (
+                self.app.agents_models_status()
+            )
+
+        before_planner = next(
+            item
+            for item in before["agents"]
+            if item["agent_id"] == "planner"
+        )
+
+        after_planner = next(
+            item
+            for item in after["agents"]
+            if item["agent_id"] == "planner"
+        )
+
+        self.assertEqual(
+            before_planner["logical_identity"],
+            "planner",
+        )
+
+        self.assertEqual(
+            after_planner["logical_identity"],
+            "planner",
+        )
+
+        self.assertNotEqual(
+            before_planner["current_model"],
+            after_planner["current_model"],
+        )
+
+        self.assertEqual(
+            after_planner["current_model"],
+            "nvidia/model-b",
+        )
+
+        self.assertEqual(
+            after_planner["current_provider"],
+            "nvidia",
+        )
+
+        self.assertEqual(
+            after_planner["health"]["source"],
+            "measured",
+        )
+
+        self.assertEqual(
+            after_planner["capacity"],
+            {
+                "status": "cooldown",
+                "source": "measured",
+                "recent_failures": 1,
+                "cooldown_until": (
+                    after_planner[
+                        "capacity"
+                    ][
+                        "cooldown_until"
+                    ]
+                ),
+            },
+        )
+
+        self.assertTrue(
+            after_planner[
+                "capacity"
+            ][
+                "cooldown_until"
+            ]
+        )
+
+        self.assertTrue(
+            any(
+                item["model_id"]
+                == "nvidia/model-a"
+                for item in after_planner[
+                    "fallback_chain"
+                ]
+            )
+        )
+
+        self.assertTrue(
+            any(
+                "capacity"
+                in failure
+                for failure in after_planner[
+                    "recent_failures"
+                ]
+            )
+        )
+
+        self.assertTrue(
+            after["provider_admin"][
+                "preserved"
+            ]
+        )
+
+        self.assertEqual(
+            after["provider_admin"]["path"],
+            "/api/providers",
+        )
+
+        self.assertEqual(
+            after["raw_inventory"][
+                "provider_count"
+            ],
+            1,
+        )
+
+        cookie, _csrf = self.login()
+
+        status, payload, _ = self.call(
+            "/api/agents-models",
+            cookie=cookie,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("agents", payload)
+        self.assertIn(
+            "raw_inventory",
+            payload,
+        )
 
     def test_probe_forwards_catalog_context(self) -> None:
         self.app.catalog.sync([{"id": "worker/model", "context_length": 28672}])

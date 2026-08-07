@@ -102,20 +102,20 @@ FORGE_HTML = r'''<!doctype html>
 </style></head><body>
 <header><div><h1>Forge LAN Operations</h1><div class="muted">Owner-operated dashboard for local Forge automation.</div></div><div class="row"><a id="openwebui" href="#" target="_blank" rel="noreferrer">Open WebUI</a><button id="refresh">Refresh</button><button id="logout">Logout</button></div></header>
 <section id="login" class="panel login"><h2>Owner login</h2><p class="muted">Use the dashboard secret from the local Forge configuration.</p><input id="secret" type="password" autocomplete="current-password" style="width:100%" placeholder="Dashboard secret"><div class="row" style="margin-top:10px"><button id="loginButton">Login</button><span id="loginStatus" class="muted"></span></div></section>
-<nav id="nav" class="hide" aria-label="Dashboard views"><button data-view="overview" aria-current="true">Overview</button><button data-view="images">Image Generation</button><button data-view="developer-runs">Developer Runs</button><button data-view="tasks">Tasks</button><button data-view="schedules">Schedules</button><button data-view="nightowl">Night Owl</button><button data-view="notifications">Notifications</button><button data-view="agents">Agents</button><button data-view="providers">Providers</button><button data-view="dispatch">Dispatch</button></nav>
+<nav id="nav" class="hide" aria-label="Dashboard views"><button data-view="overview" aria-current="true">Overview</button><button data-view="images">Image Generation</button><button data-view="developer-runs">Developer Runs</button><button data-view="tasks">Tasks</button><button data-view="schedules">Schedules</button><button data-view="nightowl">Night Owl</button><button data-view="notifications">Notifications</button><button data-view="agents-models">Agents &amp; Models</button><button data-view="providers">Providers</button><button data-view="dispatch">Dispatch</button></nav>
 <main id="app" class="hide"><div id="content" class="panel">Loading…</div></main>
 <script>
 let csrf='',view='overview',cache={};
 const $=id=>document.getElementById(id);
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function cls(s){s=String(s??'').toLowerCase();return s.includes('fail')||s==='disabled'||s==='error'?'failed':s.includes('warn')||s.includes('unknown')||s==='blocked'||s==='overdue'||s==='running'?'warning':'healthy'}
+function cls(s){s=String(s??'').toLowerCase();return s.includes('fail')||s==='disabled'||s==='error'||s==='unavailable'?'failed':s.includes('warn')||s.includes('unknown')||s==='blocked'||s==='overdue'||s==='running'||s==='cooldown'||s==='degraded'||s==='capacity'?'warning':'healthy'}
 async function api(path,opts={}){opts.headers={...(opts.headers||{}),'Content-Type':'application/json'};if(csrf)opts.headers['X-CSRF-Token']=csrf;const r=await fetch(path,opts);let text=await r.text();let data={};try{data=text?JSON.parse(text):{}}catch{data={error:text}}if(!r.ok)throw new Error(data.error||data.message||text||r.status);return data}
 async function login(){try{const d=await api('/api/login',{method:'POST',body:JSON.stringify({secret:$('secret').value})});csrf=d.csrf_token;$('login').classList.add('hide');$('nav').classList.remove('hide');$('app').classList.remove('hide');await load()}catch(e){$('loginStatus').textContent=e.message}}
 async function session(){try{const d=await api('/api/session');csrf=d.csrf_token||'';if(d.authenticated){$('login').classList.add('hide');$('nav').classList.remove('hide');$('app').classList.remove('hide');await load();return}}catch{}$('app').classList.add('hide');$('nav').classList.add('hide');$('login').classList.remove('hide')}
 function card(k,v,s=''){return `<section class="panel"><div class="muted">${esc(k)}</div><strong class="${cls(s||v)}">${esc(v)}</strong></section>`}
 function table(rows,cols){return `<table><thead><tr>${cols.map(c=>`<th>${esc(c[0])}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[1](r)}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${cols.length}" class="muted">No rows.</td></tr>`}</tbody></table>`}
 async function load(){try{cache[view]=await api('/api/'+view.replace('nightowl','night-owl'));render()}catch(e){$('content').innerHTML=`<p class="failed">${esc(e.message)}</p>`}}
-function render(){const d=cache[view]||{};if(view==='overview')return renderOverview(d);if(view==='images')return renderImages(d);if(view==='developer-runs')return renderDeveloperRuns(d);if(view==='tasks')return renderTasks(d);if(view==='schedules')return renderSchedules(d);if(view==='nightowl')return renderNightOwl(d);if(view==='notifications')return renderNotifications(d);if(view==='agents')return renderAgents(d);if(view==='providers')return renderProviders(d);renderDispatch(d)}
+function render(){const d=cache[view]||{};if(view==='overview')return renderOverview(d);if(view==='images')return renderImages(d);if(view==='developer-runs')return renderDeveloperRuns(d);if(view==='tasks')return renderTasks(d);if(view==='schedules')return renderSchedules(d);if(view==='nightowl')return renderNightOwl(d);if(view==='notifications')return renderNotifications(d);if(view==='agents-models')return renderAgentsModels(d);if(view==='agents')return renderAgents(d);if(view==='providers')return renderProviders(d);renderDispatch(d)}
 function renderOverview(d){$('openwebui').href=d.openwebui?.url||'#';$('content').innerHTML=`<h2>Overview</h2><div class="grid">${card('Forge',`${d.forge_version} / ${d.architecture_revision}`)+card('Personal backend',d.personal_backend?.status||'unknown')+card('Scheduler service',d.scheduler_service?.status||'unknown')+card('Dashboard service',d.dashboard_service?.status||'unknown')+card('Open WebUI',d.openwebui?.status||'unknown')+card('Night Owl',`${d.night_owl?.enabled?'enabled':'disabled'} · ${d.night_owl?.next_run_at||'no next run'}`,d.night_owl?.enabled?'enabled':'disabled')+card('Discord',d.discord?.valid?'configured':'not configured',d.discord?.valid?'healthy':'failed')+card('Notifications',d.discord?.latest_delivery?.status||'none')+card('Providers',`${d.providers?.provider_count||0} providers / ${d.providers?.model_count||0} models`)+card('Quarantined models',d.providers?.quarantined_model_count||0,d.providers?.quarantined_model_count?'warning':'healthy')+card('Active tasks',d.tasks?.active_count||0,d.tasks?.active_count?'warning':'healthy')+card('Failed tasks',d.tasks?.failed_count||0,d.tasks?.failed_count?'failed':'healthy')+card('Suspected orphans',d.tasks?.suspected_orphan_count||0,d.tasks?.suspected_orphan_count?'warning':'healthy')}</div><pre>${esc(JSON.stringify(d,null,2))}</pre>`}
 function renderTasks(d){$('content').innerHTML=`<h2>Tasks</h2>${table(d.tasks||[],[['Forge task',r=>`<button onclick="taskDetail('${esc(r.task_id)}')">${esc(r.task_id)}</button>`],['Personal',r=>esc(r.personal_task_id||'')],['Type',r=>esc(r.task_type||'')],['Agent',r=>esc((r.agents||[]).join(', ')||r.agent_id||'')],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Created',r=>esc(r.created_at_display||r.created_at||'')],['Updated',r=>esc(r.updated_at_display||r.updated_at||'')],['Completed',r=>esc(r.completion_time_display||r.completion_time||'')],['Schedule',r=>esc(r.schedule_id||'')],['Recovery',r=>esc(r.recovery_status?.replay_safety||'')]])}<div id="detail"></div>`}
 function renderDeveloperRuns(d){$('content').innerHTML=`<h2>Developer Runs</h2><p class="muted">Read-only orchestration state; terminal output and credentials are hidden.</p>${table(d.runs||[],[['Run',r=>`<button onclick="taskDetail('${esc(r.run_id)}')">${esc(r.run_id)}</button>`],['Task',r=>esc(r.requested_task)],['Phase',r=>esc(r.phase)],['Models',r=>Object.entries(r.roles||{}).map(([k,v])=>`${esc(k)}: ${esc(v.provider)}/${esc(v.model)}`).join('<br>')],['Writer',r=>esc(r.writer_lock?.state||'available')],['Status',r=>`<span class="${cls(r.status)}">${esc(r.status)}</span>`],['Tool',r=>esc(r.last_tool_call)],['Files',r=>esc(r.changed_file_count)],['Tests',r=>esc(r.test_state)],['Review',r=>esc(r.review_state)],['Fallback/failure',r=>esc(r.failure_summary)],['Created',r=>esc(r.created_at)],['Updated',r=>esc(r.updated_at)]])}<div id="detail"></div>`}
@@ -125,6 +125,7 @@ function renderSchedules(d){$('content').innerHTML=`<h2>Schedules</h2>${table(d.
 async function night(action,confirmText){const d=await api('/api/night-owl/'+action,{method:'POST',body:JSON.stringify({confirm:confirmText})});alert(JSON.stringify(d,null,2));await load()}
 function renderNightOwl(d){$('content').innerHTML=`<h2>Night Owl</h2><div class="grid">${card('Schedule',d.schedule?.enabled?'enabled':'disabled',d.schedule?.enabled?'enabled':'disabled')+card('Cadence',d.schedule?.trigger_configuration?.expression||'')+card('Next run',d.schedule?.next_run_at||'')+card('Last run',d.schedule?.last_run_at||'')+card('Legacy cron',d.legacy_cron?.status||'unknown')+card('Last Discord',d.last_discord_delivery?.status||'none')}</div><div class="panel actions"><button onclick="night('dry-run','run night owl dry-run')">Run dry-run</button><button onclick="night('live','RUN NIGHT OWL LIVE')">Run live</button></div><pre>${esc(JSON.stringify(d,null,2))}</pre>`}
 function renderNotifications(d){$('content').innerHTML=`<h2>Notifications</h2>${(d.unknown||[]).length?'<p class="warning">Unknown deliveries require manual review.</p>':''}${table(d.notifications||[],[['ID',r=>esc(r.notification_id)],['Event',r=>esc(r.event_type)],['Severity',r=>esc(r.severity)],['State',r=>`<span class="${cls(r.status)}">${esc(r.status)} / ${esc(r.side_effect_state)}</span>`],['Task',r=>esc(r.forge_task_id||r.task_id||'')],['Time',r=>esc(r.created_at_display||r.created_at)],['External',r=>esc(r.external_message_id||'')],['Error',r=>esc(r.error_summary||'')]])}`}
+function renderAgentsModels(d){const agents=d.agents||[],raw=d.raw_inventory||{};$('content').innerHTML=`<h2>Agents &amp; Models</h2><p class="muted">Logical agent identity remains stable while the backing runtime may rotate. Health and capacity explicitly distinguish measured evidence from unknown state.</p><div class="grid">${card('Logical agents',d.agent_count||agents.length)+card('Assigned runtimes',d.assigned_count||0)+card('Active runs',d.active_run_count||0,d.active_run_count?'warning':'healthy')+card('Unknown capacity',d.unknown_capacity_count||0,d.unknown_capacity_count?'warning':'healthy')}</div>${table(agents,[['Logical agent',r=>`<b>${esc(r.display_name||r.agent_id)}</b><div class="muted">${esc(r.logical_identity||r.agent_id)} · ${esc(r.routing||'unassigned')}</div>`],['Role',r=>esc((r.supported_task_types||[]).join(', ')||'unclassified')],['Current runtime',r=>`${esc(r.current_model||'unassigned')}<div class="muted">${esc(r.current_provider||'unknown provider')}</div>`],['Fallback chain',r=>(r.fallback_chain||[]).map(x=>`${esc(x.model_id)}<div class="muted">${esc(x.provider||'')} · <span class="${cls(x.health)}">${esc(x.health||'unknown')}</span></div>`).join('<br>')||'<span class="muted">none available</span>'],['Health',r=>`<span class="${cls(r.health?.status)}">${esc(r.health?.status||'unknown')}</span><div class="muted">${esc(r.health?.source||'unknown')} evidence</div>`],['Capacity',r=>`<span class="${cls(r.capacity?.status)}">${esc(r.capacity?.status||'unknown')}</span><div class="muted">${esc(r.capacity?.source||'unknown')} evidence${r.capacity?.recent_failures?` · ${esc(r.capacity.recent_failures)} recent capacity failure(s)`:''}${r.capacity?.cooldown_until?`<br>until ${esc(r.capacity.cooldown_until)}`:''}</div>`],['Active run',r=>r.active_run?`<b>${esc(r.active_run.run_id||'')}</b><div class="muted">${esc(r.active_run.status||'')} · ${esc(r.active_run.kind||'')}</div>`:'<span class="muted">none</span>'],['Recent failures',r=>(r.recent_failures||[]).map(x=>esc(x)).join('<br>')||'<span class="muted">none recorded</span>']])}<details><summary>Raw provider inventory (${esc(raw.provider_count||0)} providers / ${esc(raw.model_count||0)} models)</summary><p class="muted">This inventory is read-only here. Existing provider administration remains available in the Providers view.</p><button onclick="$('nav').querySelector('[data-view=providers]').click()">Open provider administration</button><h3>Providers</h3>${table(raw.providers||[],[['Provider',r=>esc(r.provider_id)],['Health',r=>`<span class="${cls(r.health)}">${esc(r.health||'unknown')}</span>`],['Inventory',r=>esc(r.inventory_revision??'unknown')],['Refresh status',r=>esc(r.last_inventory_status||'unknown')],['Last refresh',r=>esc(r.last_refresh_attempt||'unknown')],['Cooldown',r=>esc(r.cooldown_until||'none')],['Error',r=>esc(r.last_inventory_error||'')]])}<h3>Models</h3>${table(raw.models||[],[['Provider',r=>esc(r.provider_id)],['Model',r=>esc(r.model_id)],['Health',r=>`<span class="${cls(r.health)}">${esc(r.health||'unknown')}</span>`],['Available',r=>esc(r.available)],['Observed',r=>esc(r.observed_available)],['Quarantined',r=>esc(r.quarantined)],['Capabilities',r=>esc((r.capabilities||[]).join(', '))],['Context',r=>esc(r.context_length??'unknown')]])}</details>`}
 function renderAgents(d){$('content').innerHTML=`<h2>Agents</h2>${table(d.agents||[],[['ID',r=>esc(r.agent_id)],['Name',r=>esc(r.display_name)],['Model',r=>esc(r.model_id||'')],['Provider',r=>esc(r.provider||'')],['Routing',r=>esc(r.routing||'')],['Enabled',r=>esc(r.enabled)],['Task types',r=>esc((r.supported_task_types||[]).join(', '))],['Version',r=>esc(r.version)],['Description',r=>esc(r.description)]])}`}
 function renderProviders(d){$('content').innerHTML=`<h2>Providers</h2>${table(d.providers||[],[['Provider',r=>esc(r.provider_id)],['Health',r=>`<span class="${cls(r.health)}">${esc(r.health)}</span>`],['Revision',r=>esc(r.inventory_revision)],['Last refresh',r=>esc(r.last_refresh_attempt||'')],['Cooldown',r=>esc(r.cooldown_until||'')]])}<h3>Models</h3>${table(d.models||[],[['Provider',r=>esc(r.provider_id)],['Model',r=>esc(r.model_id)],['Health',r=>esc(r.health)],['Capabilities',r=>esc((r.capabilities||[]).join(', '))],['Flags',r=>esc(`${r.quarantined?'quarantined ':''}${r.available?'available':'disabled'}`)]])}`}
 async function imageSubmit(){const body={preset_id:$('imagePreset').value,prompt:$('imagePrompt').value,negative_prompt:$('imageNegative').value,seed:$('imageSeed').value,notification_requested:$('imageDiscord').checked,confirm:'generate image'};const d=await api('/api/images/generate',{method:'POST',body:JSON.stringify(body)});$('imageResult').textContent=JSON.stringify(d,null,2);const taskId=d&&(d.forge_task_id||d.task_id);if(taskId){const poll=async()=>{try{const t=await api('/api/tasks/'+encodeURIComponent(taskId));$('imageResult').textContent=JSON.stringify(t,null,2);const status=String(t?.task?.status||t?.status||'').toLowerCase();if(status==='completed'||status==='failed'||status==='cancelled'){await load();return}}catch(e){$('imageResult').textContent+='\n'+e.message}setTimeout(poll,1500)};poll()}else{await load()}}
@@ -788,6 +789,468 @@ class DashboardApp:
             )
         return status
 
+    def agents_models_status(self) -> dict[str, Any]:
+        agent_state = self.agents_status()
+        provider_state = self.provider_summary()
+
+        model_rows = {
+            str(item.get("model_id") or ""): item
+            for item in self.list_models()
+            if item.get("model_id")
+        }
+
+        provider_rows = {
+            str(item.get("provider_id") or ""): item
+            for item in provider_state.get("providers", [])
+            if item.get("provider_id")
+        }
+
+        active_statuses = {
+            "created",
+            "assigned",
+            "queued",
+            "running",
+            "continue",
+            "paused_capacity",
+            "paused_writer",
+        }
+
+        active_by_agent: dict[str, dict[str, Any]] = {}
+
+        for task in self.task_rows():
+            task_status = str(
+                task.get("status")
+                or ""
+            ).lower()
+
+            if task_status not in active_statuses:
+                continue
+
+            task_agents: set[str] = set()
+
+            agent_id = str(
+                task.get("agent_id")
+                or ""
+            ).strip()
+
+            if agent_id:
+                task_agents.add(agent_id)
+
+            listed_agents = task.get(
+                "agents",
+                [],
+            )
+
+            if isinstance(
+                listed_agents,
+                (list, tuple, set),
+            ):
+                task_agents.update(
+                    str(value).strip()
+                    for value in listed_agents
+                    if str(value).strip()
+                )
+
+            for logical_agent in task_agents:
+                active_by_agent.setdefault(
+                    logical_agent,
+                    {
+                        "run_id": str(
+                            task.get("task_id")
+                            or task.get("personal_task_id")
+                            or ""
+                        ),
+                        "status": task_status,
+                        "kind": "task",
+                    },
+                )
+
+        developer_state = self.developer_rows()
+
+        for run in developer_state.get(
+            "runs",
+            [],
+        ):
+            run_status = str(
+                run.get("status")
+                or ""
+            ).lower()
+
+            if run_status not in active_statuses:
+                continue
+
+            roles = run.get(
+                "roles",
+                {},
+            )
+
+            if not isinstance(
+                roles,
+                dict,
+            ):
+                continue
+
+            for logical_agent in roles:
+                active_by_agent.setdefault(
+                    str(logical_agent),
+                    {
+                        "run_id": str(
+                            run.get("run_id")
+                            or ""
+                        ),
+                        "status": run_status,
+                        "kind": "developer",
+                    },
+                )
+
+        unified_agents: list[
+            dict[str, Any]
+        ] = []
+
+        for raw_agent in agent_state.get(
+            "agents",
+            [],
+        ):
+            agent = dict(raw_agent)
+
+            agent_id = str(
+                agent.get("agent_id")
+                or ""
+            )
+
+            current_model = str(
+                agent.get("model_id")
+                or ""
+            )
+
+            current_provider = str(
+                agent.get("provider")
+                or ""
+            )
+
+            model = dict(
+                model_rows.get(
+                    current_model,
+                    {},
+                )
+            )
+
+            provider_id = str(
+                model.get("provider_id")
+                or current_provider
+            )
+
+            provider = dict(
+                provider_rows.get(
+                    provider_id,
+                    {},
+                )
+            )
+
+            recent_attempts = int(
+                model.get(
+                    "recent_attempts",
+                    0,
+                )
+                or 0
+            )
+
+            probe_attempts = int(
+                model.get(
+                    "probe_attempts",
+                    0,
+                )
+                or 0
+            )
+
+            recent_capacity_failures = int(
+                model.get(
+                    "recent_capacity_failures",
+                    0,
+                )
+                or 0
+            )
+
+            health_status = str(
+                model.get("health")
+                or model.get("probe_status")
+                or provider.get("health")
+                or "unknown"
+            )
+
+            if health_status == "capacity":
+                health_status = "degraded"
+
+            health_source = (
+                "measured"
+                if model
+                and (
+                    recent_attempts > 0
+                    or probe_attempts > 0
+                    or health_status
+                    not in {
+                        "",
+                        "unknown",
+                    }
+                )
+                else "unknown"
+            )
+
+            cooldown_until = str(
+                model.get("cooldown_until")
+                or provider.get("cooldown_until")
+                or ""
+            )
+
+            cooldown = bool(
+                model.get("cooldown")
+                or cooldown_until
+            )
+
+            if not model:
+                capacity_status = "unknown"
+                capacity_source = "unknown"
+            elif cooldown:
+                capacity_status = "cooldown"
+                capacity_source = "measured"
+            elif recent_capacity_failures:
+                capacity_status = "degraded"
+                capacity_source = "measured"
+            elif (
+                model.get("available")
+                and model.get(
+                    "observed_available"
+                )
+            ):
+                capacity_status = "available"
+                capacity_source = (
+                    "measured"
+                    if int(
+                        model.get(
+                            "inventory_revision",
+                            0,
+                        )
+                        or 0
+                    )
+                    or recent_attempts
+                    or probe_attempts
+                    else "unknown"
+                )
+            else:
+                capacity_status = "unavailable"
+                capacity_source = (
+                    "measured"
+                    if int(
+                        model.get(
+                            "inventory_revision",
+                            0,
+                        )
+                        or 0
+                    )
+                    else "unknown"
+                )
+
+            fallback_chain: list[
+                dict[str, Any]
+            ] = []
+
+            excluded = (
+                {current_model}
+                if current_model
+                else set()
+            )
+
+            for fallback_record in self.catalog.recommend(
+                "auto",
+                4,
+                self.config.reliability,
+                role=agent_id,
+                excluded_models=excluded,
+            ):
+                evidence = self.catalog.as_dict(
+                    fallback_record,
+                    self.config.reliability,
+                )
+
+                fallback_chain.append(
+                    {
+                        "model_id": (
+                            fallback_record.model_id
+                        ),
+                        "provider": (
+                            fallback_record.provider
+                        ),
+                        "health": (
+                            evidence.get("health")
+                            or evidence.get(
+                                "probe_status"
+                            )
+                            or "unknown"
+                        ),
+                        "capacity": (
+                            "cooldown"
+                            if evidence.get("cooldown")
+                            or evidence.get(
+                                "cooldown_until"
+                            )
+                            else (
+                                "available"
+                                if evidence.get(
+                                    "available"
+                                )
+                                and evidence.get(
+                                    "observed_available"
+                                )
+                                else "unavailable"
+                            )
+                        ),
+                    }
+                )
+
+            recent_failures: list[str] = []
+
+            def add_failure(
+                value: Any,
+            ) -> None:
+                text = str(
+                    value
+                    or ""
+                ).strip()
+
+                if (
+                    text
+                    and text
+                    not in recent_failures
+                ):
+                    recent_failures.append(
+                        text
+                    )
+
+            if recent_capacity_failures:
+                add_failure(
+                    f"capacity ({recent_capacity_failures} recent)"
+                )
+
+            consecutive_failures = int(
+                model.get(
+                    "consecutive_failures",
+                    0,
+                )
+                or 0
+            )
+
+            if consecutive_failures:
+                add_failure(
+                    "consecutive failures: "
+                    + str(
+                        consecutive_failures
+                    )
+                )
+
+            for key in (
+                "last_failure",
+                "probe_error",
+                "last_inventory_error",
+            ):
+                add_failure(
+                    model.get(key)
+                )
+
+            add_failure(
+                provider.get(
+                    "last_inventory_error"
+                )
+            )
+
+            for failure in model.get(
+                "known_failure_categories",
+                [],
+            ):
+                add_failure(failure)
+
+            agent.update(
+                {
+                    "logical_identity": agent_id,
+                    "current_model": current_model,
+                    "current_provider": (
+                        current_provider
+                        or provider_id
+                    ),
+                    "fallback_chain": (
+                        fallback_chain
+                    ),
+                    "health": {
+                        "status": health_status,
+                        "source": health_source,
+                    },
+                    "capacity": {
+                        "status": capacity_status,
+                        "source": capacity_source,
+                        "recent_failures": (
+                            recent_capacity_failures
+                        ),
+                        "cooldown_until": (
+                            cooldown_until
+                        ),
+                    },
+                    "active_run": (
+                        active_by_agent.get(
+                            agent_id
+                        )
+                    ),
+                    "recent_failures": (
+                        recent_failures[:8]
+                    ),
+                }
+            )
+
+            unified_agents.append(agent)
+
+        return _sanitize(
+            {
+                "registry_version": (
+                    agent_state.get(
+                        "registry_version"
+                    )
+                ),
+                "agent_count": len(
+                    unified_agents
+                ),
+                "assigned_count": sum(
+                    bool(
+                        item.get(
+                            "current_model"
+                        )
+                    )
+                    for item in unified_agents
+                ),
+                "active_run_count": sum(
+                    bool(
+                        item.get(
+                            "active_run"
+                        )
+                    )
+                    for item in unified_agents
+                ),
+                "unknown_capacity_count": sum(
+                    item.get(
+                        "capacity",
+                        {},
+                    ).get("source")
+                    == "unknown"
+                    for item in unified_agents
+                ),
+                "agents": unified_agents,
+                "raw_inventory": (
+                    provider_state
+                ),
+                "provider_admin": {
+                    "path": "/api/providers",
+                    "preserved": True,
+                },
+            }
+        )
+
     def _scheduler(self) -> Scheduler:
         return Scheduler(self.config, submit_task=self._submit_schedule_task)
 
@@ -965,6 +1428,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.app.notification_rows()
         if path.startswith("/api/notifications/"):
             return self.app.notifications.get(path.removeprefix("/api/notifications/"))
+        if path == "/api/agents-models":
+            return self.app.agents_models_status()
         if path == "/api/agents":
             return self.app.agents_status()
         if path == "/api/providers":
