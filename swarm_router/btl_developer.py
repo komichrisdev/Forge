@@ -175,7 +175,7 @@ def run_model_phase(
                 recoverable_errors += 1
                 signature = (name, exc.code, json.dumps(arguments, sort_keys=True, default=str))
                 repeated_errors[signature] = repeated_errors.get(signature, 0) + 1
-                if repeated_errors[signature] >= SAME_ERROR_REPEAT_LIMIT:
+                if repeated_errors[signature] > SAME_ERROR_REPEAT_LIMIT:
                     raise BTLDeveloperError(
                         f"tool {name!r} repeated recoverable error {exc.code!r}"
                     ) from exc

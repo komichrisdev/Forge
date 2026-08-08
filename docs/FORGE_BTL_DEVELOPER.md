@@ -31,8 +31,9 @@ credential, Git-mutation, deployment, Docker, systemd, or sudo tool.
 
 Ordinary structured-tool usage errors, such as reading a missing file or
 searching a file as though it were a directory, are returned to the model as
-bounded error results. A phase permits at most four recoverable errors and
-stops on the second identical error. Traversal, symlink, Git metadata, secret,
+bounded error results. A phase permits at most four recoverable errors, returns
+at most two identical corrections, and stops on the third identical error.
+Traversal, symlink, Git metadata, secret,
 worktree-boundary, unavailable-tool, and other security errors remain fatal and
 do not return probing guidance.
 

@@ -102,12 +102,12 @@ class TestModelLoop(unittest.TestCase):
 
     def test_repeated_recoverable_call_fails_boundedly(self) -> None:
         call = completion(call=("read_file", {"path": "missing.md"}))
-        client = FakeClient(call, call, completion("must not be reached"))
+        client = FakeClient(call, call, call, completion("must not be reached"))
         with self.assertRaisesRegex(BTLDeveloperError, "repeated recoverable error"):
             run_model_phase(
-                client, "model", [], self.tools, writable=False, max_turns=3, max_tokens=128,
+                client, "model", [], self.tools, writable=False, max_turns=4, max_tokens=128,
             )
-        self.assertEqual(len(client.payloads), 2)
+        self.assertEqual(len(client.payloads), 3)
 
     def test_search_file_path_can_be_corrected(self) -> None:
         client = FakeClient(
