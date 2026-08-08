@@ -37,11 +37,20 @@ class TestBTLTools(unittest.TestCase):
         outside.write_text("secret", encoding="utf-8")
         (self.root / "escape").symlink_to(outside)
         (self.root / ".env").write_text("TOKEN=x", encoding="utf-8")
-        for value in (str(outside), "../outside.txt", "dir\\file", "escape", ".env", ".git/config"):
+        for value in (
+            str(outside), "../outside.txt", "dir\\file", "escape", ".env",
+            ".git/config", "secrets.json", "certificate.pem",
+        ):
             with self.assertRaises(ValueError, msg=value):
                 self.tools.read_file(value)
             with self.assertRaises(ValueError, msg=value):
                 self.tools.write_file(value, "x")
+
+    def test_likely_secret_content_is_not_returned_or_searched(self) -> None:
+        (self.root / "ordinary.txt").write_text("token=sk-abcdefghijklmnopqrstuvwxyz\n")
+        with self.assertRaises(ValueError):
+            self.tools.read_file("ordinary.txt")
+        self.assertEqual(self.tools.search_text("token")["matches"], [])
 
     def test_read_search_write_and_replace(self) -> None:
         self.assertIn("value = 1", self.tools.read_file("code.py")["content"])

@@ -6,6 +6,7 @@ from fnmatch import fnmatch
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -19,8 +20,22 @@ READ_TOOLS = frozenset({"list_files", "read_file", "search_text", "git_status", 
 WRITE_TOOLS = frozenset({"write_file", "replace_text"})
 SECRET_PARTS = frozenset({
     ".git", ".env", ".ssh", ".aws", ".gnupg", ".credentials",
-    "credentials", "credentials.json", "auth.json", "id_rsa", "id_ed25519",
+    "credentials", "credentials.json", "auth.json", "secrets.json", "id_rsa", "id_ed25519",
 })
+SECRET_SUFFIXES = frozenset({".key", ".pem", ".p12", ".pfx"})
+SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\b(?:sk|nvapi)-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+
+def _secret_name(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        lowered in SECRET_PARTS or lowered.startswith(".env.")
+        or Path(lowered).suffix in SECRET_SUFFIXES
+    )
 
 
 def _schema(name: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -70,8 +85,7 @@ class BTLTools:
         raw = Path(value or ".")
         if raw.is_absolute() or ".." in raw.parts or "\x00" in value or "\\" in value:
             raise ValueError("path must be relative and cannot contain '..' or backslashes")
-        lowered = {part.lower() for part in raw.parts}
-        if lowered & SECRET_PARTS or any(part.startswith(".env.") for part in lowered):
+        if any(_secret_name(part) for part in raw.parts):
             raise ValueError("Git metadata and credential paths are unavailable")
         candidate = (self.root / raw).resolve(strict=False)
         if candidate != self.root and self.root not in candidate.parents:
@@ -99,7 +113,7 @@ class BTLTools:
             raise ValueError("path is not a directory")
         entries = []
         for item in sorted(directory.iterdir(), key=lambda entry: entry.name)[:MAX_RESULTS]:
-            if item.name.lower() in SECRET_PARTS or item.name.lower().startswith(".env") or item.is_symlink():
+            if _secret_name(item.name) or item.is_symlink():
                 continue
             entries.append({"name": item.name, "type": "directory" if item.is_dir() else "file"})
         return {"path": path, "entries": entries, "truncated": len(entries) == MAX_RESULTS}
@@ -109,8 +123,11 @@ class BTLTools:
         if not file.is_file():
             raise ValueError("path is not a file")
         data = file.read_bytes()
+        content = data[:MAX_BYTES].decode("utf-8", "replace")
+        if any(pattern.search(content) for pattern in SECRET_PATTERNS):
+            raise ValueError("file contains likely credential material")
         return {
-            "path": path, "content": data[:MAX_BYTES].decode("utf-8", "replace"),
+            "path": path, "content": content,
             "size": len(data), "truncated": len(data) > MAX_BYTES,
         }
 
@@ -123,20 +140,21 @@ class BTLTools:
         matches: list[dict[str, Any]] = []
         scanned = 0
         for base, dirs, files in os.walk(directory, followlinks=False):
-            dirs[:] = [d for d in dirs if d.lower() not in SECRET_PARTS and not d.startswith(".env") and not (Path(base) / d).is_symlink()]
+            dirs[:] = [d for d in dirs if not _secret_name(d) and not (Path(base) / d).is_symlink()]
             for name in files:
                 if scanned >= MAX_FILES or len(matches) >= MAX_RESULTS:
                     break
                 file = Path(base) / name
-                lowered = name.lower()
                 if (
-                    lowered in SECRET_PARTS or lowered.startswith(".env.")
-                    or not fnmatch(name, include) or file.is_symlink()
+                    _secret_name(name) or not fnmatch(name, include) or file.is_symlink()
                     or file.stat().st_size > MAX_BYTES
                 ):
                     continue
                 scanned += 1
-                for number, line in enumerate(file.read_text("utf-8", "replace").splitlines(), 1):
+                content = file.read_text("utf-8", "replace")
+                if any(pattern.search(content) for pattern in SECRET_PATTERNS):
+                    continue
+                for number, line in enumerate(content.splitlines(), 1):
                     if query in line:
                         matches.append({"path": str(file.relative_to(self.root)), "line": number, "text": line[:2000]})
                         if len(matches) >= MAX_RESULTS:
