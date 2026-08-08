@@ -27,6 +27,9 @@ SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"\b(?:sk|nvapi)-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{16,}\b"),
 )
 
 
@@ -36,6 +39,10 @@ def _secret_name(name: str) -> bool:
         lowered in SECRET_PARTS or lowered.startswith(".env.")
         or Path(lowered).suffix in SECRET_SUFFIXES
     )
+
+
+def _contains_secret(content: str) -> bool:
+    return any(pattern.search(content) for pattern in SECRET_PATTERNS)
 
 
 def _schema(name: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -122,13 +129,14 @@ class BTLTools:
         file = self._path(path)
         if not file.is_file():
             raise ValueError("path is not a file")
-        data = file.read_bytes()
+        with file.open("rb") as handle:
+            data = handle.read(MAX_BYTES + 1)
         content = data[:MAX_BYTES].decode("utf-8", "replace")
-        if any(pattern.search(content) for pattern in SECRET_PATTERNS):
+        if _contains_secret(content):
             raise ValueError("file contains likely credential material")
         return {
             "path": path, "content": content,
-            "size": len(data), "truncated": len(data) > MAX_BYTES,
+            "size": file.stat().st_size, "truncated": len(data) > MAX_BYTES,
         }
 
     def search_text(self, query: str, path: str = "", include: str = "*") -> dict[str, Any]:
@@ -152,7 +160,7 @@ class BTLTools:
                     continue
                 scanned += 1
                 content = file.read_text("utf-8", "replace")
-                if any(pattern.search(content) for pattern in SECRET_PATTERNS):
+                if _contains_secret(content):
                     continue
                 for number, line in enumerate(content.splitlines(), 1):
                     if query in line:
@@ -169,12 +177,22 @@ class BTLTools:
         args = ["diff", "--no-ext-diff", "--no-textconv", "--"]
         if path:
             args.append(str(self._path(path).relative_to(self.root)))
-        return {"output": self._git(*args)[:MAX_BYTES]}
+        output = self._git(*args)[:MAX_BYTES]
+        if _contains_secret(output):
+            raise ValueError("diff contains likely credential material")
+        return {"output": output}
 
     def write_file(self, path: str, content: str) -> dict[str, Any]:
         if not isinstance(content, str) or len(content.encode()) > MAX_BYTES:
             raise ValueError("content must be a string no larger than 500 KB")
+        if _contains_secret(content):
+            raise ValueError("content contains likely credential material")
         file = self._path(path)
+        if file.exists():
+            if not file.is_file() or file.stat().st_size > MAX_BYTES:
+                raise ValueError("existing path is not a bounded regular file")
+            if _contains_secret(file.read_text("utf-8", "replace")):
+                raise ValueError("existing file contains likely credential material")
         file.parent.mkdir(parents=True, exist_ok=True)
         self._atomic_write(file, content)
         return {"path": path, "bytes": len(content.encode())}
@@ -188,6 +206,8 @@ class BTLTools:
         if not file.is_file() or file.stat().st_size > MAX_BYTES:
             raise ValueError("path is not a bounded regular file")
         content = file.read_text(encoding="utf-8")
+        if _contains_secret(content) or _contains_secret(new):
+            raise ValueError("file or replacement contains likely credential material")
         replacements = min(content.count(old), count)
         if not replacements:
             raise ValueError("old text was not found")
@@ -198,9 +218,18 @@ class BTLTools:
         return {"path": path, "replacements": replacements}
 
     def _git(self, *args: str) -> str:
+        environment = {
+            "PATH": os.defpath,
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
         result = subprocess.run(
-            ["git", *args], cwd=self.root, capture_output=True, text=True,
-            check=False, timeout=30, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            ["git", "-c", "core.fsmonitor=false", *args], cwd=self.root,
+            capture_output=True, text=True, check=False, timeout=30, env=environment,
         )
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or "git read failed")

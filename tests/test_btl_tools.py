@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from swarm_router.btl_tools import BTLTools, READ_TOOLS, WRITE_TOOLS
 
@@ -47,10 +48,35 @@ class TestBTLTools(unittest.TestCase):
                 self.tools.write_file(value, "x")
 
     def test_likely_secret_content_is_not_returned_or_searched(self) -> None:
-        (self.root / "ordinary.txt").write_text("token=sk-abcdefghijklmnopqrstuvwxyz\n")
+        secret = "sk-" + "abcdefghijklmnopqrstuvwxyz"
+        (self.root / "ordinary.txt").write_text(f"token={secret}\n")
         with self.assertRaises(ValueError):
             self.tools.read_file("ordinary.txt")
         self.assertEqual(self.tools.search_text("token")["matches"], [])
+        with self.assertRaises(ValueError):
+            self.tools.replace_text("ordinary.txt", "token", "key")
+        with self.assertRaises(ValueError):
+            self.tools.write_file("ordinary.txt", "safe replacement\n")
+
+    def test_secret_content_is_not_accepted_or_leaked_by_diff(self) -> None:
+        secret = "ghp_" + "a" * 30
+        with self.assertRaises(ValueError):
+            self.tools.write_file("new.txt", secret)
+        (self.root / "tracked.txt").write_text(f"before {secret}\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=self.root, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "secret fixture"],
+            cwd=self.root, capture_output=True, check=True,
+        )
+        (self.root / "tracked.txt").write_text("after\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.tools.git_diff()
+
+    def test_read_file_is_bounded(self) -> None:
+        (self.root / "large.txt").write_bytes(b"x" * 500_001)
+        result = self.tools.read_file("large.txt")
+        self.assertEqual(len(result["content"]), 500_000)
+        self.assertTrue(result["truncated"])
 
     def test_read_search_write_and_replace(self) -> None:
         self.assertIn("value = 1", self.tools.read_file("code.py")["content"])
@@ -85,6 +111,15 @@ class TestBTLTools(unittest.TestCase):
         self.assertIn("entries", json.loads(self.tools.dispatch("list_files", {}, writable=False)))
         with self.assertRaises(ValueError):
             self.tools.dispatch("read_file", {"path": "code.py", "extra": True}, writable=False)
+
+    def test_git_tools_do_not_inherit_operator_environment_or_fsmonitor(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with patch.dict("os.environ", {"OPEN_WEBUI_API_KEY": "secret"}), patch(
+            "swarm_router.btl_tools.subprocess.run", return_value=completed,
+        ) as run:
+            self.tools.git_status()
+        self.assertNotIn("OPEN_WEBUI_API_KEY", run.call_args.kwargs["env"])
+        self.assertIn("core.fsmonitor=false", run.call_args.args[0])
 
 
 if __name__ == "__main__":

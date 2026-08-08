@@ -33,6 +33,9 @@ Forge Manager alone resolves the configured base, creates the isolated worktree,
 verifies changes, commits, and pushes. Task branches use
 `btl/<FT-task-id>-<bounded-lowercase-slug>`. The remote is always `origin`, and
 the push destination is generated internally from the validated task branch.
+Authoritative unittests require `/usr/bin/bwrap` and run with a read-only task
+tree, empty HOME, no operator credentials, and no network. Forge fingerprints
+the verified changes and refuses to commit if the tree changes afterward.
 
 The default worktree root is:
 

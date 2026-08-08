@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import re
 import subprocess
@@ -12,6 +13,10 @@ REMOTE = "origin"
 TASK_ID_RE = re.compile(r"FT-[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$")
 BRANCH_RE = re.compile(r"btl/[A-Za-z0-9][A-Za-z0-9-]{1,98}$")
 SHA_RE = re.compile(r"[0-9a-f]{40}$")
+
+
+class PushConfirmationError(RuntimeError):
+    """The push was accepted, but its exact remote SHA could not be confirmed."""
 
 
 @dataclass(frozen=True)
@@ -70,11 +75,17 @@ def validate_branch(branch: str) -> bool:
 def resolve_base_sha(repo_root: Path, base_branch: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", base_branch):
         raise ValueError("invalid base branch")
-    if base_branch.startswith("btl/") or base_branch.startswith("refs/tags/"):
+    if base_branch.startswith("btl/") or base_branch.startswith(("refs/", "tags/")):
         raise ValueError("task branches and tags cannot be bases")
-    sha = _git_ok("rev-parse", "--verify", f"{base_branch}^{{commit}}", cwd=repo_root)
+    sha = _git_ok("rev-parse", "--verify", f"refs/heads/{base_branch}^{{commit}}", cwd=repo_root)
     if not SHA_RE.fullmatch(sha):
         raise RuntimeError("base branch did not resolve to a commit")
+    remote = _git("ls-remote", "--exit-code", "--heads", REMOTE, f"refs/heads/{base_branch}", cwd=repo_root)
+    remote_sha = remote.stdout.split("\t", 1)[0] if remote.returncode == 0 else ""
+    if not SHA_RE.fullmatch(remote_sha):
+        raise RuntimeError(remote.stderr.strip() or "base branch is missing from origin")
+    if remote_sha != sha:
+        raise RuntimeError("local base branch does not match origin")
     return sha
 
 
@@ -141,6 +152,27 @@ def inspect_changed_files(worktree: WorktreeInfo) -> ChangedFiles:
     return ChangedFiles(tuple(dict.fromkeys(paths)))
 
 
+def workspace_fingerprint(worktree: WorktreeInfo) -> str:
+    digest = hashlib.sha256()
+    for relative in sorted(inspect_changed_files(worktree).paths):
+        path = worktree.root / relative
+        digest.update(relative.encode("utf-8", "surrogateescape") + b"\0")
+        if not path.exists():
+            digest.update(b"deleted\0")
+            continue
+        metadata = path.lstat()
+        digest.update(f"{metadata.st_mode:o}\0".encode())
+        if path.is_symlink():
+            digest.update(path.readlink().as_posix().encode("utf-8", "surrogateescape"))
+        elif path.is_file():
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(131_072), b""):
+                    digest.update(block)
+        else:
+            digest.update(b"non-file")
+    return digest.hexdigest()
+
+
 def verify_workspace_integrity(
     worktree: WorktreeInfo, *, require_base_head: bool = False
 ) -> list[str]:
@@ -172,12 +204,14 @@ def verify_workspace_integrity(
     return issues
 
 
-def manager_commit(worktree: WorktreeInfo, message: str) -> str:
+def manager_commit(worktree: WorktreeInfo, message: str, expected_fingerprint: str = "") -> str:
     issues = verify_workspace_integrity(worktree, require_base_head=True)
     if issues:
         raise ValueError("commit blocked: " + "; ".join(issues))
     if inspect_changed_files(worktree).is_empty:
         raise ValueError("commit blocked: no changes")
+    if expected_fingerprint and workspace_fingerprint(worktree) != expected_fingerprint:
+        raise ValueError("commit blocked: worktree changed after verification")
     _git_ok("add", "--all", "--", ".", cwd=worktree.root)
     _git_ok("commit", "-m", message[:240], cwd=worktree.root)
     sha = _git_ok("rev-parse", "HEAD", cwd=worktree.root)
@@ -194,8 +228,16 @@ def manager_push(worktree: WorktreeInfo, expected_sha: str) -> str:
         raise ValueError("push SHA does not match worktree HEAD")
     destination = f"refs/heads/{worktree.branch}"
     _git_ok("push", REMOTE, f"{expected_sha}:{destination}", cwd=worktree.root, timeout=300)
-    remote = _git_ok("ls-remote", "--heads", REMOTE, destination, cwd=worktree.root, timeout=120)
-    pushed = remote.split("\t", 1)[0] if remote else ""
-    if pushed != expected_sha:
-        raise RuntimeError("remote SHA does not match implementation commit")
-    return pushed
+    last_error = ""
+    for _ in range(3):
+        remote = _git("ls-remote", "--heads", REMOTE, destination, cwd=worktree.root, timeout=120)
+        if remote.returncode == 0:
+            pushed = remote.stdout.split("\t", 1)[0] if remote.stdout else ""
+            if pushed != expected_sha:
+                raise RuntimeError("remote SHA does not match implementation commit")
+            return pushed
+        last_error = remote.stderr.strip() or remote.stdout.strip()
+    raise PushConfirmationError(
+        "push was accepted but exact remote SHA confirmation failed; reconcile the task ref before recovery"
+        + (f": {last_error}" if last_error else "")
+    )

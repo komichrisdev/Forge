@@ -15,9 +15,9 @@ from typing import Any
 
 from .btl_tools import BTLTools
 from .btl_workspace import (
-    WorktreeInfo, create_task_worktree, generate_branch, inspect_changed_files,
+    PushConfirmationError, WorktreeInfo, create_task_worktree, generate_branch, inspect_changed_files,
     manager_commit, manager_push, resolve_base_sha, validate_task_id,
-    verify_workspace_integrity,
+    verify_workspace_integrity, workspace_fingerprint,
 )
 
 
@@ -183,11 +183,12 @@ def authoritative_verification(
     worktree: WorktreeInfo, timeout_seconds: int = 900
 ) -> tuple[bool, str]:
     commands = [
-        (["git", "diff", "--check"], "git diff --check"),
-        ([sys.executable, "-m", "compileall", "-q", "swarm_router", "tests"], "compileall"),
-        ([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], "full unittest"),
+        (["git", "diff", "--check"], "git diff --check", False),
+        ([sys.executable, "-m", "compileall", "-q", "swarm_router", "tests"], "compileall", False),
+        ([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], "full unittest", True),
     ]
     summaries: list[str] = []
+    before = workspace_fingerprint(worktree)
     with tempfile.TemporaryDirectory(prefix="btl-verify-") as temporary_home:
         environment = {
             "PATH": f"{Path(sys.executable).parent}:{os.defpath}",
@@ -197,10 +198,33 @@ def authoritative_verification(
             "LC_ALL": "C.UTF-8",
             "PYTHONHASHSEED": "0",
             "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
+            # Deterministic non-credentials for tests that construct the legacy adapter.
+            "OPEN_TERMINAL_API_KEY": "btl-verification-placeholder",
+            "OPEN_TERMINAL_BASE_URL": "http://127.0.0.1:1",
         }
-        for command, label in commands:
+        for command, label, sandboxed in commands:
+            if sandboxed:
+                bubblewrap = Path("/usr/bin/bwrap")
+                if not bubblewrap.is_file():
+                    return False, f"{label}: bubblewrap is required for isolated verification"
+                root = str(worktree.root)
+                virtualenv = str(Path(sys.prefix))
+                command = [
+                    str(bubblewrap), "--die-with-parent", "--unshare-all", "--new-session",
+                    "--ro-bind", "/usr", "/usr",
+                    "--symlink", "usr/bin", "/bin",
+                    "--symlink", "usr/lib", "/lib",
+                    "--symlink", "usr/lib64", "/lib64",
+                    "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+                    "--dir", "/tmp/home", "--dir", root,
+                    "--ro-bind", root, root,
+                    "--dir", virtualenv, "--ro-bind", virtualenv, virtualenv,
+                    "--chdir", root,
+                    *command,
+                ]
             try:
                 result = subprocess.run(
                     command, cwd=worktree.root, capture_output=True, text=True,
@@ -212,6 +236,9 @@ def authoritative_verification(
                 detail = (result.stderr or result.stdout).strip()[-4000:]
                 return False, f"{label}: failed ({result.returncode})\n{detail}"
             summaries.append(f"{label}: passed")
+
+    if workspace_fingerprint(worktree) != before:
+        return False, "verification changed the task worktree"
 
     # git diff --check omits untracked files; cover their common whitespace errors.
     for relative in inspect_changed_files(worktree).paths:
@@ -240,6 +267,9 @@ def run_btl_manager(
     if not instruction.strip():
         raise ValueError("instruction must not be empty")
     repo = Path(repo_root).resolve(strict=True)
+    worktree_root = Path(config.worktree_root).expanduser().resolve()
+    if worktree_root == repo or repo in worktree_root.parents:
+        raise ValueError("BTL worktree root must be outside the normal checkout")
     state_path = _state_path(config.worktree_root, task_id)
     if state_path.exists():
         raise FileExistsError(f"task {task_id} already has persisted state; inspect it before recovery")
@@ -291,6 +321,7 @@ def run_btl_manager(
             raise BTLDeveloperError("workspace integrity failed: " + "; ".join(issues))
         if inspect_changed_files(worktree).is_empty:
             raise BTLDeveloperError("implementation made no changes")
+        verified_fingerprint = workspace_fingerprint(worktree)
         passed, record.verification_summary = authoritative_verification(
             worktree, config.verification_timeout_seconds,
         )
@@ -300,6 +331,7 @@ def run_btl_manager(
 
         record.implementation_commit = manager_commit(
             worktree, f"BTL {task_id}: {instruction.strip().splitlines()[0]}",
+            expected_fingerprint=verified_fingerprint,
         )
         _persist(state_path, record)
         record.mark(BTLTaskStatus.PUSHING)
@@ -308,6 +340,11 @@ def run_btl_manager(
         record.mark(BTLTaskStatus.READY_FOR_EXTERNAL_REVIEW)
         _persist(state_path, record)
         return record
+    except PushConfirmationError as exc:
+        record.failure_summary = str(exc)[:4000]
+        record.mark(BTLTaskStatus.BLOCKED)
+        _persist(state_path, record)
+        raise
     except Exception as exc:
         record.failure_summary = str(exc)[:4000]
         record.mark(BTLTaskStatus.FAILED)

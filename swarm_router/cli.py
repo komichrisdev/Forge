@@ -850,7 +850,7 @@ def _run_btl(args: argparse.Namespace, config, client: OpenWebUIClient) -> int:
     prompt_path = Path(args.prompt_file).expanduser().resolve(strict=True)
     if not prompt_path.is_file() or prompt_path.stat().st_size > 100_000:
         raise ValueError("--prompt-file must be a regular file no larger than 100 KB")
-    instruction = prompt_path.read_text(encoding="utf-8")
+    instruction = _read_text(str(prompt_path))
     if not instruction.strip():
         raise ValueError("BTL task instruction is empty")
     root_result = subprocess.run(

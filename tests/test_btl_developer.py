@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,7 +13,8 @@ from swarm_router.btl_developer import (
     load_task_record, run_btl_manager, run_model_phase,
 )
 from swarm_router.btl_tools import BTLTools
-from swarm_router.cli import _parser
+from swarm_router.btl_workspace import PushConfirmationError
+from swarm_router.cli import _parser, _run_btl
 from swarm_router.config import load_config
 
 
@@ -100,6 +102,7 @@ class ManagerCase(unittest.TestCase):
         subprocess.run(["git", "commit", "-m", "base"], cwd=self.repo, check=True, capture_output=True)
         subprocess.run(["git", "init", "--bare", str(self.remote)], cwd=base, check=True, capture_output=True)
         subprocess.run(["git", "remote", "add", "origin", str(self.remote)], cwd=self.repo, check=True)
+        subprocess.run(["git", "push", "origin", "feature/btl-developer"], cwd=self.repo, check=True, capture_output=True)
         self.config = BTLConfig(model_id="configured-model", worktree_root=str(self.worktrees), max_phase_turns=2)
 
     def tearDown(self) -> None:
@@ -141,10 +144,26 @@ class TestManager(ManagerCase):
         self.assertFalse(record.implementation_push_sha)
         self.assertIn("tests failed", record.failure_summary)
 
+    @patch("swarm_router.btl_developer.manager_push", side_effect=PushConfirmationError("confirm unavailable"))
+    @patch("swarm_router.btl_developer.authoritative_verification", return_value=(True, "passed"))
+    def test_accepted_push_with_unconfirmed_sha_is_blocked(self, _verify, _push) -> None:
+        with self.assertRaises(PushConfirmationError):
+            run_btl_manager(self.client(), self.repo, "FT-104", "Add value", self.config)
+        record = load_task_record(self.worktrees, "FT-104")
+        self.assertEqual(record.status, BTLTaskStatus.BLOCKED.value)
+        self.assertTrue(record.implementation_commit)
+        self.assertFalse(record.implementation_push_sha)
+
     def test_invalid_task_id_cannot_escape_persistence_root(self) -> None:
         with self.assertRaises(ValueError):
             run_btl_manager(FakeClient(), self.repo, "../FT-1", "x", self.config)
         self.assertFalse((self.worktrees.parent / "FT-1.json").exists())
+
+    def test_worktree_root_inside_checkout_is_rejected_before_state_write(self) -> None:
+        config = BTLConfig(model_id="model", worktree_root=str(self.repo / "worktrees"))
+        with self.assertRaisesRegex(ValueError, "outside the normal checkout"):
+            run_btl_manager(FakeClient(), self.repo, "FT-103", "x", config)
+        self.assertFalse((self.repo / "worktrees").exists())
 
     def test_existing_state_is_not_blindly_resumed(self) -> None:
         with patch("swarm_router.btl_developer.authoritative_verification", return_value=(False, "stop")):
@@ -166,7 +185,9 @@ class TestVerification(unittest.TestCase):
         worktree = unittest.mock.MagicMock()
         worktree.root = Path("/tmp")
         failed = subprocess.CompletedProcess([], 1, "", "fatal error")
-        with patch("swarm_router.btl_developer.subprocess.run", return_value=failed):
+        with patch("swarm_router.btl_developer.workspace_fingerprint", return_value="tree"), patch(
+            "swarm_router.btl_developer.subprocess.run", return_value=failed,
+        ):
             passed, summary = authoritative_verification(worktree)
         self.assertFalse(passed)
         self.assertIn("fatal error", summary)
@@ -176,10 +197,48 @@ class TestVerification(unittest.TestCase):
         worktree.root = Path("/tmp")
         failed = subprocess.CompletedProcess([], 1, "", "stop")
         with patch.dict("os.environ", {"OPEN_WEBUI_API_KEY": "secret"}), patch(
+            "swarm_router.btl_developer.workspace_fingerprint", return_value="tree",
+        ), patch(
             "swarm_router.btl_developer.subprocess.run", return_value=failed,
         ) as run:
             authoritative_verification(worktree)
-        self.assertNotIn("OPEN_WEBUI_API_KEY", run.call_args.kwargs["env"])
+        environment = run.call_args.kwargs["env"]
+        self.assertNotIn("OPEN_WEBUI_API_KEY", environment)
+        self.assertEqual(environment["OPEN_TERMINAL_API_KEY"], "btl-verification-placeholder")
+
+    def test_model_written_test_is_filesystem_and_network_isolated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            repo, root, outside = base / "repo", base / "worktree", base / "outside"
+            repo.mkdir()
+            root.mkdir()
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+            (root / "swarm_router").mkdir()
+            (root / "swarm_router" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "tests").mkdir()
+            test_source = (
+                "import pathlib, subprocess, unittest\n"
+                "class Escape(unittest.TestCase):\n"
+                "    def test_escape(self):\n"
+                f"        target = pathlib.Path({str(outside)!r})\n"
+                "        subprocess.run(['/bin/sh', '-c', 'echo escaped > ' + str(target)], check=True)\n"
+                "        self.assertTrue(target.exists())\n"
+            )
+            (root / "tests" / "test_escape.py").write_text(test_source, encoding="utf-8")
+            for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid")):
+                subprocess.run(["git", "config", key, value], cwd=root, check=True)
+            subprocess.run(["git", "add", ".gitignore", "swarm_router/__init__.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, check=True, capture_output=True)
+            sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            worktree = __import__("swarm_router.btl_workspace", fromlist=["WorktreeInfo"]).WorktreeInfo(
+                repo, root, "btl/FT-1-test", sha,
+            )
+            passed, summary = authoritative_verification(worktree)
+            self.assertTrue(passed, summary)
+            self.assertFalse(outside.exists())
 
 
 class TestIntegration(unittest.TestCase):
@@ -193,6 +252,15 @@ class TestIntegration(unittest.TestCase):
     def test_cli_accepts_minimal_operator_command(self) -> None:
         args = _parser().parse_args(["btl-dev", "run", "--prompt-file", "task.txt"])
         self.assertEqual((args.command, args.btl_command, args.prompt_file), ("btl-dev", "run", "task.txt"))
+
+    def test_btl_prompt_reuses_secret_file_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            prompt = Path(temporary) / ".env"
+            prompt.write_text("TOKEN=value\n", encoding="utf-8")
+            args = SimpleNamespace(btl_command="run", prompt_file=str(prompt), task_id="FT-1")
+            config = SimpleNamespace(btl_developer=SimpleNamespace(enabled=True))
+            with self.assertRaisesRegex(RuntimeError, "secret file"):
+                _run_btl(args, config, FakeClient())
 
     def test_cli_routes_btl_before_catalog(self) -> None:
         source = Path(__file__).parents[1].joinpath("swarm_router/cli.py").read_text()

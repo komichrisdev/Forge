@@ -8,7 +8,7 @@ import unittest
 from swarm_router.btl_workspace import (
     create_task_worktree, generate_branch, inspect_changed_files, manager_commit,
     manager_push, resolve_base_sha, validate_branch, validate_task_id,
-    verify_workspace_integrity,
+    verify_workspace_integrity, workspace_fingerprint,
 )
 
 
@@ -31,6 +31,7 @@ class RepositoryCase(unittest.TestCase):
         git(self.repo, "commit", "-m", "base")
         git(base, "init", "--bare", str(self.remote))
         git(self.repo, "remote", "add", "origin", str(self.remote))
+        git(self.repo, "push", "origin", "feature/btl-developer")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -56,6 +57,15 @@ class TestValidation(unittest.TestCase):
 
 
 class TestWorkspace(RepositoryCase):
+    def test_base_must_be_a_current_origin_branch(self) -> None:
+        git(self.repo, "tag", "v1")
+        with self.assertRaises((ValueError, RuntimeError)):
+            resolve_base_sha(self.repo, "tags/v1")
+        (self.repo / "README.md").write_text("local only\n", encoding="utf-8")
+        git(self.repo, "commit", "-am", "local only")
+        with self.assertRaisesRegex(RuntimeError, "does not match origin"):
+            resolve_base_sha(self.repo, "feature/btl-developer")
+
     def test_worktree_is_external_attached_and_exact_base(self) -> None:
         worktree = self.worktree()
         self.assertNotIn(self.repo, worktree.root.parents)
@@ -89,6 +99,15 @@ class TestWorkspace(RepositoryCase):
             git(self.repo, "ls-remote", "--heads", "origin", f"refs/heads/{worktree.branch}").split()[0],
             commit,
         )
+
+    def test_commit_rejects_changes_after_verification(self) -> None:
+        worktree = self.worktree()
+        file = worktree.root / "new.py"
+        file.write_text("value = 1\n", encoding="utf-8")
+        verified = workspace_fingerprint(worktree)
+        file.write_text("value = 2\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "changed after verification"):
+            manager_commit(worktree, "BTL FT-123: test", verified)
 
     def test_push_rejects_wrong_sha(self) -> None:
         worktree = self.worktree()
