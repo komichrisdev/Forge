@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from swarm_router.btl_tools import BTLTools, READ_TOOLS, WRITE_TOOLS
+from swarm_router.btl_tools import BTLTools, FatalToolError, READ_TOOLS, RecoverableToolError, WRITE_TOOLS
 
 
 class TestBTLTools(unittest.TestCase):
@@ -32,6 +32,25 @@ class TestBTLTools(unittest.TestCase):
         for forbidden in ("shell", "commit", "push", "checkout", "merge", "reset", "deploy"):
             self.assertFalse(any(forbidden in name for name in names))
         self.assertNotIn("write_file", {item["function"]["name"] for item in self.tools.schemas(False)})
+        descriptions = {
+            item["function"]["name"]: item["function"]["description"]
+            for item in self.tools.schemas(True)
+        }
+        self.assertIn("existing regular file", descriptions["read_file"])
+        self.assertIn("existing directory", descriptions["search_text"])
+
+    def test_tool_error_taxonomy_separates_usage_from_security(self) -> None:
+        with self.assertRaises(RecoverableToolError):
+            self.tools.read_file("missing.txt")
+        with self.assertRaises(RecoverableToolError):
+            self.tools.search_text("value", path="code.py")
+        with self.assertRaises(RecoverableToolError):
+            self.tools.dispatch("read_file", {"path": "code.py", "extra": True}, writable=False)
+        with self.assertRaises(RecoverableToolError):
+            self.tools.dispatch("read_file", ["code.py"], writable=False)
+        for path in ("../secret", ".git/config", "secrets.json"):
+            with self.assertRaises(FatalToolError):
+                self.tools.read_file(path)
 
     def test_paths_reject_absolute_traversal_backslash_symlink_and_secrets(self) -> None:
         outside = self.root.parent / "outside.txt"

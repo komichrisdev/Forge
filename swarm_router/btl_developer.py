@@ -13,7 +13,7 @@ import sys
 import tempfile
 from typing import Any
 
-from .btl_tools import BTLTools
+from .btl_tools import BTLTools, FatalToolError, RecoverableToolError
 from .btl_workspace import (
     PushConfirmationError, WorktreeInfo, create_task_worktree, generate_branch, inspect_changed_files,
     manager_commit, manager_push, resolve_base_sha, validate_task_id,
@@ -82,6 +82,10 @@ class BTLDeveloperError(RuntimeError):
     pass
 
 
+MAX_RECOVERABLE_TOOL_ERRORS = 4
+SAME_ERROR_REPEAT_LIMIT = 2
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -122,7 +126,7 @@ def _completion_message(data: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
-def _tool_call(call: Any) -> tuple[str, str, dict[str, Any]]:
+def _tool_call(call: Any) -> tuple[str, str, Any]:
     if not isinstance(call, dict) or not isinstance(call.get("id"), str):
         raise BTLDeveloperError("model returned a malformed tool call")
     function = call.get("function")
@@ -133,8 +137,6 @@ def _tool_call(call: Any) -> tuple[str, str, dict[str, Any]]:
         arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
     except json.JSONDecodeError as exc:
         raise BTLDeveloperError("model returned malformed tool arguments") from exc
-    if not isinstance(arguments, dict):
-        raise BTLDeveloperError("model tool arguments must be an object")
     return call["id"], function["name"], arguments
 
 
@@ -149,6 +151,8 @@ def run_model_phase(
     max_tokens: int,
 ) -> str:
     schemas = tools.schemas(writable)
+    recoverable_errors = 0
+    repeated_errors: dict[tuple[str, str, str], int] = {}
     for _ in range(max_turns):
         data = client.completion({
             "model": model_id,
@@ -167,8 +171,19 @@ def run_model_phase(
             call_id, name, arguments = _tool_call(calls[0])
             try:
                 result = tools.dispatch(name, arguments, writable=writable)
-            except (ValueError, RuntimeError, OSError) as exc:
-                raise BTLDeveloperError(f"tool {name!r} failed: {exc}") from exc
+            except RecoverableToolError as exc:
+                recoverable_errors += 1
+                signature = (name, exc.code, json.dumps(arguments, sort_keys=True, default=str))
+                repeated_errors[signature] = repeated_errors.get(signature, 0) + 1
+                if repeated_errors[signature] >= SAME_ERROR_REPEAT_LIMIT:
+                    raise BTLDeveloperError(
+                        f"tool {name!r} repeated recoverable error {exc.code!r}"
+                    ) from exc
+                if recoverable_errors > MAX_RECOVERABLE_TOOL_ERRORS:
+                    raise BTLDeveloperError("model exceeded the recoverable tool error limit") from exc
+                result = exc.tool_result(name)
+            except (FatalToolError, RuntimeError, OSError) as exc:
+                raise BTLDeveloperError(f"tool {name!r} violated a fatal tool boundary") from exc
             messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": calls})
             messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
             continue

@@ -31,6 +31,35 @@ SECRET_PATTERNS = (
     re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{16,}\b"),
 )
+TOOL_GUIDANCE = {
+    "list_files": "path must be a relative path to an existing directory; omit it for the repository root",
+    "read_file": "path must be a relative path to an existing regular file; use list_files on its parent to discover files",
+    "search_text": "query must be non-empty and path must be a relative path to an existing directory",
+    "git_status": "this tool takes no arguments",
+    "git_diff": "path is optional and must be a relative repository path",
+    "write_file": "path must be relative and content must be UTF-8 text no larger than 500 KB",
+    "replace_text": "path must name an existing bounded file and old must occur in that file",
+}
+
+
+class RecoverableToolError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def tool_result(self, tool: str) -> str:
+        return json.dumps({
+            "ok": False,
+            "tool": tool,
+            "error": self.code,
+            "message": self.message,
+            "expected": TOOL_GUIDANCE[tool],
+        }, sort_keys=True)
+
+
+class FatalToolError(ValueError):
+    pass
 
 
 def _secret_name(name: str) -> bool:
@@ -50,7 +79,7 @@ def _schema(name: str, properties: dict[str, Any], required: list[str]) -> dict[
         "type": "function",
         "function": {
             "name": name,
-            "description": f"Structured repository {name.replace('_', ' ')} operation.",
+            "description": TOOL_GUIDANCE[name],
             "parameters": {
                 "type": "object", "properties": properties,
                 "required": required, "additionalProperties": False,
@@ -88,36 +117,42 @@ class BTLTools:
 
     def _path(self, value: str, *, allow_root: bool = False) -> Path:
         if not isinstance(value, str) or (not value and not allow_root):
-            raise ValueError("path must be a non-empty relative string")
+            raise RecoverableToolError("invalid_path", "path must be a non-empty relative string")
         raw = Path(value or ".")
         if raw.is_absolute() or ".." in raw.parts or "\x00" in value or "\\" in value:
-            raise ValueError("path must be relative and cannot contain '..' or backslashes")
+            raise FatalToolError("forbidden path syntax")
         if any(_secret_name(part) for part in raw.parts):
-            raise ValueError("Git metadata and credential paths are unavailable")
+            raise FatalToolError("credential and Git metadata paths are unavailable")
         candidate = (self.root / raw).resolve(strict=False)
         if candidate != self.root and self.root not in candidate.parents:
-            raise ValueError("path escapes task worktree")
+            raise FatalToolError("path escapes task worktree")
         current = self.root
         for part in raw.parts:
             current /= part
             if current.is_symlink():
-                raise ValueError("symlink paths are unavailable")
+                raise FatalToolError("symlink paths are unavailable")
         return candidate
 
-    def dispatch(self, name: str, arguments: dict[str, Any], *, writable: bool) -> str:
+    def dispatch(self, name: str, arguments: Any, *, writable: bool) -> str:
         allowed = READ_TOOLS | (WRITE_TOOLS if writable else frozenset())
-        if name not in allowed or not isinstance(arguments, dict):
-            raise ValueError(f"tool {name!r} is unavailable")
+        if name not in allowed:
+            raise FatalToolError("requested tool is unavailable")
+        if not isinstance(arguments, dict):
+            raise RecoverableToolError(
+                "invalid_arguments", "arguments must be a JSON object matching the tool schema",
+            )
         try:
             result = getattr(self, name)(**arguments)
         except TypeError as exc:
-            raise ValueError(f"invalid arguments for {name}: {exc}") from exc
+            raise RecoverableToolError(
+                "invalid_arguments", "arguments did not match the structured tool schema",
+            ) from exc
         return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
     def list_files(self, path: str = "") -> dict[str, Any]:
         directory = self._path(path, allow_root=True)
         if not directory.is_dir():
-            raise ValueError("path is not a directory")
+            raise RecoverableToolError("path_not_directory", "list_files requires an existing directory")
         entries = []
         for item in sorted(directory.iterdir(), key=lambda entry: entry.name)[:MAX_RESULTS]:
             if _secret_name(item.name) or item.is_symlink():
@@ -128,12 +163,12 @@ class BTLTools:
     def read_file(self, path: str) -> dict[str, Any]:
         file = self._path(path)
         if not file.is_file():
-            raise ValueError("path is not a file")
+            raise RecoverableToolError("path_not_file", "read_file requires an existing regular file")
         with file.open("rb") as handle:
             data = handle.read(MAX_BYTES + 1)
         content = data[:MAX_BYTES].decode("utf-8", "replace")
         if _contains_secret(content):
-            raise ValueError("file contains likely credential material")
+            raise FatalToolError("file contains likely credential material")
         return {
             "path": path, "content": content,
             "size": file.stat().st_size, "truncated": len(data) > MAX_BYTES,
@@ -141,10 +176,10 @@ class BTLTools:
 
     def search_text(self, query: str, path: str = "", include: str = "*") -> dict[str, Any]:
         if not isinstance(query, str) or not query or len(query) > 1000:
-            raise ValueError("query must contain 1-1000 characters")
+            raise RecoverableToolError("invalid_query", "query must contain 1-1000 characters")
         directory = self._path(path, allow_root=True)
         if not directory.is_dir():
-            raise ValueError("path is not a directory")
+            raise RecoverableToolError("path_not_directory", "search_text requires an existing directory")
         matches: list[dict[str, Any]] = []
         scanned = 0
         for base, dirs, files in os.walk(directory, followlinks=False):
@@ -179,41 +214,41 @@ class BTLTools:
             args.append(str(self._path(path).relative_to(self.root)))
         output = self._git(*args)[:MAX_BYTES]
         if _contains_secret(output):
-            raise ValueError("diff contains likely credential material")
+            raise FatalToolError("diff contains likely credential material")
         return {"output": output}
 
     def write_file(self, path: str, content: str) -> dict[str, Any]:
         if not isinstance(content, str) or len(content.encode()) > MAX_BYTES:
-            raise ValueError("content must be a string no larger than 500 KB")
+            raise RecoverableToolError("content_too_large", "content must be text no larger than 500 KB")
         if _contains_secret(content):
-            raise ValueError("content contains likely credential material")
+            raise FatalToolError("content contains likely credential material")
         file = self._path(path)
         if file.exists():
             if not file.is_file() or file.stat().st_size > MAX_BYTES:
-                raise ValueError("existing path is not a bounded regular file")
+                raise RecoverableToolError("path_not_file", "existing path must be a bounded regular file")
             if _contains_secret(file.read_text("utf-8", "replace")):
-                raise ValueError("existing file contains likely credential material")
+                raise FatalToolError("existing file contains likely credential material")
         file.parent.mkdir(parents=True, exist_ok=True)
         self._atomic_write(file, content)
         return {"path": path, "bytes": len(content.encode())}
 
     def replace_text(self, path: str, old: str, new: str, count: int = 1) -> dict[str, Any]:
         if not isinstance(old, str) or not old or not isinstance(new, str):
-            raise ValueError("old must be non-empty and new must be a string")
+            raise RecoverableToolError("invalid_arguments", "old must be non-empty and new must be text")
         if not isinstance(count, int) or not 1 <= count <= 1000:
-            raise ValueError("count must be between 1 and 1000")
+            raise RecoverableToolError("invalid_arguments", "count must be between 1 and 1000")
         file = self._path(path)
         if not file.is_file() or file.stat().st_size > MAX_BYTES:
-            raise ValueError("path is not a bounded regular file")
+            raise RecoverableToolError("path_not_file", "replace_text requires an existing bounded file")
         content = file.read_text(encoding="utf-8")
         if _contains_secret(content) or _contains_secret(new):
-            raise ValueError("file or replacement contains likely credential material")
+            raise FatalToolError("file or replacement contains likely credential material")
         replacements = min(content.count(old), count)
         if not replacements:
-            raise ValueError("old text was not found")
+            raise RecoverableToolError("text_not_found", "old text was not found in the target file")
         updated = content.replace(old, new, count)
         if len(updated.encode()) > MAX_BYTES:
-            raise ValueError("replacement exceeds 500 KB")
+            raise RecoverableToolError("content_too_large", "replacement would exceed 500 KB")
         self._atomic_write(file, updated)
         return {"path": path, "replacements": replacements}
 

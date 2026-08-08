@@ -29,6 +29,13 @@ worktree. Absolute paths, traversal, symlinks, Git metadata, and credential path
 are rejected. Neither profile receives a terminal, arbitrary shell, network,
 credential, Git-mutation, deployment, Docker, systemd, or sudo tool.
 
+Ordinary structured-tool usage errors, such as reading a missing file or
+searching a file as though it were a directory, are returned to the model as
+bounded error results. A phase permits at most four recoverable errors and
+stops on the second identical error. Traversal, symlink, Git metadata, secret,
+worktree-boundary, unavailable-tool, and other security errors remain fatal and
+do not return probing guidance.
+
 Forge Manager alone resolves the configured base, creates the isolated worktree,
 verifies changes, commits, and pushes. Task branches use
 `btl/<FT-task-id>-<bounded-lowercase-slug>`. The remote is always `origin`, and

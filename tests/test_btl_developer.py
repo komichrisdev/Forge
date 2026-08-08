@@ -87,6 +87,57 @@ class TestModelLoop(unittest.TestCase):
                 client, "model", [], self.tools, writable=False, max_turns=1, max_tokens=128,
             )
 
+    def test_absent_read_target_returns_recoverable_tool_result(self) -> None:
+        client = FakeClient(
+            completion(call=("read_file", {"path": "docs/BTL_CANARY_DOES_NOT_EXIST.md"})),
+            completion("plan complete"),
+        )
+        output = run_model_phase(
+            client, "model", [], self.tools, writable=False, max_turns=2, max_tokens=128,
+        )
+        self.assertEqual(output, "plan complete")
+        error = json.loads(client.payloads[1]["messages"][-1]["content"])
+        self.assertEqual((error["ok"], error["tool"], error["error"]), (False, "read_file", "path_not_file"))
+        self.assertIn("existing regular file", error["expected"])
+
+    def test_repeated_recoverable_call_fails_boundedly(self) -> None:
+        call = completion(call=("read_file", {"path": "missing.md"}))
+        client = FakeClient(call, call, completion("must not be reached"))
+        with self.assertRaisesRegex(BTLDeveloperError, "repeated recoverable error"):
+            run_model_phase(
+                client, "model", [], self.tools, writable=False, max_turns=3, max_tokens=128,
+            )
+        self.assertEqual(len(client.payloads), 2)
+
+    def test_search_file_path_can_be_corrected(self) -> None:
+        client = FakeClient(
+            completion(call=("search_text", {"query": "value", "path": "code.py"})),
+            completion(call=("search_text", {"query": "value"})),
+            completion("plan complete"),
+        )
+        output = run_model_phase(
+            client, "model", [], self.tools, writable=False, max_turns=3, max_tokens=128,
+        )
+        self.assertEqual(output, "plan complete")
+        error = next(
+            json.loads(message["content"])
+            for message in client.payloads[-1]["messages"]
+            if message["role"] == "tool" and not json.loads(message["content"]).get("ok", True)
+        )
+        self.assertEqual(error["error"], "path_not_directory")
+
+    def test_security_path_errors_remain_fatal_without_retry(self) -> None:
+        for path in ("../secret", ".git/config", "secrets.json"):
+            client = FakeClient(
+                completion(call=("read_file", {"path": path})),
+                completion("must not be reached"),
+            )
+            with self.assertRaisesRegex(BTLDeveloperError, "fatal tool boundary"):
+                run_model_phase(
+                    client, "model", [], self.tools, writable=False, max_turns=2, max_tokens=128,
+                )
+            self.assertEqual(len(client.payloads), 1)
+
 
 class ManagerCase(unittest.TestCase):
     def setUp(self) -> None:
@@ -98,7 +149,9 @@ class ManagerCase(unittest.TestCase):
         for key, value in (("user.name", "Test"), ("user.email", "test@example.invalid")):
             subprocess.run(["git", "config", key, value], cwd=self.repo, check=True)
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
-        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True)
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs" / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md", "docs/.gitkeep"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "base"], cwd=self.repo, check=True, capture_output=True)
         subprocess.run(["git", "init", "--bare", str(self.remote)], cwd=base, check=True, capture_output=True)
         subprocess.run(["git", "remote", "add", "origin", str(self.remote)], cwd=self.repo, check=True)
@@ -117,6 +170,25 @@ class ManagerCase(unittest.TestCase):
 
 
 class TestManager(ManagerCase):
+    @patch("swarm_router.btl_developer.authoritative_verification", return_value=(True, "all checks passed"))
+    def test_recovered_create_file_flow_verifies_commits_and_pushes(self, _verify) -> None:
+        client = FakeClient(
+            completion(call=("read_file", {"path": "docs/BTL_CANARY_DOES_NOT_EXIST.md"})),
+            completion(call=("list_files", {"path": "docs"})),
+            completion("create the requested file"),
+            completion(call=("write_file", {
+                "path": "docs/BTL_CANARY_DOES_NOT_EXIST.md", "content": "# Canary\n",
+            })),
+            completion("implementation complete"),
+        )
+        config = BTLConfig(
+            model_id="configured-model", worktree_root=str(self.worktrees), max_phase_turns=4,
+        )
+        record = run_btl_manager(client, self.repo, "FT-105", "Create canary", config)
+        self.assertEqual(record.status, BTLTaskStatus.READY_FOR_EXTERNAL_REVIEW.value)
+        self.assertEqual(record.implementation_commit, record.implementation_push_sha)
+        self.assertTrue(Path(record.worktree_path, "docs/BTL_CANARY_DOES_NOT_EXIST.md").is_file())
+
     @patch("swarm_router.btl_developer.authoritative_verification", return_value=(True, "all checks passed"))
     def test_success_verifies_commits_pushes_and_persists(self, verify) -> None:
         client = self.client()
