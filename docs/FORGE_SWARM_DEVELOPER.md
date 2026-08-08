@@ -1,5 +1,9 @@
 # Forge Swarm Developer
 
+> **DEPRECATED:** The multi-model developer architecture proved infeasible in
+> evaluation. Do not add new functionality here. Use
+> [Forge BTL Developer](FORGE_BTL_DEVELOPER.md) for the replacement workflow.
+
 `swarm-developer` is the write-capable Forge development model exposed by the
 existing authenticated personal backend. It does not replace or weaken
 `swarm-personal`.

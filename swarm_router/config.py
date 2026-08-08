@@ -109,6 +109,17 @@ class AuthorityConfig:
 
 
 @dataclass(frozen=True)
+class BTLDeveloperConfig:
+    enabled: bool
+    model: str
+    base_branch: str
+    worktree_root: str
+    max_phase_turns: int
+    planner_max_tokens: int
+    implementer_max_tokens: int
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     name: str
     model: str
@@ -127,6 +138,7 @@ class AppConfig:
     scheduler: SchedulerConfig
     image_generation: ImageGenerationConfig
     authority: AuthorityConfig
+    btl_developer: BTLDeveloperConfig
     judge: AgentConfig
     workers: tuple[AgentConfig, ...]
 
@@ -151,6 +163,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
     probe_raw = raw.get("probe", {})
     reliability_raw = raw.get("reliability", {})
     authority_raw = raw.get("authority", {})
+    btl_raw = raw.get("btl_developer", {})
     judge_raw = raw.get("judge", {})
     workers_raw = raw.get("workers", [])
 
@@ -253,6 +266,15 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
             )
         ),
     )
+    btl_developer = BTLDeveloperConfig(
+        enabled=bool(btl_raw.get("enabled", False)),
+        model=str(btl_raw.get("model", "local-qwen36-35b-a3b-windows")),
+        base_branch=str(btl_raw.get("base_branch", "feature/btl-developer")),
+        worktree_root=str(btl_raw.get("worktree_root", "~/.local/share/owui-swarm/btl-worktrees")),
+        max_phase_turns=max(1, min(50, int(btl_raw.get("max_phase_turns", 12)))),
+        planner_max_tokens=max(128, min(16_384, int(btl_raw.get("planner_max_tokens", 4096)))),
+        implementer_max_tokens=max(128, min(32_768, int(btl_raw.get("implementer_max_tokens", 8192)))),
+    )
 
     judge = AgentConfig(
         name=str(judge_raw.get("name", "integrator")),
@@ -290,6 +312,7 @@ def load_config(path: str | Path, require_api_key: bool = True) -> AppConfig:
         scheduler=scheduler,
         image_generation=image_generation,
         authority=authority,
+        btl_developer=btl_developer,
         judge=judge,
         workers=tuple(workers),
     )

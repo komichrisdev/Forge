@@ -10,7 +10,9 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+import uuid
 from urllib import error, request
 
 from .agents import AgentManifest, HandoffEnvelope, default_registry, load_json_object
@@ -220,6 +222,13 @@ def _parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int)
 
     sub.add_parser("personal-serve", help="Run the personal-task OpenAI-compatible backend.")
+
+    btl = sub.add_parser("btl-dev", help="Run the isolated BTL Developer workflow.")
+    btl_sub = btl.add_subparsers(dest="btl_command", required=True)
+    btl_run = btl_sub.add_parser("run", help="Plan, implement, verify, commit, and push one BTL task branch.")
+    btl_run.add_argument("--prompt-file", required=True)
+    btl_run.add_argument("--task-id")
+    btl_run.add_argument("--json", action="store_true")
 
     benchmark = sub.add_parser("benchmark", help="Run or list the compact local quality benchmarks.")
     benchmark.add_argument("benchmark_id", nargs="?")
@@ -831,6 +840,58 @@ def _probe_model(catalog: ModelCatalog, client: OpenWebUIClient, config, model_i
     return model_id, status, elapsed, detail
 
 
+def _run_btl(args: argparse.Namespace, config, client: OpenWebUIClient) -> int:
+    from .btl_developer import BTLConfig, run_btl_manager
+
+    if args.btl_command != "run":
+        return 2
+    if not config.btl_developer.enabled:
+        raise RuntimeError("BTL Developer is disabled in [btl_developer].")
+    prompt_path = Path(args.prompt_file).expanduser().resolve(strict=True)
+    if not prompt_path.is_file() or prompt_path.stat().st_size > 100_000:
+        raise ValueError("--prompt-file must be a regular file no larger than 100 KB")
+    instruction = prompt_path.read_text(encoding="utf-8")
+    if not instruction.strip():
+        raise ValueError("BTL task instruction is empty")
+    root_result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd(),
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if root_result.returncode:
+        raise RuntimeError("Run btl-dev from inside the Forge Git checkout.")
+    settings = config.btl_developer
+    record = run_btl_manager(
+        client=client,
+        repo_root=root_result.stdout.strip(),
+        task_id=args.task_id or f"FT-{uuid.uuid4().hex[:12]}",
+        instruction=instruction,
+        config=BTLConfig(
+            model_id=settings.model,
+            base_branch=settings.base_branch,
+            worktree_root=settings.worktree_root,
+            max_phase_turns=settings.max_phase_turns,
+            planner_max_tokens=settings.planner_max_tokens,
+            implementer_max_tokens=settings.implementer_max_tokens,
+        ),
+    )
+    output = {
+        "task_id": record.task_id,
+        "status": record.status,
+        "base_sha": record.base_sha,
+        "task_branch": record.task_branch,
+        "worktree": record.worktree_path,
+        "implementation_commit": record.implementation_commit,
+        "pushed_sha": record.implementation_push_sha,
+        "verification_summary": record.verification_summary,
+    }
+    if args.json:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        for key, value in output.items():
+            print(f"{key}\t{value}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -859,6 +920,8 @@ def main(argv: list[str] | None = None) -> int:
             config.openwebui.health_endpoint,
             config.openwebui.models_endpoint,
         )
+        if args.command == "btl-dev":
+            return _run_btl(args, config, client)
         catalog = ModelCatalog(config.swarm.catalog_path)
         catalog.import_run_history(config.swarm.run_directory)
 

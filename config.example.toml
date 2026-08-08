@@ -85,6 +85,15 @@ worker_trust = "low"
 current_data_policy = "Workers must treat current or changing facts as unverified unless supplied by the supervisor."
 execution_policy = "Workers propose; the supervisor inspects, applies, tests, and decides."
 
+[btl_developer]
+enabled = false
+model = "local-qwen36-35b-a3b-windows"
+base_branch = "feature/btl-developer"
+worktree_root = "~/.local/share/owui-swarm/btl-worktrees"
+max_phase_turns = 12
+planner_max_tokens = 4096
+implementer_max_tokens = 8192
+
 # These are role defaults only. They can use any chat-capable model exposed by
 # Open WebUI, and can be overridden per run in the CLI or dashboard.
 [judge]
